@@ -1,3 +1,5 @@
+# RapidSurge Warehouse v2.1 - Updated 19 July 2026
+
 import streamlit as st
 import pandas as pd
 import os
