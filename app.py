@@ -54,27 +54,14 @@ def load_areas():
         return ["Gaur City","Sector 78","Indirapuram"]
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
-USERS = {
-    "ankit":      {"password": "ritika237",  "name": "Ankit",      "team": "Admin",    "role": "admin"},
-    "dharmendra": {"password": "dhar123",    "name": "Dharmendra", "team": "Purchase", "role": "user"},
-    "rahul":      {"password": "rahul123",   "name": "Rahul",      "team": "Purchase", "role": "user"},
-    "anshul":     {"password": "ansh123",    "name": "Anshul",     "team": "Purchase", "role": "user"},
-    "pradeep":    {"password": "prad123",    "name": "Pradeep",    "team": "Purchase", "role": "user"},
-    "shagun":     {"password": "shag123",    "name": "Shagun",     "team": "Purchase", "role": "user"},
-    "sushant":    {"password": "sush123",    "name": "Sushant",    "team": "Purchase", "role": "user"},
-    "pooja":      {"password": "pooj123",    "name": "Pooja",      "team": "Stock",    "role": "user"},
-    "deepak":     {"password": "deep123",    "name": "Deepak",     "team": "Stock",    "role": "user"},
-    "ijee":       {"password": "ijee123",    "name": "Ijee",       "team": "Stock",    "role": "user"},
-    "nidhi":      {"password": "nidh123",    "name": "Nidhi",      "team": "Stock",    "role": "user"},
-    "ritik":      {"password": "riti123",    "name": "Ritik",      "team": "Stock",    "role": "user"},
-    "rachna":     {"password": "rach123",    "name": "Rachna",     "team": "Stock",    "role": "user"},
-    "lovely":     {"password": "love123",    "name": "Lovely",     "team": "Stock",    "role": "user"},
-    "tarun":      {"password": "taru123",    "name": "Tarun",      "team": "Stock",    "role": "user"},
-    "akhil":      {"password": "akhi123",    "name": "Akhil",      "team": "Call",     "role": "user"},
-    "simran":     {"password": "simr123",    "name": "Simran",     "team": "Call",     "role": "user"},
-    "naresh":     {"password": "nare123",    "name": "Naresh",     "team": "Delivery", "role": "user"},
-    "sandeep":    {"password": "sand123",    "name": "Sandeep",    "team": "Delivery", "role": "user"},
-}
+# Users loaded from Streamlit secrets
+def load_users():
+    try:
+        return st.secrets["USERS"]
+    except:
+        return {}
+
+USERS = load_users()
 
 DISTRIBUTORS = [
     "Acorns Health Solutions Private Limited","Admire Enterprises",
@@ -790,6 +777,266 @@ def form_other_task():
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+# ── STOCK PLACEMENT & CROSS CHECK FORMS ──────────────────────────────────────
+
+def form_stock_placement():
+    st.subheader("📍 Stock Placement")
+
+    # Load Bill Uploaded arrangements
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        resp = supabase.table("arrangements").select("*")\
+            .eq("status", "Bill Uploaded")\
+            .gte("order_placed_date", two_days_ago)\
+            .execute()
+        arrangements = resp.data if resp.data else []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        arrangements = []
+
+    if not arrangements:
+        st.info("No arrangements pending placement!")
+        return
+
+    arr_options = {
+        f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a
+        for a in arrangements
+    }
+
+    start = timer_button("stock_placement")
+    if start is None:
+        return
+
+    selected_label = st.selectbox("Select Arrangement *", list(arr_options.keys()), key="sp_arr")
+    selected_arr   = arr_options[selected_label]
+
+    st.info(f"📋 Distributor: **{selected_arr.get('distributor','')}** | Area: **{selected_arr.get('area','')}** | Arrangement: **{selected_arr.get('arrangement_no','')}**")
+
+    # Load medicines for this arrangement
+    try:
+        meds_resp = supabase.table("arrangement_medicines").select("*")\
+            .eq("arrangement_id", selected_arr["id"]).execute()
+        medicines = meds_resp.data if meds_resp.data else []
+    except:
+        medicines = []
+
+    with st.form("stock_placement_form", clear_on_submit=True):
+        st.markdown("**Enter Box/Rack Location for Each Medicine:**")
+
+        placement_data = {}
+        if medicines:
+            for med in medicines:
+                c1,c2,c3 = st.columns([3,2,2])
+                with c1:
+                    st.markdown(f"💊 **{med.get('medicine_name','')}** (Qty: {med.get('quantity','')})")
+                with c2:
+                    location = st.text_input(f"Box/Rack", key=f"loc_{med['id']}", placeholder="e.g. A-1-3-2")
+                with c3:
+                    qty_placed = st.text_input(f"Qty Placed", key=f"qty_{med['id']}", value=str(med.get('quantity','')))
+                placement_data[med['id']] = {
+                    "medicine_name": med.get('medicine_name',''),
+                    "quantity": med.get('quantity',''),
+                    "location": location,
+                    "qty_placed": qty_placed
+                }
+        else:
+            st.warning("No medicines found for this arrangement — they may not have been entered during order placement!")
+            total_items = st.number_input("Total Items Placed", min_value=0, step=1)
+
+        st.divider()
+        st.markdown("**📸 Photo of Placement Area**")
+        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+            key="sp_radio", label_visibility="collapsed")
+        if upload_opt == "Upload":
+            placement_img = st.file_uploader("Select Image",
+                type=["jpg","jpeg","png"], key="sp_upload")
+        else:
+            placement_img = st.camera_input("Take Photo", key="sp_cam")
+
+        remarks = st.text_input("Remarks")
+
+        if st.form_submit_button("Submit Placement ✅", type="primary", use_container_width=True):
+            end_time, duration = end_timer("stock_placement", start)
+            img_name = upload_image(placement_img, "placement") if placement_img else ""
+
+            try:
+                import random
+                import json
+
+                # Save placement data
+                supabase.table("arrangements").update({
+                    "status": "Stock Placed",
+                    "placed_by": st.session_state.name,
+                    "placement_time": end_time,
+                    "placement_image": img_name,
+                    "placement_data": json.dumps(placement_data),
+                }).eq("id", selected_arr["id"]).execute()
+
+                # Randomly select 2 medicines for cross check
+                if medicines and len(medicines) >= 2:
+                    check_meds = random.sample(medicines, 2)
+                elif medicines and len(medicines) == 1:
+                    check_meds = medicines
+                else:
+                    check_meds = []
+
+                check_list = [{"medicine_name": m.get("medicine_name",""),
+                              "quantity": m.get("quantity",""),
+                              "location": placement_data.get(m["id"],{}).get("location","")}
+                             for m in check_meds]
+
+                supabase.table("arrangements").update({
+                    "cross_check_medicines": json.dumps(check_list),
+                    "cross_check_status": "Pending"
+                }).eq("id", selected_arr["id"]).execute()
+
+                # Log daily task
+                supabase.table("daily_tasks").insert({
+                    "date": date_str(), "time": time_str(),
+                    "person": st.session_state.name, "team": st.session_state.team,
+                    "task_type": "Stock Placement",
+                    "details": {
+                        "arrangement_no": selected_arr.get("arrangement_no"),
+                        "distributor": selected_arr.get("distributor"),
+                        "no_medicines": str(len(medicines)),
+                        "placement_image": img_name,
+                        "remarks": remarks
+                    },
+                    "start_time": start.strftime("%I:%M %p"),
+                    "end_time": end_time,
+                    "duration_mins": str(duration)
+                }).execute()
+
+                if check_meds:
+                    check_names = " & ".join([m.get("medicine_name","") for m in check_meds])
+                    st.success(f"✅ Placement done! Cross check needed for: **{check_names}**")
+                else:
+                    st.success("✅ Placement done!")
+                st.balloons()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+def form_placement_crosscheck():
+    st.subheader("🔍 Placement Cross Check")
+
+    # Load arrangements pending cross check
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        resp = supabase.table("arrangements").select("*")\
+            .eq("status", "Stock Placed")\
+            .eq("cross_check_status", "Pending")\
+            .gte("order_placed_date", two_days_ago)\
+            .execute()
+        arrangements = resp.data if resp.data else []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        arrangements = []
+
+    if not arrangements:
+        st.info("No arrangements pending placement cross check!")
+        return
+
+    # Filter out arrangements placed by current user
+    others_arrangements = [
+        a for a in arrangements
+        if a.get("placed_by") != st.session_state.name
+    ]
+
+    if not others_arrangements:
+        st.warning("⚠️ You placed all pending arrangements! Another team member needs to cross check.")
+        return
+
+    arr_options = {
+        f"#{a.get('arrangement_no')} — {a.get('distributor','')} — Placed by: {a.get('placed_by','')}": a
+        for a in others_arrangements
+    }
+
+    with st.form("placement_crosscheck_form", clear_on_submit=True):
+        selected_label = st.selectbox("Select Arrangement *", list(arr_options.keys()), key="pc_arr")
+        selected_arr   = arr_options[selected_label]
+
+        st.info(f"📋 Placed by: **{selected_arr.get('placed_by','')}** | Arrangement: **{selected_arr.get('arrangement_no','')}**")
+
+        # Show medicines to cross check
+        import json
+        check_meds = []
+        try:
+            check_meds = json.loads(selected_arr.get("cross_check_medicines","[]"))
+        except:
+            check_meds = []
+
+        if check_meds:
+            st.markdown("**🔍 Verify these 2 medicines:**")
+            results = {}
+            for med in check_meds:
+                st.markdown(f"💊 **{med.get('medicine_name','')}** | Expected Location: **{med.get('location','')}** | Qty: **{med.get('quantity','')}**")
+                c1,c2 = st.columns(2)
+                with c1:
+                    correct = st.selectbox(
+                        f"Is it in correct location?",
+                        ["Yes ✅","No ❌"],
+                        key=f"cc_{med.get('medicine_name','')}"
+                    )
+                with c2:
+                    qty_ok = st.selectbox(
+                        f"Is quantity correct?",
+                        ["Yes ✅","No ❌"],
+                        key=f"qq_{med.get('medicine_name','')}"
+                    )
+                results[med.get("medicine_name","")] = {
+                    "location_correct": correct,
+                    "quantity_correct": qty_ok
+                }
+                st.divider()
+
+        remarks = st.text_input("Remarks")
+
+        if st.form_submit_button("Submit Cross Check ✅", type="primary", use_container_width=True):
+            try:
+                # Check if any issues found
+                issues = [k for k,v in results.items()
+                         if "No" in v.get("location_correct","") or "No" in v.get("quantity_correct","")]
+
+                if issues:
+                    new_status = "Placement Issue Found"
+                    st.warning(f"⚠️ Issues found with: {', '.join(issues)}")
+                else:
+                    new_status = "Completed"
+
+                supabase.table("arrangements").update({
+                    "status": new_status,
+                    "cross_check_status": "Done",
+                    "cross_checked_by_placement": st.session_state.name,
+                    "cross_check_result": json.dumps(results),
+                }).eq("id", selected_arr["id"]).execute()
+
+                supabase.table("daily_tasks").insert({
+                    "date": date_str(), "time": time_str(),
+                    "person": st.session_state.name, "team": st.session_state.team,
+                    "task_type": "Placement Cross Check",
+                    "details": {
+                        "arrangement_no": selected_arr.get("arrangement_no"),
+                        "placed_by": selected_arr.get("placed_by"),
+                        "results": json.dumps(results),
+                        "issues": str(issues),
+                        "remarks": remarks
+                    },
+                    "start_time": time_str(),
+                    "end_time": time_str(),
+                }).execute()
+
+                if issues:
+                    st.error(f"❌ Issues found! Admin has been notified.")
+                else:
+                    st.success("✅ Cross check passed! Arrangement Completed!")
+                st.balloons()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
 # ── BILL CROSS CHECK & UPLOAD FORMS ──────────────────────────────────────────
 
 def form_bill_crosscheck():
@@ -1371,12 +1618,12 @@ def show_user_page():
         with tabs[7]: form_other_task()
 
     elif team == "Stock":
-        tabs = st.tabs(["🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📦 Stock Check","📍 Placement","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
+        tabs = st.tabs(["🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
         with tabs[0]: form_bill_upload()
         with tabs[1]: form_bill_crosscheck()
         with tabs[2]: form_bill_upload_arrangement()
-        with tabs[3]: st.info("Stock Check — Coming Soon")
-        with tabs[4]: st.info("Placement — Coming Soon")
+        with tabs[3]: form_stock_placement()
+        with tabs[4]: form_placement_crosscheck()
         with tabs[5]: form_rack_cleaning()
         with tabs[6]: form_inventory_check()
         with tabs[7]: form_book_porter()
@@ -1544,6 +1791,241 @@ def show_admin_page():
         with c2:
             st.download_button("⬇️ Download CSV", filtered.to_csv(index=False).encode(),
                 f"rapidsurge_{date_str()}.csv", "text/csv")
+
+    st.divider()
+
+    # ── PERFORMANCE DASHBOARD ─────────────────────────────────────────────────
+    st.subheader("📊 Performance Dashboard")
+
+    perf_date = st.date_input("Select Date", value=today_ist(), key="perf_date_admin")
+    perf_date_str = perf_date.strftime("%Y-%m-%d")
+
+    try:
+        # Load all tasks for selected date
+        tasks_resp = supabase.table("daily_tasks").select("*").eq("date", perf_date_str).execute()
+        tasks = tasks_resp.data if tasks_resp.data else []
+
+        # Load all arrangements for selected date
+        arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", perf_date_str).execute()
+        arrangements = arr_resp.data if arr_resp.data else []
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        tasks = []
+        arrangements = []
+
+    if not tasks and not arrangements:
+        st.info("No data found for selected date!")
+    else:
+        import json
+
+        # ── SECTION 1 — PURCHASE SUMMARY ─────────────────────────────────────
+        st.markdown("### 🛒 Purchase Summary")
+        purchase_tasks = [t for t in tasks if t.get("team") == "Purchase"]
+
+        # Arrangement vs Normal orders
+        arr_orders  = [a for a in arrangements]
+        normal_orders = [t for t in purchase_tasks if t.get("task_type") == "Purchase Order"]
+
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: st.metric("📋 Arrangement Orders", len(arr_orders))
+        with c2: st.metric("🛒 Normal Orders", len(normal_orders))
+        with c3:
+            total_sku = sum([int(t.get("details",{}).get("no_sku",0) or 0) for t in normal_orders])
+            st.metric("📦 Total SKUs (Normal)", total_sku)
+        with c4:
+            arr_sku = sum([int(a.get("no_medicines",0) or 0) for a in arr_orders])
+            st.metric("📦 Total SKUs (Arrangement)", arr_sku)
+
+        # Avg time per SKU for orders
+        st.markdown("**⏱️ Order Placement Time:**")
+        order_times = []
+        for t in normal_orders:
+            try:
+                dur  = int(t.get("duration_mins",0) or 0)
+                skus = int(t.get("details",{}).get("no_sku",0) or 0)
+                if skus > 0:
+                    order_times.append(round(dur/skus, 2))
+            except:
+                pass
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Avg Time/SKU (Normal Order)", f"{round(sum(order_times)/len(order_times),2) if order_times else 0} mins")
+        with c2: st.metric("Min Time/SKU", f"{min(order_times) if order_times else 0} mins")
+        with c3: st.metric("Max Time/SKU", f"{max(order_times) if order_times else 0} mins")
+
+        st.divider()
+
+        # ── SECTION 2 — BILL CROSS CHECK ─────────────────────────────────────
+        st.markdown("### ✔️ Bill Cross Check Performance")
+        crosscheck_tasks = [t for t in tasks if t.get("task_type") == "Bill Cross Check"]
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Total Cross Checks", len(crosscheck_tasks))
+        with c2:
+            total_items = sum([int(t.get("details",{}).get("no_items",0) or 0) for t in crosscheck_tasks])
+            st.metric("Total Items Checked", total_items)
+        with c3:
+            issues = sum([
+                int(t.get("details",{}).get("near_expiry",0) or 0) +
+                int(t.get("details",{}).get("damaged",0) or 0) +
+                int(t.get("details",{}).get("contra",0) or 0) +
+                int(t.get("details",{}).get("wrong_batch",0) or 0)
+                for t in crosscheck_tasks
+            ])
+            st.metric("Total Issues Found", issues)
+
+        # Avg time per SKU
+        check_times = []
+        for t in crosscheck_tasks:
+            try:
+                dur   = int(t.get("duration_mins",0) or 0)
+                items = int(t.get("details",{}).get("no_items",0) or 0)
+                if items > 0:
+                    check_times.append(round(dur/items, 2))
+            except:
+                pass
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Avg Time/SKU (Cross Check)", f"{round(sum(check_times)/len(check_times),2) if check_times else 0} mins")
+        with c2: st.metric("Min Time/SKU", f"{min(check_times) if check_times else 0} mins")
+        with c3: st.metric("Max Time/SKU", f"{max(check_times) if check_times else 0} mins")
+
+        # Issues breakdown
+        if crosscheck_tasks:
+            st.markdown("**Issues Breakdown:**")
+            near_exp  = sum([int(t.get("details",{}).get("near_expiry",0) or 0) for t in crosscheck_tasks])
+            damaged   = sum([int(t.get("details",{}).get("damaged",0) or 0) for t in crosscheck_tasks])
+            contra    = sum([int(t.get("details",{}).get("contra",0) or 0) for t in crosscheck_tasks])
+            wrong_b   = sum([int(t.get("details",{}).get("wrong_batch",0) or 0) for t in crosscheck_tasks])
+            wrong_d   = sum([int(t.get("details",{}).get("wrong_discount",0) or 0) for t in crosscheck_tasks])
+            wrong_c   = sum([int(t.get("details",{}).get("wrong_calculation",0) or 0) for t in crosscheck_tasks])
+            shortage  = sum([int(t.get("details",{}).get("shortage",0) or 0) for t in crosscheck_tasks])
+
+            c1,c2,c3,c4 = st.columns(4)
+            with c1:
+                st.metric("Near Expiry", near_exp)
+                st.metric("Damaged", damaged)
+            with c2:
+                st.metric("Contra Items", contra)
+                st.metric("Wrong Batch", wrong_b)
+            with c3:
+                st.metric("Wrong Discount", wrong_d)
+                st.metric("Wrong Calculation", wrong_c)
+            with c4:
+                st.metric("Shortage", shortage)
+
+        st.divider()
+
+        # ── SECTION 3 — BILL UPLOAD ───────────────────────────────────────────
+        st.markdown("### 📤 Bill Upload Performance")
+        upload_tasks = [t for t in tasks if t.get("task_type") in ["Bill Upload","Bill Upload (Arrangement)"]]
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Total Bills Uploaded", len(upload_tasks))
+        with c2:
+            arr_uploads = len([t for t in upload_tasks if t.get("task_type") == "Bill Upload (Arrangement)"])
+            st.metric("Arrangement Bills", arr_uploads)
+        with c3:
+            normal_uploads = len([t for t in upload_tasks if t.get("task_type") == "Bill Upload"])
+            st.metric("Normal Bills", normal_uploads)
+
+        upload_times = []
+        for t in upload_tasks:
+            try:
+                dur   = int(t.get("duration_mins",0) or 0)
+                items = int(t.get("details",{}).get("no_items",0) or 0)
+                if items > 0 and dur > 0:
+                    upload_times.append(round(dur/items, 2))
+            except:
+                pass
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Avg Time/SKU (Upload)", f"{round(sum(upload_times)/len(upload_times),2) if upload_times else 0} mins")
+        with c2: st.metric("Min Time/SKU", f"{min(upload_times) if upload_times else 0} mins")
+        with c3: st.metric("Max Time/SKU", f"{max(upload_times) if upload_times else 0} mins")
+
+        st.divider()
+
+        # ── SECTION 4 — STOCK PLACEMENT ──────────────────────────────────────
+        st.markdown("### 📍 Stock Placement Performance")
+        placement_tasks = [t for t in tasks if t.get("task_type") == "Stock Placement"]
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Total Placements", len(placement_tasks))
+        with c2:
+            total_placed = sum([int(t.get("details",{}).get("no_medicines",0) or 0) for t in placement_tasks])
+            st.metric("Total Medicines Placed", total_placed)
+        with c3:
+            placement_issues = len([a for a in arrangements if a.get("status") == "Placement Issue Found"])
+            st.metric("Placement Issues", placement_issues)
+
+        placement_times = []
+        for t in placement_tasks:
+            try:
+                dur   = int(t.get("duration_mins",0) or 0)
+                items = int(t.get("details",{}).get("no_medicines",0) or 0)
+                if items > 0 and dur > 0:
+                    placement_times.append(round(dur/items, 2))
+            except:
+                pass
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.metric("Avg Time/SKU (Placement)", f"{round(sum(placement_times)/len(placement_times),2) if placement_times else 0} mins")
+        with c2: st.metric("Min Time/SKU", f"{min(placement_times) if placement_times else 0} mins")
+        with c3: st.metric("Max Time/SKU", f"{max(placement_times) if placement_times else 0} mins")
+
+        st.divider()
+
+        # ── SECTION 5 — ARRANGEMENT PIPELINE TIME ────────────────────────────
+        st.markdown("### ⏱️ Arrangement Pipeline Time")
+        st.caption("Time from Order Placed → Bill Uploaded")
+
+        pipeline_data = []
+        for arr in arrangements:
+            try:
+                order_time   = arr.get("order_placed_time","")
+                upload_time  = arr.get("bill_upload_time","")
+                if order_time and upload_time and upload_time != "":
+                    from datetime import datetime as dt
+                    fmt = "%I:%M %p"
+                    o = dt.strptime(order_time, fmt)
+                    u = dt.strptime(upload_time, fmt)
+                    diff = int((u-o).total_seconds()/60)
+                    if diff > 0:
+                        pipeline_data.append({
+                            "Arrangement": arr.get("arrangement_no",""),
+                            "Distributor": arr.get("distributor",""),
+                            "Order Time": order_time,
+                            "Bill Upload Time": upload_time,
+                            "Total Time (mins)": diff
+                        })
+            except:
+                pass
+
+        if pipeline_data:
+            pipeline_df = pd.DataFrame(pipeline_data)
+            st.dataframe(pipeline_df, use_container_width=True)
+            avg_pipeline = round(pipeline_df["Total Time (mins)"].mean(), 1)
+            c1,c2,c3 = st.columns(3)
+            with c1: st.metric("Avg Pipeline Time", f"{avg_pipeline} mins")
+            with c2: st.metric("Fastest", f"{pipeline_df['Total Time (mins)'].min()} mins")
+            with c3: st.metric("Slowest", f"{pipeline_df['Total Time (mins)'].max()} mins")
+        else:
+            st.info("No completed pipeline data yet for this date!")
+
+        st.divider()
+
+        # ── SECTION 6 — TEAM MEMBER PERFORMANCE ──────────────────────────────
+        st.markdown("### 👥 Team Member Performance")
+
+        if tasks:
+            tasks_df = pd.DataFrame(tasks)
+            person_summary = tasks_df.groupby(["person","team","task_type"]).size().reset_index(name="count")
+            st.dataframe(person_summary, use_container_width=True)
+
+            # Bar chart
+            person_counts = tasks_df.groupby("person").size().reset_index(name="Total Tasks")
+            st.bar_chart(person_counts.set_index("person"))
 
     st.divider()
 
