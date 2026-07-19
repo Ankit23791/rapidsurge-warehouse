@@ -54,7 +54,7 @@ def load_areas():
         return ["Gaur City","Sector 78","Indirapuram"]
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_users():
     try:
         resp = supabase.table("app_users").select("*").eq("active", True).execute()
@@ -296,7 +296,7 @@ def form_bounce_medicine():
             no_useful   = st.number_input("No of New Useful Medicines Found", min_value=0, step=1)
         with c2:
             st.markdown("📸 **Image of Medicine List**")
-            upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="bounce_radio", label_visibility="collapsed")
+            upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="bounce_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="bounce_upload")
         else:
@@ -353,7 +353,7 @@ def form_arrangement():
 
         medicines = st.text_area("Medicines (one per line) *", placeholder="Medicine 1 - Qty\nMedicine 2 - Qty")
         st.markdown("📸 **Image of Order**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="arr_radio", label_visibility="collapsed")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="arr_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="arr_upload")
         else:
@@ -417,7 +417,7 @@ def form_bill_upload():
             delivery_by  = st.selectbox("Delivery By", ["Porter","Naresh","Sandeep","Distributor"], key="bu_del")
             order_type   = st.selectbox("Order Type", ["Regular","Arrangement"], key="bu_type")
         st.markdown("📸 **Bill Image**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="bu_radio", label_visibility="collapsed")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="bu_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             img = st.file_uploader("Select Image", type=["jpg","jpeg","png","pdf"], key="bu_upload")
         else:
@@ -549,12 +549,13 @@ def form_call_log():
 def form_pickup():
     st.subheader("📋 Pickup Log")
 
-    # Load ONLY pending arrangements from last 2 days (not already picked)
+    # Load ONLY Self Pick pending arrangements from last 2 days
     try:
         from datetime import timedelta
         two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
         resp = supabase.table("arrangements").select("*")\
             .eq("status", "Pending")\
+            .eq("pickup_type", "Self Pick")\
             .gte("order_placed_date", two_days_ago)\
             .execute()
         arrangements = resp.data if resp.data else []
@@ -633,7 +634,7 @@ def form_pickup():
 
         # Medicine received image
         st.markdown("**📸 Image of Medicine Received**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="pu_radio", label_visibility="collapsed")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="pu_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             medicine_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="pu_upload")
         else:
@@ -1372,7 +1373,7 @@ def form_porter_handover():
             handover_time = st.time_input("Handover Time", key="ph_time")
 
         st.markdown("📸 **Image of Handover**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="ph_radio", label_visibility="collapsed")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="ph_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             handover_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="ph_upload")
         else:
@@ -1424,19 +1425,183 @@ def form_porter_handover():
                 st.error(f"Error: {e}")
 
 def form_porter_receive():
-    st.subheader("📦 Receive from Porter")
+    st.subheader("📦 Receive Stock")
 
-    # Load handed over porter bookings
+    # ── INCOMING STOCK DASHBOARD ─────────────────────────────────────────────
+    st.markdown("### 📊 All Incoming Stock Today")
+
     try:
-        resp = supabase.table("porter_bookings").select("*")\
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        # All arrangements not yet received
+        all_resp = supabase.table("arrangements").select("*")\
+            .not_.in_("status", ["Reached Warehouse","Bill Cross Checked",
+                                  "Bill Uploaded","Stock Placed","Completed",
+                                  "Placement Issue Found"])\
+            .gte("order_placed_date", two_days_ago)\
+            .execute()
+        all_incoming = all_resp.data if all_resp.data else []
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        all_incoming = []
+
+    if all_incoming:
+        # Area filter
+        all_areas = list(set([a.get("area","") for a in all_incoming if a.get("area","")]))
+        all_areas.sort()
+        
+        c1,c2 = st.columns(2)
+        with c1:
+            selected_area = st.selectbox("Filter by Area/Warehouse", 
+                ["All Areas"] + all_areas, key="incoming_area_filter")
+        with c2:
+            selected_status = st.selectbox("Filter by Status",
+                ["All Status","Pending","In Transit","Porter Booked","Porter On Way"],
+                key="incoming_status_filter")
+
+        # Apply filters
+        filtered_incoming = all_incoming
+        if selected_area != "All Areas":
+            filtered_incoming = [a for a in filtered_incoming if a.get("area","") == selected_area]
+        if selected_status != "All Status":
+            if selected_status == "Pending":
+                filtered_incoming = [a for a in filtered_incoming if a.get("status","") == "Pending"]
+            elif selected_status == "In Transit":
+                filtered_incoming = [a for a in filtered_incoming if a.get("status","") == "Picked Up - In Transit"]
+            elif selected_status == "Porter Booked":
+                filtered_incoming = [a for a in filtered_incoming if a.get("status","") == "Porter Booked"]
+            elif selected_status == "Porter On Way":
+                filtered_incoming = [a for a in filtered_incoming if "Porter" in a.get("status","") and "Transit" in a.get("status","")]
+
+        st.markdown(f"**Showing {len(filtered_incoming)} of {len(all_incoming)} incoming stocks**")
+
+        for arr in filtered_incoming:
+            status = arr.get("status","")
+            pickup_type = arr.get("pickup_type","")
+
+            # Status emoji
+            if status == "Pending":
+                if pickup_type == "Self Pick":
+                    status_icon = "🔴 Waiting for Naresh to Pick"
+                elif pickup_type == "Porter":
+                    status_icon = "🔴 Waiting for Porter Booking"
+                elif pickup_type == "Distributor Delivers":
+                    status_icon = "🚚 Distributor will Deliver Directly"
+            elif status == "Picked Up - In Transit":
+                status_icon = "🚚 Naresh Picked — Coming to Warehouse"
+            elif status == "Porter Booked":
+                status_icon = "🚛 Porter Booked — In Transit"
+            elif status == "Given to Porter - In Transit":
+                status_icon = "🚛 Porter On The Way"
+            else:
+                status_icon = status
+
+            c1,c2,c3,c4 = st.columns([2,2,2,2])
+            with c1: st.markdown(f"**#{arr.get('arrangement_no','')}**")
+            with c2: st.markdown(f"🏪 {arr.get('distributor','')}")
+            with c3: st.markdown(f"📍 {arr.get('area','')}")
+            with c4: st.markdown(f"{status_icon}")
+
+        if not filtered_incoming:
+            st.info(f"No incoming stock for selected filter!")
+        st.divider()
+    else:
+        st.info("No incoming stock at the moment!")
+        st.divider()
+
+    # Load handed over porter bookings OR delivered by distributor
+    try:
+        # Porter handed over
+        porter_resp = supabase.table("porter_bookings").select("*")\
             .eq("status", "Handed Over").execute()
-        bookings = resp.data if resp.data else []
+        bookings = porter_resp.data if porter_resp.data else []
+
+        # Also check Distributor Delivers arrangements
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        dist_resp = supabase.table("arrangements").select("*")\
+            .eq("pickup_type", "Distributor Delivers")\
+            .eq("status", "Pending")\
+            .gte("order_placed_date", two_days_ago)\
+            .execute()
+        dist_arrangements = dist_resp.data if dist_resp.data else []
+
     except Exception as e:
         st.error(f"Error: {e}")
         bookings = []
+        dist_arrangements = []
+
+    if not bookings and not dist_arrangements:
+        st.info("No stock pending receipt!")
+        return
+
+    # Show Distributor Delivers section
+    if dist_arrangements:
+        st.markdown("### 🚚 Distributor Direct Delivery")
+        for arr in dist_arrangements:
+            st.markdown(f"📦 **#{arr.get('arrangement_no')}** — {arr.get('distributor','')} — {arr.get('area','')} — Medicines: {arr.get('no_medicines','')}")
+
+        st.divider()
+        dist_options = {
+            f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a
+            for a in dist_arrangements
+        }
+
+        with st.form("dist_receive_form", clear_on_submit=True):
+            selected_dist_label = st.selectbox("Select Arrangement *", list(dist_options.keys()), key="dr_select")
+            selected_dist_arr   = dist_options[selected_dist_label]
+
+            c1,c2 = st.columns(2)
+            with c1:
+                bills_received = st.number_input("No of Bills Received", min_value=0, step=1, key="dr_bills")
+            with c2:
+                receive_time = st.time_input("Receive Time", key="dr_time")
+
+            st.markdown("📸 **Image of Stock Received**")
+            upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+                key="dr_radio", label_visibility="collapsed")
+            if upload_opt == "Upload":
+                recv_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="dr_upload")
+            else:
+                recv_img = st.camera_input("Take Photo", key="dr_cam")
+
+            remarks = st.text_input("Remarks", key="dr_remarks")
+
+            if st.form_submit_button("Confirm Receipt ✅", type="primary", use_container_width=True):
+                img_name = upload_image(recv_img, "dist_recv") if recv_img else ""
+                try:
+                    supabase.table("arrangements").update({
+                        "status": "Reached Warehouse",
+                        "pickup_by": "Distributor",
+                        "pickup_time": str(receive_time),
+                    }).eq("id", selected_dist_arr["id"]).execute()
+
+                    supabase.table("daily_tasks").insert({
+                        "date": date_str(), "time": time_str(),
+                        "person": st.session_state.name, "team": st.session_state.team,
+                        "task_type": "Distributor Delivery Receipt",
+                        "details": {
+                            "arrangement_no": selected_dist_arr.get("arrangement_no"),
+                            "distributor": selected_dist_arr.get("distributor"),
+                            "bills_received": str(bills_received),
+                            "image": img_name,
+                            "remarks": remarks
+                        },
+                        "start_time": str(receive_time),
+                        "end_time": time_str(),
+                    }).execute()
+
+                    st.success("✅ Distributor delivery received!")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        st.divider()
 
     if not bookings:
-        st.info("No porter deliveries pending receipt!")
         return
 
     st.markdown(f"**{len(bookings)} porter delivery(s) incoming:**")
@@ -1579,7 +1744,7 @@ def form_porter_payment():
             payment_time = st.time_input("Payment Time", key="pp_time")
 
         st.markdown("📸 **Payment Bill Image**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True, key="pp_radio", label_visibility="collapsed")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="pp_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             bill_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="pp_upload")
         else:
@@ -1668,48 +1833,68 @@ def show_user_page():
 
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
-    st.title("👑 Admin Dashboard — RapidSurge Warehouse")
-    st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')}")
+    st.title("👑 RapidSurge Warehouse — Admin")
+    st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
+    # ── MAIN TABS ─────────────────────────────────────────────────────────────
     try:
-        resp = supabase.table("daily_tasks").select("*").execute()
-        df   = pd.DataFrame(resp.data) if resp.data else pd.DataFrame()
+        USERS_global = load_users()
     except:
-        df = pd.DataFrame()
+        pass
 
-    if df.empty:
-        st.warning("No data yet!")
-    else:
-        df["date"] = pd.to_datetime(df["date"])
-        today_df   = df[df["date"] == pd.to_datetime(date_str())]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 Dashboard",
+        "🔄 Arrangement Pipeline",
+        "📈 Performance",
+        "📝 Submit Entry",
+        "👥 Users & Settings",
+        "📥 Reports"
+    ])
 
-        # Today summary
-        st.subheader("📊 Today's Summary")
-
-        # Team task counts
-        teams = ["Purchase","Stock","Call","Delivery"]
-        cols  = st.columns(4)
-        for i,t in enumerate(teams):
-            with cols[i]:
-                count = len(today_df[today_df["team"]==t]) if not today_df.empty else 0
-                st.metric(t, count, "tasks")
-
-        # Arrangement summary
-        st.divider()
+    # ── TAB 1 — DASHBOARD ─────────────────────────────────────────────────────
+    with tab1:
         try:
-            arr_resp = supabase.table("arrangements").select("*")\
-                .eq("order_placed_date", date_str()).execute()
+            tasks_resp = supabase.table("daily_tasks").select("*").eq("date", date_str()).execute()
+            df = pd.DataFrame(tasks_resp.data) if tasks_resp.data else pd.DataFrame()
+            arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", date_str()).execute()
             arr_today = arr_resp.data if arr_resp.data else []
-        except:
+        except Exception as e:
+            st.error(f"Error: {e}")
+            df = pd.DataFrame()
             arr_today = []
 
+        # Arrangement summary
+        st.subheader("📋 Today's Arrangement Summary")
         a1,a2,a3,a4,a5 = st.columns(5)
-        with a1: st.metric("📋 Total Arrangements", len(arr_today))
+        with a1: st.metric("Total", len(arr_today))
         with a2: st.metric("🔴 Pending", len([a for a in arr_today if a.get("status")=="Pending"]))
         with a3: st.metric("🚚 In Transit", len([a for a in arr_today if "Transit" in str(a.get("status",""))]))
-        with a4: st.metric("📦 At Warehouse", len([a for a in arr_today if a.get("status")=="Reached Warehouse"]))
+        with a4: st.metric("🏭 At Warehouse", len([a for a in arr_today if a.get("status")=="Reached Warehouse"]))
         with a5: st.metric("✅ Completed", len([a for a in arr_today if a.get("status")=="Completed"]))
+
+        st.divider()
+
+        # Team task summary
+        st.subheader("👥 Team Tasks Today")
+        if not df.empty:
+            teams = ["Purchase","Stock","Call","Delivery"]
+            cols  = st.columns(4)
+            for i,t in enumerate(teams):
+                with cols[i]:
+                    count = len(df[df["team"]==t])
+                    st.metric(t, count, "tasks")
+
+            st.divider()
+            c1,c2 = st.columns(2)
+            with c1:
+                st.subheader("📈 Tasks by Team")
+                st.bar_chart(df["team"].value_counts())
+            with c2:
+                st.subheader("👤 Tasks by Person")
+                st.bar_chart(df["person"].value_counts())
+        else:
+            st.info("No tasks today yet!")
 
         st.divider()
 
@@ -1734,25 +1919,27 @@ def show_admin_page():
 
         st.divider()
 
-        # Pending arrangements
+        # All arrangements today
         st.subheader("📋 All Arrangements Today")
         try:
             arr = supabase.table("arrangements").select("*")\
                 .eq("order_placed_date", date_str()).execute()
             if arr.data:
                 arr_df = pd.DataFrame(arr.data)
-                # Add status emoji
                 def status_label(s):
-                    if s == "Pending": return "🔴 Pending"
-                    elif s == "Naresh Going to Pick": return "🚶 Naresh Going"
-                    elif s == "Picked Up - In Transit": return "🚚 In Transit"
-                    elif s == "Given to Porter": return "📦 Given to Porter"
-                    elif s == "Naresh Self Delivering": return "🛵 Naresh Delivering"
-                    elif s == "Reached Warehouse": return "🏭 At Warehouse"
-                    elif s == "Bill Checked": return "✔️ Bill Checked"
-                    elif s == "Bill Uploaded": return "📤 Bill Uploaded"
-                    elif s == "Completed": return "✅ Completed"
-                    else: return s
+                    labels = {
+                        "Pending": "🔴 Pending",
+                        "Picked Up - In Transit": "🚚 In Transit",
+                        "Porter Booked": "🚛 Porter Booked",
+                        "Given to Porter - In Transit": "🚛 Porter In Transit",
+                        "Reached Warehouse": "🏭 At Warehouse",
+                        "Bill Cross Checked": "✔️ Bill Checked",
+                        "Bill Uploaded": "📤 Bill Uploaded",
+                        "Stock Placed": "📍 Stock Placed",
+                        "Completed": "✅ Completed",
+                        "Placement Issue Found": "⚠️ Issue Found"
+                    }
+                    return labels.get(s, s)
                 arr_df["Status"] = arr_df["status"].apply(status_label)
                 display_cols = ["arrangement_no","distributor","area","order_placed_time","order_by","urgency","pickup_type","pickup_by","Status"]
                 existing_cols = [c for c in display_cols if c in arr_df.columns]
@@ -1762,377 +1949,380 @@ def show_admin_page():
         except Exception as e:
             st.error(f"Error: {e}")
 
-        st.divider()
-
-        # Filter entries
-        st.subheader("🔍 Filter & View All Tasks")
-        c1,c2,c3 = st.columns(3)
-        with c1: sel_team   = st.selectbox("Team",   ["All"]+sorted(df["team"].unique().tolist()), key="f1")
-        with c2: sel_person = st.selectbox("Person", ["All"]+sorted(df["person"].unique().tolist()), key="f2")
-        with c3: date_f     = st.selectbox("Period", ["Today","Yesterday","Last 7 Days","Last 30 Days","All Time"], key="f3")
-
-        filtered = df.copy()
-        if sel_team   != "All": filtered = filtered[filtered["team"]==sel_team]
-        if sel_person != "All": filtered = filtered[filtered["person"]==sel_person]
-        if date_f == "Today":
-            filtered = filtered[filtered["date"]==pd.to_datetime(date_str())]
-        elif date_f == "Yesterday":
-            filtered = filtered[filtered["date"]==pd.to_datetime(date_str())-pd.Timedelta(days=1)]
-        elif date_f == "Last 7 Days":
-            filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=7)]
-        elif date_f == "Last 30 Days":
-            filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=30)]
-
-        st.markdown(f"**{len(filtered)} tasks found**")
-        st.dataframe(filtered.sort_values("date",ascending=False), use_container_width=True)
-
-        # Download
-        st.divider()
-        st.subheader("📥 Download Reports")
-        c1,c2 = st.columns(2)
-        with c1:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                filtered.to_excel(w, index=False, sheet_name="All Tasks")
-            st.download_button("⬇️ Download Excel", buf.getvalue(),
-                f"rapidsurge_{date_str()}.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with c2:
-            st.download_button("⬇️ Download CSV", filtered.to_csv(index=False).encode(),
-                f"rapidsurge_{date_str()}.csv", "text/csv")
-
-    st.divider()
-
-    # ── PERFORMANCE DASHBOARD ─────────────────────────────────────────────────
-    st.subheader("📊 Performance Dashboard")
-
-    perf_date = st.date_input("Select Date", value=today_ist(), key="perf_date_admin")
-    perf_date_str = perf_date.strftime("%Y-%m-%d")
-
-    try:
-        # Load all tasks for selected date
-        tasks_resp = supabase.table("daily_tasks").select("*").eq("date", perf_date_str).execute()
-        tasks = tasks_resp.data if tasks_resp.data else []
-
-        # Load all arrangements for selected date
-        arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", perf_date_str).execute()
-        arrangements = arr_resp.data if arr_resp.data else []
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-        tasks = []
-        arrangements = []
-
-    if not tasks and not arrangements:
-        st.info("No data found for selected date!")
-    else:
-        import json
-
-        # ── SECTION 1 — PURCHASE SUMMARY ─────────────────────────────────────
-        st.markdown("### 🛒 Purchase Summary")
-        purchase_tasks = [t for t in tasks if t.get("team") == "Purchase"]
-
-        # Arrangement vs Normal orders
-        arr_orders  = [a for a in arrangements]
-        normal_orders = [t for t in purchase_tasks if t.get("task_type") == "Purchase Order"]
+    # ── TAB 2 — ARRANGEMENT PIPELINE ──────────────────────────────────────────
+    with tab2:
+        st.subheader("🔄 Arrangement Pipeline View")
 
         c1,c2,c3,c4 = st.columns(4)
-        with c1: st.metric("📋 Arrangement Orders", len(arr_orders))
-        with c2: st.metric("🛒 Normal Orders", len(normal_orders))
-        with c3:
-            total_sku = sum([int(t.get("details",{}).get("no_sku",0) or 0) for t in normal_orders])
-            st.metric("📦 Total SKUs (Normal)", total_sku)
-        with c4:
-            arr_sku = sum([int(a.get("no_medicines",0) or 0) for a in arr_orders])
-            st.metric("📦 Total SKUs (Arrangement)", arr_sku)
-
-        # Avg time per SKU for orders
-        st.markdown("**⏱️ Order Placement Time:**")
-        order_times = []
-        for t in normal_orders:
-            try:
-                dur  = int(t.get("duration_mins",0) or 0)
-                skus = int(t.get("details",{}).get("no_sku",0) or 0)
-                if skus > 0:
-                    order_times.append(round(dur/skus, 2))
-            except:
-                pass
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Avg Time/SKU (Normal Order)", f"{round(sum(order_times)/len(order_times),2) if order_times else 0} mins")
-        with c2: st.metric("Min Time/SKU", f"{min(order_times) if order_times else 0} mins")
-        with c3: st.metric("Max Time/SKU", f"{max(order_times) if order_times else 0} mins")
-
-        st.divider()
-
-        # ── SECTION 2 — BILL CROSS CHECK ─────────────────────────────────────
-        st.markdown("### ✔️ Bill Cross Check Performance")
-        crosscheck_tasks = [t for t in tasks if t.get("task_type") == "Bill Cross Check"]
-
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Total Cross Checks", len(crosscheck_tasks))
+        with c1:
+            pipeline_date = st.date_input("Date", value=today_ist(), key="pipeline_date_tab")
         with c2:
-            total_items = sum([int(t.get("details",{}).get("no_items",0) or 0) for t in crosscheck_tasks])
-            st.metric("Total Items Checked", total_items)
-        with c3:
-            issues = sum([
-                int(t.get("details",{}).get("near_expiry",0) or 0) +
-                int(t.get("details",{}).get("damaged",0) or 0) +
-                int(t.get("details",{}).get("contra",0) or 0) +
-                int(t.get("details",{}).get("wrong_batch",0) or 0)
-                for t in crosscheck_tasks
-            ])
-            st.metric("Total Issues Found", issues)
-
-        # Avg time per SKU
-        check_times = []
-        for t in crosscheck_tasks:
             try:
-                dur   = int(t.get("duration_mins",0) or 0)
-                items = int(t.get("details",{}).get("no_items",0) or 0)
-                if items > 0:
-                    check_times.append(round(dur/items, 2))
+                areas_resp = supabase.table("areas").select("name").eq("active", True).execute()
+                area_list = ["All Areas"] + [a["name"] for a in areas_resp.data]
             except:
-                pass
+                area_list = ["All Areas"]
+            pipeline_area = st.selectbox("Area", area_list, key="pipeline_area_tab")
+        with c3:
+            pipeline_status = st.selectbox("Status", [
+                "All", "Pending", "Picked Up - In Transit",
+                "Porter Booked", "Given to Porter - In Transit",
+                "Reached Warehouse", "Bill Cross Checked",
+                "Bill Uploaded", "Stock Placed", "Completed",
+                "Placement Issue Found"
+            ], key="pipeline_status_tab")
+        with c4:
+            pipeline_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pipeline_dist_tab")
 
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Avg Time/SKU (Cross Check)", f"{round(sum(check_times)/len(check_times),2) if check_times else 0} mins")
-        with c2: st.metric("Min Time/SKU", f"{min(check_times) if check_times else 0} mins")
-        with c3: st.metric("Max Time/SKU", f"{max(check_times) if check_times else 0} mins")
+        try:
+            pipeline_resp = supabase.table("arrangements").select("*")\
+                .eq("order_placed_date", pipeline_date.strftime("%Y-%m-%d"))\
+                .execute()
+            pipeline_arrs = pipeline_resp.data if pipeline_resp.data else []
+        except Exception as e:
+            st.error(f"Error: {e}")
+            pipeline_arrs = []
 
-        # Issues breakdown
-        if crosscheck_tasks:
-            st.markdown("**Issues Breakdown:**")
-            near_exp  = sum([int(t.get("details",{}).get("near_expiry",0) or 0) for t in crosscheck_tasks])
-            damaged   = sum([int(t.get("details",{}).get("damaged",0) or 0) for t in crosscheck_tasks])
-            contra    = sum([int(t.get("details",{}).get("contra",0) or 0) for t in crosscheck_tasks])
-            wrong_b   = sum([int(t.get("details",{}).get("wrong_batch",0) or 0) for t in crosscheck_tasks])
-            wrong_d   = sum([int(t.get("details",{}).get("wrong_discount",0) or 0) for t in crosscheck_tasks])
-            wrong_c   = sum([int(t.get("details",{}).get("wrong_calculation",0) or 0) for t in crosscheck_tasks])
-            shortage  = sum([int(t.get("details",{}).get("shortage",0) or 0) for t in crosscheck_tasks])
+        if pipeline_area != "All Areas":
+            pipeline_arrs = [a for a in pipeline_arrs if a.get("area","") == pipeline_area]
+        if pipeline_status != "All":
+            pipeline_arrs = [a for a in pipeline_arrs if a.get("status","") == pipeline_status]
+        if pipeline_dist:
+            pipeline_arrs = [a for a in pipeline_arrs if pipeline_dist.lower() in a.get("distributor","").lower()]
+
+        st.markdown(f"**{len(pipeline_arrs)} arrangements found**")
+
+        if pipeline_arrs:
+            for arr in pipeline_arrs:
+                status   = arr.get("status","")
+                urgency  = arr.get("urgency","Normal")
+                urgency_color = "🔴" if urgency == "Very Urgent" else "🟡" if urgency == "Urgent" else "🟢"
+
+                steps = [
+                    ("Order Placed",      arr.get("order_placed_time",""), arr.get("order_by",""),                   True),
+                    ("Picked Up",         arr.get("pickup_time",""),       arr.get("pickup_by",""),                  arr.get("pickup_time","") != ""),
+                    ("Porter Booked",     "",                              arr.get("porter_no",""),                  arr.get("porter_no","") != "" and arr.get("pickup_type","") != "Self Pick"),
+                    ("Handed to Porter",  "",                              "",                                       status in ["Given to Porter - In Transit","Reached Warehouse","Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]),
+                    ("Reached Warehouse", "",                              "",                                       status in ["Reached Warehouse","Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]),
+                    ("Bill Cross Checked",arr.get("cross_check_time",""), arr.get("cross_checked_by",""),           status in ["Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]),
+                    ("Bill Uploaded",     arr.get("bill_upload_time",""), arr.get("bill_uploaded_by",""),           status in ["Bill Uploaded","Stock Placed","Completed"]),
+                    ("Stock Placed",      arr.get("placement_time",""),   arr.get("placed_by",""),                  status in ["Stock Placed","Completed","Placement Issue Found"]),
+                    ("Cross Checked",     "",                              arr.get("cross_checked_by_placement",""), arr.get("cross_check_status","") == "Done"),
+                    ("Completed",         "",                              "",                                       status == "Completed"),
+                ]
+
+                with st.expander(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | **{status}**"):
+                    c1,c2 = st.columns([2,1])
+                    with c1:
+                        st.markdown("**📋 Pipeline Steps:**")
+                        for step_name, step_time, step_by, done in steps:
+                            if done:
+                                time_str_val = f"— {step_time}" if step_time else ""
+                                by_str = f"— {step_by}" if step_by else ""
+                                st.markdown(f"✅ **{step_name}** {time_str_val} {by_str}")
+                            else:
+                                st.markdown(f"⏳ {step_name}")
+                    with c2:
+                        st.markdown("**📊 Details:**")
+                        st.markdown(f"📦 Medicines: **{arr.get('no_medicines','N/A')}**")
+                        st.markdown(f"🏪 Distributor: **{arr.get('distributor','')}**")
+                        st.markdown(f"📍 Area: **{arr.get('area','')}**")
+                        st.markdown(f"👤 Ordered By: **{arr.get('order_by','')}**")
+                        st.markdown(f"🚚 Pickup: **{arr.get('pickup_type','')}**")
+                        st.markdown(f"🕐 Order Time: **{arr.get('order_placed_time','')}**")
+                        try:
+                            if arr.get("bill_upload_time") and arr.get("order_placed_time"):
+                                from datetime import datetime as dt
+                                o = dt.strptime(arr.get("order_placed_time",""), "%I:%M %p")
+                                u = dt.strptime(arr.get("bill_upload_time",""), "%I:%M %p")
+                                diff = int((u-o).total_seconds()/60)
+                                if diff > 0:
+                                    hours = diff // 60
+                                    mins  = diff % 60
+                                    st.markdown(f"⏱️ Total Time: **{hours}h {mins}m**")
+                        except:
+                            pass
+        else:
+            st.info("No arrangements found!")
+
+    # ── TAB 3 — PERFORMANCE ───────────────────────────────────────────────────
+    with tab3:
+        st.subheader("📈 Performance Dashboard")
+        perf_date = st.date_input("Select Date", value=today_ist(), key="perf_date_tab")
+        perf_date_str = perf_date.strftime("%Y-%m-%d")
+
+        try:
+            tasks_resp = supabase.table("daily_tasks").select("*").eq("date", perf_date_str).execute()
+            tasks = tasks_resp.data if tasks_resp.data else []
+            arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", perf_date_str).execute()
+            arrangements = arr_resp.data if arr_resp.data else []
+        except Exception as e:
+            st.error(f"Error: {e}")
+            tasks = []
+            arrangements = []
+
+        if not tasks and not arrangements:
+            st.info("No data found for selected date!")
+        else:
+            # Purchase Summary
+            st.markdown("### 🛒 Purchase Summary")
+            purchase_tasks  = [t for t in tasks if t.get("team") == "Purchase"]
+            normal_orders   = [t for t in purchase_tasks if t.get("task_type") == "Purchase Order"]
+            arr_orders      = arrangements
 
             c1,c2,c3,c4 = st.columns(4)
-            with c1:
-                st.metric("Near Expiry", near_exp)
-                st.metric("Damaged", damaged)
-            with c2:
-                st.metric("Contra Items", contra)
-                st.metric("Wrong Batch", wrong_b)
+            with c1: st.metric("📋 Arrangement Orders", len(arr_orders))
+            with c2: st.metric("🛒 Normal Orders", len(normal_orders))
             with c3:
-                st.metric("Wrong Discount", wrong_d)
-                st.metric("Wrong Calculation", wrong_c)
+                total_sku = sum([int(t.get("details",{}).get("no_sku",0) or 0) for t in normal_orders])
+                st.metric("📦 SKUs (Normal)", total_sku)
             with c4:
-                st.metric("Shortage", shortage)
+                arr_sku = sum([int(a.get("no_medicines",0) or 0) for a in arr_orders])
+                st.metric("📦 SKUs (Arrangement)", arr_sku)
 
-        st.divider()
+            st.divider()
 
-        # ── SECTION 3 — BILL UPLOAD ───────────────────────────────────────────
-        st.markdown("### 📤 Bill Upload Performance")
-        upload_tasks = [t for t in tasks if t.get("task_type") in ["Bill Upload","Bill Upload (Arrangement)"]]
-
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Total Bills Uploaded", len(upload_tasks))
-        with c2:
-            arr_uploads = len([t for t in upload_tasks if t.get("task_type") == "Bill Upload (Arrangement)"])
-            st.metric("Arrangement Bills", arr_uploads)
-        with c3:
-            normal_uploads = len([t for t in upload_tasks if t.get("task_type") == "Bill Upload"])
-            st.metric("Normal Bills", normal_uploads)
-
-        upload_times = []
-        for t in upload_tasks:
-            try:
-                dur   = int(t.get("duration_mins",0) or 0)
-                items = int(t.get("details",{}).get("no_items",0) or 0)
-                if items > 0 and dur > 0:
-                    upload_times.append(round(dur/items, 2))
-            except:
-                pass
-
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Avg Time/SKU (Upload)", f"{round(sum(upload_times)/len(upload_times),2) if upload_times else 0} mins")
-        with c2: st.metric("Min Time/SKU", f"{min(upload_times) if upload_times else 0} mins")
-        with c3: st.metric("Max Time/SKU", f"{max(upload_times) if upload_times else 0} mins")
-
-        st.divider()
-
-        # ── SECTION 4 — STOCK PLACEMENT ──────────────────────────────────────
-        st.markdown("### 📍 Stock Placement Performance")
-        placement_tasks = [t for t in tasks if t.get("task_type") == "Stock Placement"]
-
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Total Placements", len(placement_tasks))
-        with c2:
-            total_placed = sum([int(t.get("details",{}).get("no_medicines",0) or 0) for t in placement_tasks])
-            st.metric("Total Medicines Placed", total_placed)
-        with c3:
-            placement_issues = len([a for a in arrangements if a.get("status") == "Placement Issue Found"])
-            st.metric("Placement Issues", placement_issues)
-
-        placement_times = []
-        for t in placement_tasks:
-            try:
-                dur   = int(t.get("duration_mins",0) or 0)
-                items = int(t.get("details",{}).get("no_medicines",0) or 0)
-                if items > 0 and dur > 0:
-                    placement_times.append(round(dur/items, 2))
-            except:
-                pass
-
-        c1,c2,c3 = st.columns(3)
-        with c1: st.metric("Avg Time/SKU (Placement)", f"{round(sum(placement_times)/len(placement_times),2) if placement_times else 0} mins")
-        with c2: st.metric("Min Time/SKU", f"{min(placement_times) if placement_times else 0} mins")
-        with c3: st.metric("Max Time/SKU", f"{max(placement_times) if placement_times else 0} mins")
-
-        st.divider()
-
-        # ── SECTION 5 — ARRANGEMENT PIPELINE TIME ────────────────────────────
-        st.markdown("### ⏱️ Arrangement Pipeline Time")
-        st.caption("Time from Order Placed → Bill Uploaded")
-
-        pipeline_data = []
-        for arr in arrangements:
-            try:
-                order_time   = arr.get("order_placed_time","")
-                upload_time  = arr.get("bill_upload_time","")
-                if order_time and upload_time and upload_time != "":
-                    from datetime import datetime as dt
-                    fmt = "%I:%M %p"
-                    o = dt.strptime(order_time, fmt)
-                    u = dt.strptime(upload_time, fmt)
-                    diff = int((u-o).total_seconds()/60)
-                    if diff > 0:
-                        pipeline_data.append({
-                            "Arrangement": arr.get("arrangement_no",""),
-                            "Distributor": arr.get("distributor",""),
-                            "Order Time": order_time,
-                            "Bill Upload Time": upload_time,
-                            "Total Time (mins)": diff
-                        })
-            except:
-                pass
-
-        if pipeline_data:
-            pipeline_df = pd.DataFrame(pipeline_data)
-            st.dataframe(pipeline_df, use_container_width=True)
-            avg_pipeline = round(pipeline_df["Total Time (mins)"].mean(), 1)
+            # Bill Cross Check
+            st.markdown("### ✔️ Bill Cross Check")
+            crosscheck_tasks = [t for t in tasks if t.get("task_type") == "Bill Cross Check"]
             c1,c2,c3 = st.columns(3)
-            with c1: st.metric("Avg Pipeline Time", f"{avg_pipeline} mins")
-            with c2: st.metric("Fastest", f"{pipeline_df['Total Time (mins)'].min()} mins")
-            with c3: st.metric("Slowest", f"{pipeline_df['Total Time (mins)'].max()} mins")
-        else:
-            st.info("No completed pipeline data yet for this date!")
+            with c1: st.metric("Total Cross Checks", len(crosscheck_tasks))
+            with c2:
+                total_items = sum([int(t.get("details",{}).get("no_items",0) or 0) for t in crosscheck_tasks])
+                st.metric("Items Checked", total_items)
+            with c3:
+                issues = sum([
+                    int(t.get("details",{}).get("near_expiry",0) or 0) +
+                    int(t.get("details",{}).get("damaged",0) or 0) +
+                    int(t.get("details",{}).get("contra",0) or 0) +
+                    int(t.get("details",{}).get("wrong_batch",0) or 0)
+                    for t in crosscheck_tasks
+                ])
+                st.metric("Issues Found", issues)
+
+            check_times = []
+            for t in crosscheck_tasks:
+                try:
+                    dur = int(t.get("duration_mins",0) or 0)
+                    items = int(t.get("details",{}).get("no_items",0) or 0)
+                    if items > 0: check_times.append(round(dur/items,2))
+                except: pass
+            c1,c2,c3 = st.columns(3)
+            with c1: st.metric("Avg Time/SKU", f"{round(sum(check_times)/len(check_times),2) if check_times else 0} mins")
+            with c2: st.metric("Min Time/SKU", f"{min(check_times) if check_times else 0} mins")
+            with c3: st.metric("Max Time/SKU", f"{max(check_times) if check_times else 0} mins")
+
+            st.divider()
+
+            # Stock Placement
+            st.markdown("### 📍 Stock Placement")
+            placement_tasks = [t for t in tasks if t.get("task_type") == "Stock Placement"]
+            c1,c2,c3 = st.columns(3)
+            with c1: st.metric("Total Placements", len(placement_tasks))
+            with c2:
+                total_placed = sum([int(t.get("details",{}).get("no_medicines",0) or 0) for t in placement_tasks])
+                st.metric("Medicines Placed", total_placed)
+            with c3:
+                placement_issues = len([a for a in arrangements if a.get("status") == "Placement Issue Found"])
+                st.metric("Placement Issues", placement_issues)
+
+            placement_times = []
+            for t in placement_tasks:
+                try:
+                    dur = int(t.get("duration_mins",0) or 0)
+                    items = int(t.get("details",{}).get("no_medicines",0) or 0)
+                    if items > 0 and dur > 0: placement_times.append(round(dur/items,2))
+                except: pass
+            c1,c2,c3 = st.columns(3)
+            with c1: st.metric("Avg Time/SKU", f"{round(sum(placement_times)/len(placement_times),2) if placement_times else 0} mins")
+            with c2: st.metric("Min Time/SKU", f"{min(placement_times) if placement_times else 0} mins")
+            with c3: st.metric("Max Time/SKU", f"{max(placement_times) if placement_times else 0} mins")
+
+            st.divider()
+
+            # Team Member Performance
+            st.markdown("### 👥 Team Member Performance")
+            if tasks:
+                tasks_df = pd.DataFrame(tasks)
+                person_summary = tasks_df.groupby(["person","team","task_type"]).size().reset_index(name="count")
+                st.dataframe(person_summary, use_container_width=True)
+                st.bar_chart(tasks_df.groupby("person").size())
+
+    # ── TAB 4 — SUBMIT ENTRY ──────────────────────────────────────────────────
+    with tab4:
+        st.subheader("📝 Submit Entry")
+        tabs_entry = st.tabs(["🛒 Purchase","📋 Arrangement","🧾 Bill Upload","📞 Call","🚚 Delivery","🚛 Book Porter","🚛 Porter Handover","📦 Receive Porter","💰 Porter Payment","✏️ Other"])
+        with tabs_entry[0]: form_purchase_order()
+        with tabs_entry[1]: form_arrangement()
+        with tabs_entry[2]: form_bill_upload()
+        with tabs_entry[3]: form_call_log()
+        with tabs_entry[4]: form_delivery()
+        with tabs_entry[5]: form_book_porter()
+        with tabs_entry[6]: form_porter_handover()
+        with tabs_entry[7]: form_porter_receive()
+        with tabs_entry[8]: form_porter_payment()
+        with tabs_entry[9]: form_other_task()
+
+    # ── TAB 5 — USERS & SETTINGS ──────────────────────────────────────────────
+    with tab5:
+        # User Management
+        st.subheader("👥 User Management")
+        tab_u1, tab_u2 = st.tabs(["➕ Add User","👥 Manage Users"])
+        with tab_u1:
+            with st.form("add_user_form", clear_on_submit=True):
+                c1,c2 = st.columns(2)
+                with c1:
+                    new_username = st.text_input("Username *")
+                    new_name     = st.text_input("Full Name *")
+                    new_password = st.text_input("Password *")
+                with c2:
+                    new_team = st.selectbox("Team *", ["Purchase","Stock","Call","Delivery","Admin"], key="nu_team")
+                    new_role = st.selectbox("Role", ["user","admin"], key="nu_role")
+                if st.form_submit_button("Add User ✅", type="primary", use_container_width=True):
+                    if not new_username or not new_name or not new_password:
+                        st.error("Fill all fields!")
+                    else:
+                        try:
+                            check = supabase.table("app_users").select("id").eq("username", new_username).execute()
+                            if check.data:
+                                st.error(f"❌ Username '{new_username}' already exists!")
+                            else:
+                                supabase.table("app_users").insert({
+                                    "username": new_username, "password": new_password,
+                                    "name": new_name, "team": new_team,
+                                    "role": new_role, "active": True
+                                }).execute()
+                                load_users.clear()
+                                st.success(f"✅ {new_name} added! Username: {new_username} | Password: {new_password}")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+        with tab_u2:
+            try:
+                users_resp = supabase.table("app_users").select("*").order("team").execute()
+                if users_resp.data:
+                    teams = ["Admin","Purchase","Stock","Call","Delivery"]
+                    for team in teams:
+                        team_users = [u for u in users_resp.data if u.get("team") == team]
+                        if team_users:
+                            st.markdown(f"**{team} Team ({len(team_users)} members)**")
+                            for u in team_users:
+                                c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
+                                with c1: st.markdown(f"👤 **{u['name']}**")
+                                with c2: st.markdown(f"🔑 `{u['username']}`")
+                                with c3: st.markdown(f"🔒 `{u['password']}`")
+                                with c4: st.markdown("✅ Active" if u.get("active") else "❌ Inactive")
+                                with c5:
+                                    if u.get("active"):
+                                        if st.button("Deactivate", key=f"deact_{u['id']}"):
+                                            supabase.table("app_users").update({"active": False}).eq("id", u["id"]).execute()
+                                            st.rerun()
+                                    else:
+                                        if st.button("Activate", key=f"act_{u['id']}"):
+                                            supabase.table("app_users").update({"active": True}).eq("id", u["id"]).execute()
+                                            st.rerun()
+                            st.divider()
+            except Exception as e:
+                st.error(f"Error: {e}")
 
         st.divider()
 
-        # ── SECTION 6 — TEAM MEMBER PERFORMANCE ──────────────────────────────
-        st.markdown("### 👥 Team Member Performance")
-
-        if tasks:
-            tasks_df = pd.DataFrame(tasks)
-            person_summary = tasks_df.groupby(["person","team","task_type"]).size().reset_index(name="count")
-            st.dataframe(person_summary, use_container_width=True)
-
-            # Bar chart
-            person_counts = tasks_df.groupby("person").size().reset_index(name="Total Tasks")
-            st.bar_chart(person_counts.set_index("person"))
-
-    st.divider()
-
-    # ── MANAGE WAREHOUSES ────────────────────────────────────────────────────
-    st.subheader("🏭 Manage Warehouses & Areas")
-    tab_w, tab_a = st.tabs(["🏭 Warehouses", "📍 Areas"])
-
-    with tab_w:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Add New Warehouse**")
-            with st.form("add_warehouse", clear_on_submit=True):
-                wh_name = st.text_input("Warehouse Name *")
-                wh_loc  = st.text_input("Location")
-                if st.form_submit_button("Add ✅"):
-                    if wh_name:
-                        try:
-                            supabase.table("warehouses").insert({
-                                "name": wh_name, "location": wh_loc
-                            }).execute()
-                            st.success(f"✅ {wh_name} added!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-                    else:
-                        st.error("Enter warehouse name!")
-        with col2:
-            st.markdown("**Current Warehouses**")
-            try:
-                wh_resp = supabase.table("warehouses").select("*").eq("active", True).execute()
-                if wh_resp.data:
-                    for wh in wh_resp.data:
-                        c1,c2 = st.columns([3,1])
-                        with c1: st.markdown(f"🏭 **{wh['name']}** — {wh.get('location','')}")
-                        with c2:
-                            if st.button("Remove", key=f"rm_wh_{wh['id']}"):
-                                supabase.table("warehouses").update({"active": False}).eq("id", wh["id"]).execute()
+        # Warehouses & Areas
+        st.subheader("🏭 Manage Warehouses & Areas")
+        tab_w, tab_a = st.tabs(["🏭 Warehouses","📍 Areas"])
+        with tab_w:
+            c1,c2 = st.columns(2)
+            with c1:
+                with st.form("add_warehouse", clear_on_submit=True):
+                    wh_name = st.text_input("Warehouse Name *")
+                    wh_loc  = st.text_input("Location")
+                    if st.form_submit_button("Add ✅"):
+                        if wh_name:
+                            try:
+                                supabase.table("warehouses").insert({"name": wh_name, "location": wh_loc}).execute()
+                                st.success(f"✅ {wh_name} added!")
                                 st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+            with c2:
+                try:
+                    wh_resp = supabase.table("warehouses").select("*").eq("active", True).execute()
+                    if wh_resp.data:
+                        for wh in wh_resp.data:
+                            c1,c2 = st.columns([3,1])
+                            with c1: st.markdown(f"🏭 **{wh['name']}**")
+                            with c2:
+                                if st.button("Remove", key=f"rm_wh_{wh['id']}"):
+                                    supabase.table("warehouses").update({"active": False}).eq("id", wh["id"]).execute()
+                                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-    with tab_a:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Add New Area**")
-            with st.form("add_area", clear_on_submit=True):
-                area_name = st.text_input("Area Name *")
-                if st.form_submit_button("Add ✅"):
-                    if area_name:
-                        try:
-                            supabase.table("areas").insert({
-                                "name": area_name
-                            }).execute()
-                            st.success(f"✅ {area_name} added!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-                    else:
-                        st.error("Enter area name!")
-        with col2:
-            st.markdown("**Current Areas**")
-            try:
-                area_resp = supabase.table("areas").select("*").eq("active", True).execute()
-                if area_resp.data:
-                    for area in area_resp.data:
-                        c1,c2 = st.columns([3,1])
-                        with c1: st.markdown(f"📍 **{area['name']}**")
-                        with c2:
-                            if st.button("Remove", key=f"rm_area_{area['id']}"):
-                                supabase.table("areas").update({"active": False}).eq("id", area["id"]).execute()
+        with tab_a:
+            c1,c2 = st.columns(2)
+            with c1:
+                with st.form("add_area", clear_on_submit=True):
+                    area_name = st.text_input("Area Name *")
+                    if st.form_submit_button("Add ✅"):
+                        if area_name:
+                            try:
+                                supabase.table("areas").insert({"name": area_name}).execute()
+                                st.success(f"✅ {area_name} added!")
                                 st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+            with c2:
+                try:
+                    area_resp = supabase.table("areas").select("*").eq("active", True).execute()
+                    if area_resp.data:
+                        for area in area_resp.data:
+                            c1,c2 = st.columns([3,1])
+                            with c1: st.markdown(f"📍 **{area['name']}**")
+                            with c2:
+                                if st.button("Remove", key=f"rm_area_{area['id']}"):
+                                    supabase.table("areas").update({"active": False}).eq("id", area["id"]).execute()
+                                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-    st.divider()
-    st.subheader("📝 Submit Entry")
-    tabs = st.tabs(["🛒 Purchase","📋 Arrangement","🧾 Bill Upload","📞 Call","🚚 Delivery","🚛 Book Porter","🚛 Porter Handover","📦 Receive Porter","💰 Porter Payment","✏️ Other"])
-    with tabs[0]: form_purchase_order()
-    with tabs[1]: form_arrangement()
-    with tabs[2]: form_bill_upload()
-    with tabs[3]: form_call_log()
-    with tabs[4]: form_delivery()
-    with tabs[5]: form_book_porter()
-    with tabs[6]: form_porter_handover()
-    with tabs[7]: form_porter_receive()
-    with tabs[8]: form_porter_payment()
-    with tabs[9]: form_other_task()
+    # ── TAB 6 — REPORTS ───────────────────────────────────────────────────────
+    with tab6:
+        st.subheader("📥 Download Reports")
+        c1,c2,c3 = st.columns(3)
+        with c1: sel_team   = st.selectbox("Team", ["All","Purchase","Stock","Call","Delivery"], key="r_team")
+        with c2: sel_person = st.selectbox("Person", ["All"] + [u["name"] for u in supabase.table("app_users").select("name").execute().data], key="r_person")
+        with c3: date_f     = st.selectbox("Period", ["Today","Yesterday","Last 7 Days","Last 30 Days","All Time"], key="r_date")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-def main():
-    if not st.session_state.logged_in:
-        show_login()
-    else:
-        show_sidebar()
-        if st.session_state.role == "admin":
-            show_admin_page()
-        else:
-            show_user_page()
+        try:
+            all_tasks = supabase.table("daily_tasks").select("*").execute()
+            filtered  = pd.DataFrame(all_tasks.data) if all_tasks.data else pd.DataFrame()
 
-if __name__ == "__main__":
-    main()
+            if not filtered.empty:
+                filtered["date"] = pd.to_datetime(filtered["date"])
+                if sel_team != "All": filtered = filtered[filtered["team"]==sel_team]
+                if sel_person != "All": filtered = filtered[filtered["person"]==sel_person]
+                if date_f == "Today": filtered = filtered[filtered["date"]==pd.to_datetime(date_str())]
+                elif date_f == "Yesterday": filtered = filtered[filtered["date"]==pd.to_datetime(date_str())-pd.Timedelta(days=1)]
+                elif date_f == "Last 7 Days": filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=7)]
+                elif date_f == "Last 30 Days": filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=30)]
+
+                st.markdown(f"**{len(filtered)} tasks found**")
+                st.dataframe(filtered.sort_values("date", ascending=False), use_container_width=True)
+
+                c1,c2 = st.columns(2)
+                with c1:
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                        filtered.to_excel(w, index=False, sheet_name="Tasks")
+                    st.download_button("⬇️ Download Excel", buf.getvalue(),
+                        f"rapidsurge_{date_str()}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_excel_tab")
+                with c2:
+                    st.download_button("⬇️ Download CSV", filtered.to_csv(index=False).encode(),
+                        f"rapidsurge_{date_str()}.csv", "text/csv", key="dl_csv_tab")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
