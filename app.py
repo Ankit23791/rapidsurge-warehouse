@@ -1,37 +1,3 @@
-with open("/Users/mac/app.py", "r") as f:
-    content = f.read()
-
-old = '''st.set_page_config(
-    page_title="RapidSurge Warehouse",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)'''
-
-new = '''st.set_page_config(
-    page_title="RapidSurge Warehouse",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Show errors clearly
-import traceback
-try:
-    pass
-except Exception as e:
-    st.error(f"App Error: {e}")
-    st.code(traceback.format_exc())'''
-
-content = content.replace(old, new)
-
-with open("/Users/mac/app.py", "w") as f:
-    f.write(content)
-
-print("✅ Error display added!")
-
-
-
 import streamlit as st
 import pandas as pd
 import os
