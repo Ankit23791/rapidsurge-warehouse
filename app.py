@@ -1,4 +1,3 @@
-# RapidSurge Warehouse v2.1 - Updated 19 July 2026
 
 import streamlit as st
 import pandas as pd
@@ -28,11 +27,15 @@ def date_str():
 
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
 # Keys stored in Streamlit secrets or environment variables only
-SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-SUPABASE_SECRET = os.getenv("SUPABASE_SECRET") or st.secrets.get("SUPABASE_SECRET", "")
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_SECRET = st.secrets["SUPABASE_SECRET"]
+except:
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SECRET = os.getenv("SUPABASE_SECRET", "")
 
 if not SUPABASE_URL or not SUPABASE_SECRET:
-    st.error("⚠️ Supabase credentials not found! Please set SUPABASE_URL and SUPABASE_SECRET.")
+    st.error("⚠️ Supabase credentials not found!")
     st.stop()
 
 @st.cache_resource
