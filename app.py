@@ -54,10 +54,19 @@ def load_areas():
         return ["Gaur City","Sector 78","Indirapuram"]
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
-# Users loaded from Streamlit secrets
+@st.cache_data(ttl=300)
 def load_users():
     try:
-        return st.secrets["USERS"]
+        resp = supabase.table("app_users").select("*").eq("active", True).execute()
+        users = {}
+        for u in resp.data:
+            users[u["username"]] = {
+                "password": u["password"],
+                "name": u["name"],
+                "team": u["team"],
+                "role": u["role"]
+            }
+        return users
     except:
         return {}
 
