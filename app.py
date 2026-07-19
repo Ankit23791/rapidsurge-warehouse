@@ -2165,3 +2165,31 @@ def show_admin_page():
             st.error(f"Error: {e}")
 
 
+
+
+def show_forms_section():
+    st.subheader("📝 Submit Entry")
+    tabs = st.tabs(["🛒 Purchase","📋 Arrangement","🧾 Bill Upload","📞 Call","🚚 Delivery","🚛 Book Porter","🚛 Handover","📦 Receive","💰 Payment","✏️ Other"])
+    with tabs[0]: form_purchase_order()
+    with tabs[1]: form_arrangement()
+    with tabs[2]: form_bill_upload()
+    with tabs[3]: form_call_log()
+    with tabs[4]: form_delivery()
+    with tabs[5]: form_book_porter()
+    with tabs[6]: form_porter_handover()
+    with tabs[7]: form_porter_receive()
+    with tabs[8]: form_porter_payment()
+    with tabs[9]: form_other_task()
+
+def main():
+    if not st.session_state.logged_in:
+        show_login()
+    else:
+        show_sidebar()
+        if st.session_state.role == "admin":
+            show_admin_page()
+        else:
+            show_user_page()
+
+if __name__ == "__main__":
+    main()
