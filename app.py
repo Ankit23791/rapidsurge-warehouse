@@ -800,39 +800,66 @@ def form_stock_placement():
     try:
         from datetime import timedelta
         two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-        resp = supabase.table("arrangements").select("*")\
+        arr_resp = supabase.table("arrangements").select("*")\
             .eq("status", "Bill Uploaded")\
             .gte("order_placed_date", two_days_ago)\
             .execute()
-        arrangements = resp.data if resp.data else []
+        arrangements = arr_resp.data if arr_resp.data else []
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
 
-    if not arrangements:
-        st.info("No arrangements pending placement!")
+    # Load Normal Orders with bill uploaded
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        normal_resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Bill Upload")\
+            .gte("date", two_days_ago)\
+            .execute()
+        normal_orders = []
+        for t in (normal_resp.data or []):
+            d = t.get("details",{})
+            if not d.get("arrangement_no","") and not d.get("placement_done"):
+                normal_orders.append(t)
+    except:
+        normal_orders = []
+
+    if not arrangements and not normal_orders:
+        st.info("No items pending placement!")
         return
 
-    arr_options = {
-        f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a
-        for a in arrangements
-    }
+    st.markdown(f"**Pending:** {len(arrangements)} Arrangements + {len(normal_orders)} Normal Orders")
+
+    # Build combined options
+    all_options = {}
+    for a in arrangements:
+        all_options[f"ARR: #{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}"] = {"type": "arrangement", "data": a}
+    for n in normal_orders:
+        d = n.get("details",{})
+        all_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
     start = timer_button("stock_placement")
     if start is None:
         return
 
-    selected_label = st.selectbox("Select Arrangement *", list(arr_options.keys()), key="sp_arr")
-    selected_arr   = arr_options[selected_label]
+    selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="sp_arr")
+    selected_item  = all_options[selected_label]
+    item_type      = selected_item["type"]
+    selected_data  = selected_item["data"]
 
-    st.info(f"📋 Distributor: **{selected_arr.get('distributor','')}** | Area: **{selected_arr.get('area','')}** | Arrangement: **{selected_arr.get('arrangement_no','')}**")
-
-    # Load medicines for this arrangement
-    try:
-        meds_resp = supabase.table("arrangement_medicines").select("*")\
-            .eq("arrangement_id", selected_arr["id"]).execute()
-        medicines = meds_resp.data if meds_resp.data else []
-    except:
+    if item_type == "arrangement":
+        st.info(f"📋 Distributor: **{selected_data.get('distributor','')}** | Area: **{selected_data.get('area','')}** | Arrangement: **{selected_data.get('arrangement_no','')}**")
+        # Load medicines for arrangement
+        try:
+            meds_resp = supabase.table("arrangement_medicines").select("*")\
+                .eq("arrangement_id", selected_data["id"]).execute()
+            medicines = meds_resp.data if meds_resp.data else []
+        except:
+            medicines = []
+    else:
+        d = selected_data.get("details",{})
+        st.info(f"📋 Distributor: **{d.get('distributor','')}** | Bill: **{d.get('bill_no','')}** | Items: **{d.get('no_items','')}**")
         medicines = []
 
     with st.form("stock_placement_form", clear_on_submit=True):
@@ -879,19 +906,32 @@ def form_stock_placement():
                 import json
 
                 # Save placement data
-                supabase.table("arrangements").update({
-                    "status": "Stock Placed",
-                    "placed_by": st.session_state.name,
-                    "placement_time": end_time,
-                    "placement_image": img_name,
-                    "placement_data": json.dumps(placement_data),
-                }).eq("id", selected_arr["id"]).execute()
+                if item_type == "arrangement":
+                    supabase.table("arrangements").update({
+                        "status": "Stock Placed",
+                        "placed_by": st.session_state.name,
+                        "placement_time": end_time,
+                        "placement_image": img_name,
+                        "placement_data": json.dumps(placement_data),
+                    }).eq("id", selected_data["id"]).execute()
+                else:
+                    d = selected_data.get("details",{})
+                    d["placement_done"] = True
+                    d["placed_by"] = st.session_state.name
+                    d["placement_time"] = end_time
+                    d["placement_image"] = img_name
+                    supabase.table("daily_tasks").update({
+                        "details": d
+                    }).eq("id", selected_data["id"]).execute()
 
-                # Randomly select 2 medicines for cross check
-                if medicines and len(medicines) >= 2:
-                    check_meds = random.sample(medicines, 2)
-                elif medicines and len(medicines) == 1:
-                    check_meds = medicines
+                # Randomly select 2 medicines for cross check (only for arrangements)
+                if item_type == "arrangement":
+                    if medicines and len(medicines) >= 2:
+                        check_meds = random.sample(medicines, 2)
+                    elif medicines and len(medicines) == 1:
+                        check_meds = medicines
+                    else:
+                        check_meds = []
                 else:
                     check_meds = []
 
@@ -900,10 +940,11 @@ def form_stock_placement():
                               "location": placement_data.get(m["id"],{}).get("location","")}
                              for m in check_meds]
 
-                supabase.table("arrangements").update({
-                    "cross_check_medicines": json.dumps(check_list),
-                    "cross_check_status": "Pending"
-                }).eq("id", selected_arr["id"]).execute()
+                if item_type == "arrangement" and check_meds:
+                    supabase.table("arrangements").update({
+                        "cross_check_medicines": json.dumps(check_list),
+                        "cross_check_status": "Pending"
+                    }).eq("id", selected_data["id"]).execute()
 
                 # Log daily task
                 supabase.table("daily_tasks").insert({
@@ -911,8 +952,8 @@ def form_stock_placement():
                     "person": st.session_state.name, "team": st.session_state.team,
                     "task_type": "Stock Placement",
                     "details": {
-                        "arrangement_no": selected_arr.get("arrangement_no"),
-                        "distributor": selected_arr.get("distributor"),
+                        "arrangement_no": selected_data.get("arrangement_no","") if item_type=="arrangement" else "",
+                        "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor",""),
                         "no_medicines": str(len(medicines)),
                         "placement_image": img_name,
                         "remarks": remarks
@@ -1051,6 +1092,75 @@ def form_placement_crosscheck():
             except Exception as e:
                 st.error(f"Error: {e}")
 
+# ── REGISTER ENTRY FORM ──────────────────────────────────────────────────────
+
+def form_register_entry():
+    st.subheader("📒 Register Entry")
+    st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
+
+    with st.form("register_entry_form", clear_on_submit=True):
+        c1,c2 = st.columns(2)
+        with c1:
+            order_type  = st.selectbox("Order Type *", ["Normal Order","Arrangement"], key="re_type")
+            distributor = st.selectbox("Distributor *", DISTRIBUTORS, key="re_dist")
+            bill_no     = st.text_input("Bill Number *")
+        with c2:
+            no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
+            delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key="re_delby")
+
+        # Show arrangement dropdown if arrangement selected
+        arr_no = ""
+        if order_type == "Arrangement":
+            try:
+                from datetime import timedelta
+                two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+                resp = supabase.table("arrangements").select("*")\
+                    .eq("status", "Reached Warehouse")\
+                    .gte("order_placed_date", two_days_ago)\
+                    .execute()
+                arr_list = resp.data if resp.data else []
+                if arr_list:
+                    arr_options = ["—"] + [f"#{a.get('arrangement_no')} — {a.get('distributor','')}" for a in arr_list]
+                    arr_select = st.selectbox("Arrangement No", arr_options, key="re_arr")
+                    if arr_select != "—":
+                        arr_no = arr_select.split("—")[0].replace("#","").strip()
+                else:
+                    st.info("No arrangements found!")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+        bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
+        remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
+
+        if st.form_submit_button("Submit Entry ✅", type="primary", use_container_width=True):
+            if not bill_no or no_items == 0:
+                st.error("Fill Bill Number and No of Items!")
+            else:
+                try:
+                    supabase.table("daily_tasks").insert({
+                        "date": date_str(),
+                        "time": time_str(),
+                        "person": st.session_state.name,
+                        "team": st.session_state.team,
+                        "task_type": "Register Entry",
+                        "details": {
+                            "order_type": order_type,
+                            "distributor": distributor,
+                            "bill_no": bill_no,
+                            "bill_amount": str(bill_amount),
+                            "no_items": str(no_items),
+                            "delivery_by": delivery_by,
+                            "arrangement_no": arr_no,
+                            "remarks": remarks
+                        },
+                        "start_time": time_str(),
+                        "end_time": time_str(),
+                    }).execute()
+                    st.success(f"✅ Register entry done! {no_items} items from {distributor} received!")
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
 # ── BILL CROSS CHECK & UPLOAD FORMS ──────────────────────────────────────────
 
 def form_bill_crosscheck():
@@ -1069,27 +1179,56 @@ def form_bill_crosscheck():
         st.error(f"Error: {e}")
         arrangements = []
 
-    if not arrangements:
-        st.info("No arrangements pending cross check!")
+    # Load normal orders from register entry
+    try:
+        normal_resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Register Entry")\
+            .eq("date", date_str())\
+            .execute()
+        normal_orders = normal_resp.data if normal_resp.data else []
+        # Filter out already cross checked
+        normal_orders = [n for n in normal_orders 
+                        if not n.get("details",{}).get("cross_checked")]
+    except:
+        normal_orders = []
+
+    if not arrangements and not normal_orders:
+        st.info("No items pending cross check!")
         return
 
-    arr_options = {
-        f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a
-        for a in arrangements
-    }
+    # Show pending items
+    if normal_orders:
+        st.markdown("### 📦 Normal Orders Pending Cross Check")
+        for n in normal_orders:
+            d = n.get("details",{})
+            st.markdown(f"🧾 **{d.get('distributor','')}** | Bill: **{d.get('bill_no','')}** | Items: **{d.get('no_items','')}** | Amount: ₹**{d.get('bill_amount','')}**")
+        st.divider()
+
+    # Combine options
+    arr_options = {}
+    for a in arrangements:
+        arr_options[f"ARR: #{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}"] = {"type": "arrangement", "data": a}
+    for n in normal_orders:
+        d = n.get("details",{})
+        arr_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
     start = timer_button("bill_crosscheck")
     if start is None:
         return
 
     with st.form("bill_crosscheck_form", clear_on_submit=True):
-        selected_label = st.selectbox("Select Arrangement *", list(arr_options.keys()), key="bc_arr")
-        selected_arr   = arr_options[selected_label]
+        selected_label = st.selectbox("Select Item *", list(arr_options.keys()), key="bc_arr")
+        selected_item  = arr_options[selected_label]
+        item_type      = selected_item["type"]
+        selected_data  = selected_item["data"]
 
-        st.info(f"📋 Distributor: **{selected_arr.get('distributor','')}** | Area: **{selected_arr.get('area','')}** | Arrangement: **{selected_arr.get('arrangement_no','')}**")
-
-        # Bill number - auto + manual
-        bill_no = st.text_input("Bill Number", value=selected_arr.get("bill_order_id",""), help="Auto filled from arrangement - edit if different")
+        if item_type == "arrangement":
+            st.info(f"📋 Distributor: **{selected_data.get('distributor','')}** | Area: **{selected_data.get('area','')}** | Arrangement: **{selected_data.get('arrangement_no','')}**")
+            bill_no = st.text_input("Bill Number", value=selected_data.get("bill_order_id",""))
+        else:
+            d = selected_data.get("details",{})
+            st.info(f"📋 Distributor: **{d.get('distributor','')}** | Bill: **{d.get('bill_no','')}** | Items: **{d.get('no_items','')}** | Amount: ₹**{d.get('bill_amount','')}**")
+            bill_no = st.text_input("Bill Number", value=d.get("bill_no",""))
 
         c1,c2,c3 = st.columns(3)
         with c1:
@@ -1112,12 +1251,26 @@ def form_bill_crosscheck():
             avg_time = round(duration / no_items, 2) if no_items > 0 else 0
 
             try:
-                # Update arrangement status
-                supabase.table("arrangements").update({
-                    "status": "Bill Cross Checked",
-                    "cross_checked_by": st.session_state.name,
-                    "cross_check_time": end_time,
-                }).eq("id", selected_arr["id"]).execute()
+                # Update status based on type
+                if item_type == "arrangement":
+                    supabase.table("arrangements").update({
+                        "status": "Bill Cross Checked",
+                        "cross_checked_by": st.session_state.name,
+                        "cross_check_time": end_time,
+                    }).eq("id", selected_data["id"]).execute()
+                    dist = selected_data.get("distributor","")
+                    arr_no = selected_data.get("arrangement_no","")
+                else:
+                    # Mark normal order as cross checked
+                    d = selected_data.get("details",{})
+                    d["cross_checked"] = True
+                    d["cross_checked_by"] = st.session_state.name
+                    d["cross_check_time"] = end_time
+                    supabase.table("daily_tasks").update({
+                        "details": d
+                    }).eq("id", selected_data["id"]).execute()
+                    dist = d.get("distributor","")
+                    arr_no = ""
 
                 # Save to daily tasks
                 supabase.table("daily_tasks").insert({
@@ -1125,8 +1278,8 @@ def form_bill_crosscheck():
                     "person": st.session_state.name, "team": st.session_state.team,
                     "task_type": "Bill Cross Check",
                     "details": {
-                        "arrangement_no": selected_arr.get("arrangement_no"),
-                        "distributor": selected_arr.get("distributor"),
+                        "arrangement_no": arr_no,
+                        "distributor": dist,
                         "bill_no": bill_no,
                         "no_items": str(no_items),
                         "near_expiry": str(near_expiry),
@@ -1151,44 +1304,85 @@ def form_bill_crosscheck():
                 st.error(f"Error: {e}")
 
 def form_bill_upload_arrangement():
-    st.subheader("📤 Bill Upload (Arrangement)")
+    st.subheader("📤 Bill Upload")
 
     # Load cross checked arrangements
     try:
         from datetime import timedelta
         two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-        resp = supabase.table("arrangements").select("*")\
+        arr_resp = supabase.table("arrangements").select("*")\
             .eq("status", "Bill Cross Checked")\
             .gte("order_placed_date", two_days_ago)\
             .execute()
-        arrangements = resp.data if resp.data else []
+        arrangements = arr_resp.data if arr_resp.data else []
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
 
-    if not arrangements:
-        st.info("No arrangements pending bill upload!")
+    # Load cross checked normal orders (last 2 days)
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        normal_resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Bill Cross Check")\
+            .gte("date", two_days_ago)\
+            .execute()
+        cross_checked_normal = []
+        for t in (normal_resp.data or []):
+            d = t.get("details",{})
+            # Show only normal orders (no arrangement_no) not yet uploaded
+            if not d.get("arrangement_no","") and not d.get("bill_uploaded"):
+                cross_checked_normal.append(t)
+    except Exception as e:
+        st.error(f"Error loading normal orders: {e}")
+        cross_checked_normal = []
+
+    if not arrangements and not cross_checked_normal:
+        st.info("No items pending bill upload!")
         return
 
-    arr_options = {
-        f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a
-        for a in arrangements
-    }
+    # Show pending counts
+    st.markdown(f"**Pending:** {len(arrangements)} Arrangements + {len(cross_checked_normal)} Normal Orders")
+
+    # Build combined options
+    all_options = {}
+    for a in arrangements:
+        all_options[f"ARR: #{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}"] = {"type": "arrangement", "data": a}
+    for n in cross_checked_normal:
+        d = n.get("details",{})
+        all_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
     with st.form("bill_upload_arr_form", clear_on_submit=True):
-        selected_label = st.selectbox("Select Arrangement *", list(arr_options.keys()), key="ba_arr")
-        selected_arr   = arr_options[selected_label]
+        selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="ba_arr")
+        selected_item  = all_options[selected_label]
+        item_type      = selected_item["type"]
+        selected_data  = selected_item["data"]
 
-        st.info(f"📋 Distributor: **{selected_arr.get('distributor','')}** | Area: **{selected_arr.get('area','')}**")
+        # Auto fill details
+        if item_type == "arrangement":
+            auto_bill_no  = selected_data.get("bill_order_id","")
+            auto_dist     = selected_data.get("distributor","")
+            auto_area     = selected_data.get("area","")
+            auto_items    = 0
+            auto_amount   = 0.0
+            st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}**")
+        else:
+            d = selected_data.get("details",{})
+            auto_bill_no  = d.get("bill_no","")
+            auto_dist     = d.get("distributor","")
+            auto_area     = ""
+            auto_items    = int(d.get("no_items",0) or 0)
+            auto_amount   = float(d.get("bill_amount",0) or 0)
+            st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Amount: ₹**{auto_amount}**")
 
         c1,c2 = st.columns(2)
         with c1:
-            bill_no    = st.text_input("Bill Number *", value=selected_arr.get("bill_order_id",""))
-            bill_date  = st.date_input("Bill Date")
-            bill_amt   = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0)
+            bill_no   = st.text_input("Bill Number *", value=auto_bill_no)
+            bill_date = st.date_input("Bill Date")
+            bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount)
         with c2:
-            no_items   = st.number_input("No of Items", min_value=0, step=1)
-            order_type = st.selectbox("Order Type", ["Arrangement","Regular"], key="ba_type")
+            no_items   = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
+            order_type = st.selectbox("Order Type", ["Arrangement","Normal Order"], key="ba_type")
 
         st.markdown("📸 **Bill Image**")
         upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
@@ -1207,22 +1401,34 @@ def form_bill_upload_arrangement():
             else:
                 img_name = upload_image(bill_img, "bill_arr") if bill_img else ""
                 try:
-                    # Update arrangement status
-                    supabase.table("arrangements").update({
-                        "status": "Bill Uploaded",
-                        "bill_uploaded_by": st.session_state.name,
-                        "bill_upload_time": time_str(),
-                        "bill_image_arr": img_name,
-                    }).eq("id", selected_arr["id"]).execute()
+                    if item_type == "arrangement":
+                        supabase.table("arrangements").update({
+                            "status": "Bill Uploaded",
+                            "bill_uploaded_by": st.session_state.name,
+                            "bill_upload_time": time_str(),
+                            "bill_image_arr": img_name,
+                        }).eq("id", selected_data["id"]).execute()
+                        arr_no = selected_data.get("arrangement_no","")
+                        dist   = selected_data.get("distributor","")
+                    else:
+                        d = selected_data.get("details",{})
+                        d["bill_uploaded"] = True
+                        d["bill_uploaded_by"] = st.session_state.name
+                        d["bill_upload_time"] = time_str()
+                        supabase.table("daily_tasks").update({
+                            "details": d
+                        }).eq("id", selected_data["id"]).execute()
+                        arr_no = ""
+                        dist   = d.get("distributor","")
 
                     # Save to daily tasks
                     supabase.table("daily_tasks").insert({
                         "date": date_str(), "time": time_str(),
                         "person": st.session_state.name, "team": st.session_state.team,
-                        "task_type": "Bill Upload (Arrangement)",
+                        "task_type": "Bill Upload",
                         "details": {
-                            "arrangement_no": selected_arr.get("arrangement_no"),
-                            "distributor": selected_arr.get("distributor"),
+                            "arrangement_no": arr_no,
+                            "distributor": dist,
                             "bill_no": bill_no,
                             "bill_date": str(bill_date),
                             "bill_amount": str(bill_amt),
@@ -1796,17 +2002,18 @@ def show_user_page():
         with tabs[7]: form_other_task()
 
     elif team == "Stock":
-        tabs = st.tabs(["🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
-        with tabs[0]: form_bill_upload()
-        with tabs[1]: form_bill_crosscheck()
-        with tabs[2]: form_bill_upload_arrangement()
-        with tabs[3]: form_stock_placement()
-        with tabs[4]: form_placement_crosscheck()
-        with tabs[5]: form_rack_cleaning()
-        with tabs[6]: form_inventory_check()
-        with tabs[7]: form_book_porter()
-        with tabs[8]: form_porter_receive()
-        with tabs[9]: form_other_task()
+        tabs = st.tabs(["📒 Register Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
+        with tabs[0]: form_register_entry()
+        with tabs[1]: form_bill_upload()
+        with tabs[2]: form_bill_crosscheck()
+        with tabs[3]: form_bill_upload_arrangement()
+        with tabs[4]: form_stock_placement()
+        with tabs[5]: form_placement_crosscheck()
+        with tabs[6]: form_rack_cleaning()
+        with tabs[7]: form_inventory_check()
+        with tabs[8]: form_book_porter()
+        with tabs[9]: form_porter_receive()
+        with tabs[10]: form_other_task()
 
     elif team == "Call":
         tabs = st.tabs(["📞 Call Log","🚛 Book Porter","✏️ Other"])
