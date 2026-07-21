@@ -1243,6 +1243,11 @@ def form_bill_crosscheck():
             wrong_calc   = st.number_input("Wrong Calculation", min_value=0, step=1)
             shortage     = st.number_input("Shortage Items", min_value=0, step=1)
 
+        st.markdown("---")
+        st.markdown("📹 **Video Evidence**")
+        st.markdown("[📁 Open RapidSurge Stock Videos Folder](https://drive.google.com/drive/folders/1DbkuKSFeftMVpVFqVwcRRDssc49X9YJQ)")
+        st.caption("Record video → Upload to folder → Copy link → Paste below")
+        video_link = st.text_input("Paste Video Link", placeholder="https://drive.google.com/file/d/...")
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Submit Cross Check ✅", type="primary", use_container_width=True):
