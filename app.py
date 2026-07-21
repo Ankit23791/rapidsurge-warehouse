@@ -1452,6 +1452,86 @@ def form_bill_upload_arrangement():
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+# ── PICKUP IMAGES VIEWER ─────────────────────────────────────────────────────
+
+def show_pickup_images():
+    st.subheader("📸 Pickup Images from Naresh/Sandeep")
+
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        # Load pickup tasks with images
+        resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Pickup")\
+            .eq("team", "Delivery")\
+            .gte("date", two_days_ago)\
+            .execute()
+        pickups = resp.data if resp.data else []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        pickups = []
+
+    if not pickups:
+        st.info("No pickup images found for last 2 days!")
+        return
+
+    # Filter by date
+    c1,c2 = st.columns(2)
+    with c1:
+        filter_date = st.date_input("Filter by Date", value=today_ist(), key="pi_date")
+    with c2:
+        filter_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pi_dist")
+
+    filter_date_str = filter_date.strftime("%Y-%m-%d")
+    filtered = [p for p in pickups if p.get("date","") == filter_date_str]
+    if filter_dist:
+        filtered = [p for p in filtered if filter_dist.lower() in p.get("details",{}).get("distributor","").lower()]
+
+    st.markdown(f"**{len(filtered)} pickup entries found**")
+
+    for p in filtered:
+        d = p.get("details",{})
+        dist      = d.get("distributor","")
+        arr_no    = d.get("arrangement_no","")
+        img_name  = d.get("medicine_image","")
+        pickup_by = p.get("person","")
+        pickup_time = p.get("start_time","")
+        no_sku    = d.get("no_sku_received","")
+
+        with st.expander(f"📦 {dist} | Arr: {arr_no} | By: {pickup_by} | Time: {pickup_time}"):
+            c1,c2 = st.columns([2,1])
+            with c1:
+                if img_name:
+                    try:
+                        img_data = supabase.storage.from_("Images").download(img_name)
+                        from PIL import Image
+                        import io as io_module
+                        img = Image.open(io_module.BytesIO(img_data))
+                        st.image(img, caption=f"Pickup by {pickup_by}", use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Image not available: {e}")
+                else:
+                    st.warning("⚠️ No image uploaded for this pickup!")
+            with c2:
+                st.markdown(f"**Distributor:** {dist}")
+                st.markdown(f"**Arrangement:** {arr_no}")
+                st.markdown(f"**Picked by:** {pickup_by}")
+                st.markdown(f"**Time:** {pickup_time}")
+                st.markdown(f"**SKUs Received:** {no_sku}")
+                if img_name:
+                    try:
+                        img_data = supabase.storage.from_("Images").download(img_name)
+                        st.download_button(
+                            "⬇️ Download Image",
+                            img_data,
+                            file_name=f"pickup_{arr_no}_{pickup_by}.jpg",
+                            mime="image/jpeg",
+                            key=f"dl_pickup_{p['id']}"
+                        )
+                    except:
+                        pass
+
 # ── PORTER FORMS ─────────────────────────────────────────────────────────────
 
 def form_book_porter():
@@ -1996,7 +2076,7 @@ def show_user_page():
     st.divider()
 
     if team == "Purchase":
-        tabs = st.tabs(["🛒 Purchase Order","↩️ Purchase Return","💊 PharmaRack","📋 Bounce Medicine","📦 Arrangement","🚛 Book Porter","💰 Porter Payment","✏️ Other"])
+        tabs = st.tabs(["🛒 Purchase Order","↩️ Purchase Return","💊 PharmaRack","📋 Bounce Medicine","📦 Arrangement","🚛 Book Porter","💰 Porter Payment","📸 Pickup Images","✏️ Other"])
         with tabs[0]: form_purchase_order()
         with tabs[1]: form_purchase_return()
         with tabs[2]: form_pharmarack()
@@ -2004,7 +2084,8 @@ def show_user_page():
         with tabs[4]: form_arrangement()
         with tabs[5]: form_book_porter()
         with tabs[6]: form_porter_payment()
-        with tabs[7]: form_other_task()
+        with tabs[7]: show_pickup_images()
+        with tabs[8]: form_other_task()
 
     elif team == "Stock":
         tabs = st.tabs(["📒 Register Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
@@ -2032,6 +2113,27 @@ def show_user_page():
         with tabs[1]: form_porter_handover()
         with tabs[2]: form_delivery()
         with tabs[3]: form_other_task()
+
+    st.divider()
+
+    # ── ARRANGEMENT PIPELINE (visible to all) ────────────────────────────────
+    with st.expander("🔄 View Today's Arrangement Pipeline", expanded=False):
+        try:
+            arr_resp = supabase.table("arrangements").select("*")\
+                .eq("order_placed_date", date_str()).execute()
+            arr_today = arr_resp.data if arr_resp.data else []
+        except:
+            arr_today = []
+
+        if not arr_today:
+            st.info("No arrangements today!")
+        else:
+            st.markdown(f"**{len(arr_today)} arrangements today**")
+            for arr in arr_today:
+                status  = arr.get("status","")
+                urgency = arr.get("urgency","Normal")
+                urgency_color = "🔴" if urgency == "Very Urgent" else "🟡" if urgency == "Urgent" else "🟢"
+                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | **{status}**")
 
     st.divider()
     st.subheader("📋 My Tasks Today")
