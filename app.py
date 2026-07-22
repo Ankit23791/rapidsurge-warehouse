@@ -522,18 +522,22 @@ def form_inventory_check():
 # ── CALL TEAM FORM ────────────────────────────────────────────────────────────
 def form_call_log():
     st.subheader("📞 Daily Call Log")
+
+    start = timer_button("call_log")
+    if start is None:
+        return
+
     with st.form("call_log_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
             calls_made   = st.number_input("Total Calls Made", min_value=0, step=1)
             calls_picked = st.number_input("Calls Picked", min_value=0, step=1)
-            orders_del   = st.number_input("Orders Delivered", min_value=0, step=1)
         with c2:
-            start_time   = st.time_input("Start Time")
-            end_time     = st.time_input("End Time")
+            orders_del   = st.number_input("Orders Delivered", min_value=0, step=1)
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
             calls_not_picked = max(0, calls_made - calls_picked)
+            end_time, duration = end_timer("call_log", start)
             try:
                 supabase.table("daily_tasks").insert({
                     "date": date_str(), "time": time_str(),
@@ -542,10 +546,13 @@ def form_call_log():
                     "details": {"calls_made": str(calls_made), "calls_picked": str(calls_picked),
                                "calls_not_picked": str(calls_not_picked), "orders_delivered": str(orders_del),
                                "remarks": remarks},
-                    "start_time": str(start_time), "end_time": str(end_time)
+                    "start_time": start.strftime("%I:%M %p"),
+                    "end_time": end_time,
+                    "duration_mins": str(duration)
                 }).execute()
-                st.success(f"✅ Call Log submitted! Calls not picked: {calls_not_picked}")
+                st.success(f"✅ Call Log submitted! Duration: {duration} mins | Calls not picked: {calls_not_picked}")
                 st.balloons()
+                st.session_state["call_log_start"] = None
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -1476,17 +1483,21 @@ def show_pickup_images():
         st.info("No pickup images found for last 2 days!")
         return
 
-    # Filter by date
-    c1,c2 = st.columns(2)
+    # Filter by date, distributor and arrangement number
+    c1,c2,c3 = st.columns(3)
     with c1:
         filter_date = st.date_input("Filter by Date", value=today_ist(), key="pi_date")
     with c2:
         filter_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pi_dist")
+    with c3:
+        filter_arr = st.text_input("Arrangement No", placeholder="e.g. ARR-20260718-001", key="pi_arr")
 
     filter_date_str = filter_date.strftime("%Y-%m-%d")
     filtered = [p for p in pickups if p.get("date","") == filter_date_str]
     if filter_dist:
         filtered = [p for p in filtered if filter_dist.lower() in p.get("details",{}).get("distributor","").lower()]
+    if filter_arr:
+        filtered = [p for p in filtered if filter_arr.lower() in p.get("details",{}).get("arrangement_no","").lower()]
 
     st.markdown(f"**{len(filtered)} pickup entries found**")
 
@@ -2076,7 +2087,7 @@ def show_user_page():
     st.divider()
 
     if team == "Purchase":
-        tabs = st.tabs(["🛒 Purchase Order","↩️ Purchase Return","💊 PharmaRack","📋 Bounce Medicine","📦 Arrangement","🚛 Book Porter","💰 Porter Payment","📸 Pickup Images","✏️ Other"])
+        tabs = st.tabs(["🛒 Purchase Order","↩️ Purchase Return","💊 PharmaRack","📋 Bounce Medicine","📦 Arrangement","🚛 Book Porter","💰 Porter Payment","📸 Pickup Images","📒 Register Entry","✔️ Bill Cross Check","📍 Stock Placement","✏️ Other"])
         with tabs[0]: form_purchase_order()
         with tabs[1]: form_purchase_return()
         with tabs[2]: form_pharmarack()
@@ -2085,10 +2096,13 @@ def show_user_page():
         with tabs[5]: form_book_porter()
         with tabs[6]: form_porter_payment()
         with tabs[7]: show_pickup_images()
-        with tabs[8]: form_other_task()
+        with tabs[8]: form_register_entry()
+        with tabs[9]: form_bill_crosscheck()
+        with tabs[10]: form_stock_placement()
+        with tabs[11]: form_other_task()
 
     elif team == "Stock":
-        tabs = st.tabs(["📒 Register Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","✏️ Other"])
+        tabs = st.tabs(["📒 Register Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","🛒 Purchase Order","📦 Arrangement","✏️ Other"])
         with tabs[0]: form_register_entry()
         with tabs[1]: form_bill_upload()
         with tabs[2]: form_bill_crosscheck()
@@ -2099,7 +2113,9 @@ def show_user_page():
         with tabs[7]: form_inventory_check()
         with tabs[8]: form_book_porter()
         with tabs[9]: form_porter_receive()
-        with tabs[10]: form_other_task()
+        with tabs[10]: form_purchase_order()
+        with tabs[11]: form_arrangement()
+        with tabs[12]: form_other_task()
 
     elif team == "Call":
         tabs = st.tabs(["📞 Call Log","🚛 Book Porter","✏️ Other"])
@@ -2141,9 +2157,204 @@ def show_user_page():
         resp = supabase.table("daily_tasks").select("*")\
             .eq("person", st.session_state.name)\
             .eq("date", date_str()).execute()
-        if resp.data:
-            df = pd.DataFrame(resp.data)
-            st.dataframe(df[["time","task_type","start_time","end_time","duration_mins","status"]], use_container_width=True)
+        
+        # Also load arrangement orders placed by this person
+        arr_resp = supabase.table("arrangements").select("*")\
+            .eq("order_by", st.session_state.name)\
+            .eq("order_placed_date", date_str()).execute()
+        
+        # Convert arrangements to daily_tasks format
+        arr_tasks = []
+        for a in (arr_resp.data or []):
+            arr_tasks.append({
+                "time": a.get("order_placed_time",""),
+                "task_type": "Arrangement",
+                "details": {
+                    "distributor": a.get("distributor",""),
+                    "arrangement_no": a.get("arrangement_no",""),
+                    "no_medicines": a.get("no_medicines","0"),
+                    "urgency": a.get("urgency",""),
+                    "pickup_type": a.get("pickup_type",""),
+                },
+                "start_time": a.get("order_placed_time",""),
+                "end_time": "",
+                "duration_mins": 0,
+                "status": a.get("status","Pending")
+            })
+        
+        # Combine both
+        all_data = (resp.data or []) + arr_tasks
+        if resp.data or arr_tasks:
+            df = pd.DataFrame(all_data)
+            display_rows = []
+            total_sku = 0
+            total_duration = 0
+
+            for _, row in df.iterrows():
+                details = row.get("details", {}) or {}
+                duration = int(row.get("duration_mins",0) or 0)
+
+                # Get SKU based on task type
+                if row.get("task_type") == "Purchase Order":
+                    sku = int(details.get("no_sku",0) or 0)
+                    extra = f"SKUs: {sku}"
+                elif row.get("task_type") == "Bill Cross Check":
+                    sku = int(details.get("no_items",0) or 0)
+                    extra = f"Items: {sku}"
+                elif row.get("task_type") == "Stock Placement":
+                    sku = int(details.get("no_medicines",0) or 0)
+                    extra = f"Medicines: {sku}"
+                elif row.get("task_type") == "Call Log":
+                    sku = int(details.get("calls_made",0) or 0)
+                    picked = int(details.get("calls_picked",0) or 0)
+                    not_picked = sku - picked
+                    orders = details.get("orders_delivered",0)
+                    extra = f"Made:{sku} | Picked:{picked} | Not Picked:{not_picked} | Orders:{orders}"
+                elif row.get("task_type") == "Register Entry":
+                    sku = int(details.get("no_items",0) or 0)
+                    extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
+                else:
+                    sku = 0
+                    extra = details.get("distributor","") or details.get("task_name","")
+
+                avg = round(duration/sku, 1) if sku > 0 and duration > 0 else "-"
+                total_sku += sku
+                total_duration += duration
+
+                # Customize column names per task type
+                if row.get("task_type") == "Call Log":
+                    count_label = "Calls Made"
+                    avg_label   = "Avg mins/Call"
+                elif row.get("task_type") == "Purchase Order":
+                    count_label = "SKUs Ordered"
+                    avg_label   = "Avg mins/SKU"
+                elif row.get("task_type") in ["Bill Cross Check","Register Entry"]:
+                    count_label = "Items"
+                    avg_label   = "Avg mins/Item"
+                elif row.get("task_type") == "Stock Placement":
+                    count_label = "Medicines"
+                    avg_label   = "Avg mins/Med"
+                else:
+                    count_label = "Count"
+                    avg_label   = "Avg/Item"
+
+                display_rows.append({
+                    "Time": row.get("time",""),
+                    "Task": row.get("task_type",""),
+                    "Details": extra,
+                    "Start": row.get("start_time",""),
+                    "End": row.get("end_time",""),
+                    "Duration": f"{duration} mins",
+                    count_label: sku if sku > 0 else "-",
+                    avg_label: f"{avg} mins" if avg != "-" else "-",
+                })
+
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
+
+            # Smart Summary based on team
+            overall_avg = round(total_duration/total_sku, 1) if total_sku > 0 else 0
+            team = st.session_state.team
+
+            c1,c2,c3,c4 = st.columns(4)
+            with c1: st.metric("Total Tasks", len(display_rows))
+            with c3: st.metric("Total Time", f"{total_duration} mins")
+
+            if team == "Call":
+                total_calls = sum([int((row.get("details") or {}).get("calls_made",0) or 0) for _, row in df.iterrows()])
+                total_picked = sum([int((row.get("details") or {}).get("calls_picked",0) or 0) for _, row in df.iterrows()])
+                total_orders = sum([int((row.get("details") or {}).get("orders_delivered",0) or 0) for _, row in df.iterrows()])
+                
+                # Calculate averages per hour
+                total_hours = round(total_duration/60, 2) if total_duration > 0 else 0
+                avg_calls_per_hour = round(total_calls/total_hours, 1) if total_hours > 0 else 0
+                avg_orders_per_hour = round(total_orders/total_hours, 1) if total_hours > 0 else 0
+
+                # Pickup rate
+                pickup_rate = round((total_picked/total_calls)*100, 1) if total_calls > 0 else 0
+
+                with c2: st.metric("Total Calls", total_calls)
+                with c4: st.metric("Total Orders", total_orders)
+
+                st.divider()
+                r1,r2,r3,r4 = st.columns(4)
+                with r1: st.metric("📞 Picked", total_picked)
+                with r2: st.metric("📵 Not Picked", total_calls - total_picked)
+                with r3: st.metric("📊 Pickup Rate", f"{pickup_rate}%")
+                with r4: st.metric("⏱️ Total Time", f"{total_duration} mins")
+            elif team == "Purchase":
+                # Calculate purchase metrics
+                normal_orders = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Order"]
+                arrangements  = [row for _, row in df.iterrows() if row.get("task_type") == "Arrangement"]
+                pharmarack    = [row for _, row in df.iterrows() if row.get("task_type") == "PharmaRack Search"]
+                returns       = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Return"]
+
+                # SKU metrics
+                total_skus = sum([int((row.get("details") or {}).get("no_sku",0) or 0) for row in normal_orders])
+                avg_sku_per_min = round(total_skus/total_duration, 2) if total_duration > 0 and total_skus > 0 else 0
+
+                # Avg time per order type
+                normal_duration = sum([int(row.get("duration_mins",0) or 0) for row in normal_orders])
+                arr_duration    = sum([int(row.get("duration_mins",0) or 0) for row in arrangements])
+                avg_normal_time = round(normal_duration/len(normal_orders), 1) if normal_orders else 0
+                avg_arr_time    = round(arr_duration/len(arrangements), 1) if arrangements else 0
+
+                with c2: st.metric("Total SKUs", total_skus)
+                with c4: st.metric("Avg SKU/min", avg_sku_per_min)
+
+                st.divider()
+                r1,r2,r3,r4 = st.columns(4)
+                with r1: st.metric("🛒 Normal Orders", len(normal_orders))
+                with r2: st.metric("⏱️ Avg Time/Normal", f"{avg_normal_time} mins")
+                with r3: st.metric("📋 Arrangements", len(arrangements))
+                with r4: st.metric("⏱️ Avg Time/Arr", f"{avg_arr_time} mins")
+
+                st.divider()
+                r5,r6 = st.columns(2)
+                with r5: st.metric("💊 PharmaRack", len(pharmarack))
+                with r6: st.metric("↩️ Returns", len(returns))
+            elif team == "Stock":
+                # Calculate stock metrics
+                reg_entries   = [row for _, row in df.iterrows() if row.get("task_type") == "Register Entry"]
+                cross_checks  = [row for _, row in df.iterrows() if row.get("task_type") == "Bill Cross Check"]
+                bill_uploads  = [row for _, row in df.iterrows() if row.get("task_type") in ["Bill Upload","Bill Upload (Arrangement)"]]
+                placements    = [row for _, row in df.iterrows() if row.get("task_type") == "Stock Placement"]
+                place_checks  = [row for _, row in df.iterrows() if row.get("task_type") == "Placement Cross Check"]
+                rack_cleaning = [row for _, row in df.iterrows() if row.get("task_type") == "Rack Cleaning"]
+                inventory     = [row for _, row in df.iterrows() if row.get("task_type") == "Inventory Check"]
+
+                # Items metrics
+                items_received = sum([int((row.get("details") or {}).get("no_items",0) or 0) for row in reg_entries])
+                items_checked  = sum([int((row.get("details") or {}).get("no_items",0) or 0) for row in cross_checks])
+                meds_placed    = sum([int((row.get("details") or {}).get("no_medicines",0) or 0) for row in placements])
+
+                # Avg time metrics
+                cross_dur = sum([int(row.get("duration_mins",0) or 0) for row in cross_checks])
+                place_dur = sum([int(row.get("duration_mins",0) or 0) for row in placements])
+                avg_cross = round(cross_dur/items_checked, 2) if items_checked > 0 else 0
+                avg_place = round(place_dur/meds_placed, 2) if meds_placed > 0 else 0
+
+                # Issues found
+                issues = sum([1 for row in place_checks if "No" in str((row.get("details") or {}).get("placement_issues",""))])
+
+                with c2: st.metric("Total Items Handled", items_received + items_checked + meds_placed)
+                with c4: st.metric("Avg mins/Item (Check)", f"{avg_cross} mins")
+
+                st.divider()
+                r1,r2,r3,r4 = st.columns(4)
+                with r1: st.metric("📒 Register Entry", f"{len(reg_entries)} | {items_received} items")
+                with r2: st.metric("✔️ Bill Cross Check", f"{len(cross_checks)} | {items_checked} items")
+                with r3: st.metric("📤 Bill Upload", len(bill_uploads))
+                with r4: st.metric("📍 Stock Placed", f"{len(placements)} | {meds_placed} meds")
+
+                st.divider()
+                r5,r6,r7,r8 = st.columns(4)
+                with r5: st.metric("⏱️ Avg mins/Med (Place)", f"{avg_place} mins")
+                with r6: st.metric("🔍 Placement Checks", len(place_checks))
+                with r7: st.metric("⚠️ Issues Found", issues)
+                with r8: st.metric("🧹 Rack Cleaning", len(rack_cleaning))
+            else:
+                with c2: st.metric("Total Count", total_sku)
+                with c4: st.metric("Avg/Item", f"{overall_avg} mins")
         else:
             st.info("No tasks submitted today yet.")
     except Exception as e:
