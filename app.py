@@ -2192,26 +2192,32 @@ def show_user_page():
 
             for _, row in df.iterrows():
                 details = row.get("details", {}) or {}
-                duration = int(row.get("duration_mins",0) or 0)
+                try:
+                    duration = int(float(row.get("duration_mins",0) or 0))
+                except:
+                    duration = 0
 
                 # Get SKU based on task type
                 if row.get("task_type") == "Purchase Order":
-                    sku = int(details.get("no_sku",0) or 0)
+                    try:
+                        sku = int(float(details.get("no_sku",0) or 0))
+                    except:
+                        sku = 0
                     extra = f"SKUs: {sku}"
                 elif row.get("task_type") == "Bill Cross Check":
-                    sku = int(details.get("no_items",0) or 0)
+                    sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku}"
                 elif row.get("task_type") == "Stock Placement":
-                    sku = int(details.get("no_medicines",0) or 0)
+                    sku = int(float(details.get("no_medicines",0) or 0))
                     extra = f"Medicines: {sku}"
                 elif row.get("task_type") == "Call Log":
-                    sku = int(details.get("calls_made",0) or 0)
+                    sku = int(float(details.get("calls_made",0) or 0))
                     picked = int(details.get("calls_picked",0) or 0)
                     not_picked = sku - picked
                     orders = details.get("orders_delivered",0)
                     extra = f"Made:{sku} | Picked:{picked} | Not Picked:{not_picked} | Orders:{orders}"
                 elif row.get("task_type") == "Register Entry":
-                    sku = int(details.get("no_items",0) or 0)
+                    sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
                 else:
                     sku = 0
@@ -2323,9 +2329,9 @@ def show_user_page():
                 inventory     = [row for _, row in df.iterrows() if row.get("task_type") == "Inventory Check"]
 
                 # Items metrics
-                items_received = sum([int((row.get("details") or {}).get("no_items",0) or 0) for row in reg_entries])
-                items_checked  = sum([int((row.get("details") or {}).get("no_items",0) or 0) for row in cross_checks])
-                meds_placed    = sum([int((row.get("details") or {}).get("no_medicines",0) or 0) for row in placements])
+                items_received = sum([int(float((row.get("details") or {}).get("no_items",0) or 0)) for row in reg_entries])
+                items_checked  = sum([int(float((row.get("details") or {}).get("no_items",0) or 0)) for row in cross_checks])
+                meds_placed    = sum([int(float((row.get("details") or {}).get("no_medicines",0) or 0)) for row in placements])
 
                 # Avg time metrics
                 cross_dur = sum([int(row.get("duration_mins",0) or 0) for row in cross_checks])
