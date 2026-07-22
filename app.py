@@ -169,10 +169,11 @@ def show_sidebar():
             st.rerun()
 
 # ── TIMER BUTTON ──────────────────────────────────────────────────────────────
-def timer_button(key):
+def timer_button(key, task_name=None):
     sk = f"{key}_start"
     if sk not in st.session_state:
         st.session_state[sk] = None
+
     if st.session_state[sk] is None:
         st.info("👆 Click START when you begin this task")
         if st.button("▶️ Start", key=f"btn_{key}", type="primary"):
@@ -188,6 +189,18 @@ def end_timer(key, start_time):
     end = now_ist()
     duration = int((end - start_time).total_seconds() / 60)
     st.session_state[f"{key}_start"] = None
+    # Update In Progress record to Completed
+    task_id = st.session_state.get(f"{key}_task_id")
+    if task_id:
+        try:
+            supabase.table("daily_tasks").update({
+                "end_time": end.strftime("%I:%M %p"),
+                "duration_mins": str(duration),
+                "status": "Completed"
+            }).eq("id", task_id).execute()
+        except:
+            pass
+        st.session_state[f"{key}_task_id"] = None
     return end.strftime("%I:%M %p"), duration
 
 # ── PURCHASE TEAM FORMS ───────────────────────────────────────────────────────
@@ -216,8 +229,14 @@ def form_purchase_order():
                                "no_sku": str(no_sku), "mode": mode, "urgency": urgency,
                                "remarks": remarks},
                     "start_time": start.strftime("%I:%M %p"),
-                    "end_time": end_time, "duration_mins": str(duration)
+                    "end_time": end_time, "duration_mins": str(duration),
+                    "status": "Completed"
                 }).execute()
+                # Delete the In Progress duplicate if exists
+                task_id = st.session_state.get("purchase_order_task_id")
+                if task_id:
+                    supabase.table("daily_tasks").delete().eq("id", task_id).execute()
+                    st.session_state["purchase_order_task_id"] = None
                 st.success("✅ Purchase Order submitted!")
                 st.balloons()
             except Exception as e:
@@ -2167,12 +2186,59 @@ def show_user_page():
                 st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | {pickup_icon} | **{status}**")
 
     st.divider()
-    st.subheader("📋 My Tasks Today")
+    c1,c2 = st.columns([3,1])
+    with c1: st.subheader("📋 My Tasks Today")
+    with c2:
+        if st.button("🔄 Refresh", key="refresh_tasks"):
+            st.rerun()
+
+    # Show In Progress tasks from session state
+    in_progress = []
+    timer_keys = {
+        "purchase_order": "Purchase Order",
+        "purchase_return": "Purchase Return",
+        "pharmarack": "PharmaRack Search",
+        "bounce": "Bounce Medicine Study",
+        "bill_crosscheck": "Bill Cross Check",
+        "stock_placement": "Stock Placement",
+        "rack_cleaning": "Rack Cleaning",
+        "inventory": "Inventory Check",
+        "call_log": "Call Log",
+        "delivery": "Delivery Trip",
+        "other_task": "Other Task",
+        "pickup": "Pickup",
+    }
+    for key, task_name in timer_keys.items():
+        start_time = st.session_state.get(f"{key}_start")
+        if start_time:
+            elapsed = int((now_ist() - start_time).total_seconds() / 60)
+            in_progress.append({
+                "Time": start_time.strftime("%I:%M %p"),
+                "Task": task_name,
+                "Details": "🔄 In Progress...",
+                "Start": start_time.strftime("%I:%M %p"),
+                "End": "In Progress",
+                "Duration": f"{elapsed} mins",
+                "Count": "-",
+                "Avg/Item": "-",
+            })
+
+    if in_progress:
+        st.warning(f"⏳ {len(in_progress)} task(s) in progress:")
+        st.dataframe(pd.DataFrame(in_progress), use_container_width=True)
     try:
         resp = supabase.table("daily_tasks").select("*")\
             .eq("person", st.session_state.name)\
             .eq("date", date_str()).execute()
-        
+
+        # Also load In Progress tasks from yesterday (not completed)
+        inprogress_resp = supabase.table("daily_tasks").select("*")\
+            .eq("person", st.session_state.name)\
+            .eq("status", "In Progress")\
+            .execute()
+        inprogress_data = [t for t in (inprogress_resp.data or []) 
+                          if t.get("date") != date_str()]
+
         # Also load arrangement orders placed by this person
         arr_resp = supabase.table("arrangements").select("*")\
             .eq("order_by", st.session_state.name)\
@@ -2197,8 +2263,8 @@ def show_user_page():
                 "status": a.get("status","Pending")
             })
         
-        # Combine both
-        all_data = (resp.data or []) + arr_tasks
+        # Combine all
+        all_data = (resp.data or []) + arr_tasks + inprogress_data
         if resp.data or arr_tasks:
             df = pd.DataFrame(all_data)
             display_rows = []
