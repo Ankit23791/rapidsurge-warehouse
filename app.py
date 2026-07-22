@@ -560,14 +560,19 @@ def form_call_log():
 def form_pickup():
     st.subheader("📋 Pickup Log")
 
-    # Load ONLY Self Pick pending arrangements from last 2 days
+    # Simple date filter for Naresh
+    from datetime import timedelta
+    pickup_date = st.date_input("Filter by Order Date",
+        value=today_ist(),
+        key="naresh_date_filter",
+        min_value=today_ist() - timedelta(days=2),
+        max_value=today_ist())
+
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
         resp = supabase.table("arrangements").select("*")\
             .eq("status", "Pending")\
             .eq("pickup_type", "Self Pick")\
-            .gte("order_placed_date", two_days_ago)\
+            .eq("order_placed_date", pickup_date.strftime("%Y-%m-%d"))\
             .execute()
         arrangements = resp.data if resp.data else []
     except Exception as e:
@@ -2149,7 +2154,17 @@ def show_user_page():
                 status  = arr.get("status","")
                 urgency = arr.get("urgency","Normal")
                 urgency_color = "🔴" if urgency == "Very Urgent" else "🟡" if urgency == "Urgent" else "🟢"
-                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | **{status}**")
+                pickup_type = arr.get("pickup_type","")
+                if pickup_type == "Self Pick":
+                    pickup_icon = "🚚 Naresh/Sandeep"
+                elif pickup_type == "Porter":
+                    pickup_icon = "🚛 Porter"
+                elif pickup_type == "Distributor Delivers":
+                    pickup_icon = "🏪 Distributor Delivers"
+                else:
+                    pickup_icon = pickup_type
+
+                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | {pickup_icon} | **{status}**")
 
     st.divider()
     st.subheader("📋 My Tasks Today")
