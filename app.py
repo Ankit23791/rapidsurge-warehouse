@@ -156,12 +156,57 @@ def show_login():
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 def show_sidebar():
     with st.sidebar:
-        st.markdown(f"## 👋 {st.session_state.name}")
+        # Time based greeting
+        hour = now_ist().hour
+        if hour < 12:
+            greeting = "🌅 Good Morning"
+        elif hour < 17:
+            greeting = "🌞 Good Afternoon"
+        else:
+            greeting = "🌙 Good Evening"
+
+        st.markdown(f"## {greeting}, {st.session_state.name}!")
+
+        # Daily quote by day of week
+        quotes = [
+            "💪 Great things never come from comfort zones!",
+            "🎯 Success is the sum of small efforts repeated daily!",
+            "🔥 Push yourself because no one else will do it for you!",
+            "⭐ Hard work beats talent when talent doesn't work hard!",
+            "🚀 The only way to do great work is to love what you do!",
+            "💡 Every expert was once a beginner. Keep going!",
+            "🏆 Champions keep playing until they get it right!",
+        ]
+        st.info(quotes[today_ist().weekday()])
+        st.divider()
+
+        # Personal stats
+        try:
+            from datetime import timedelta
+            yesterday = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+            yest_resp = supabase.table("daily_tasks").select("id")\
+                .eq("person", st.session_state.name)\
+                .eq("date", yesterday).execute()
+            yest_count = len(yest_resp.data) if yest_resp.data else 0
+            today_resp = supabase.table("daily_tasks").select("id")\
+                .eq("person", st.session_state.name)\
+                .eq("date", date_str()).execute()
+            today_count = len(today_resp.data) if today_resp.data else 0
+            st.markdown("**📊 Your Performance:**")
+            c1,c2 = st.columns(2)
+            with c1: st.metric("Yesterday", yest_count)
+            with c2:
+                delta = today_count - yest_count
+                st.metric("Today", today_count, f"{'+' if delta>=0 else ''}{delta}")
+        except:
+            pass
+
+        st.divider()
+        st.markdown(f"📅 **{today_ist().strftime('%d %B %Y')}**")
+        st.markdown(f"🕐 **{time_str()}**")
         st.markdown(f"**Team:** {st.session_state.team}")
         if st.session_state.role == "admin":
             st.success("👑 Admin")
-        st.markdown(f"📅 {today_ist().strftime('%d %B %Y')}")
-        st.markdown(f"🕐 {time_str()}")
         st.divider()
         if st.button("🚪 Logout", use_container_width=True):
             for k in ["logged_in","username","name","team","role"]:
@@ -537,6 +582,53 @@ def form_inventory_check():
                     st.balloons()
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+# ── CALL TEAM FORMS ───────────────────────────────────────────────────────────
+
+def form_medicine_search():
+    st.subheader("🔍 Medicine Search")
+    st.caption("Track time spent searching for medicines in warehouse")
+
+    start = timer_button("medicine_search", "Medicine Search")
+    if start is None:
+        return
+
+    with st.form("medicine_search_form", clear_on_submit=True):
+        c1,c2 = st.columns(2)
+        with c1:
+            no_searched  = st.number_input("No of Medicines Searched", min_value=0, step=1)
+            no_found     = st.number_input("No Found in Warehouse", min_value=0, step=1)
+        with c2:
+            no_not_found = st.number_input("No NOT Found", min_value=0, step=1)
+            no_ordered   = st.number_input("No Ordered After Search", min_value=0, step=1)
+        remarks = st.text_input("Remarks")
+
+        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+            end_time, duration = end_timer("medicine_search", start)
+            avg_per_sku = round(duration/no_searched, 2) if no_searched > 0 else 0
+            try:
+                supabase.table("daily_tasks").insert({
+                    "date": date_str(), "time": time_str(),
+                    "person": st.session_state.name, "team": "Call",
+                    "task_type": "Medicine Search",
+                    "details": {
+                        "no_searched": str(no_searched),
+                        "no_found": str(no_found),
+                        "no_not_found": str(no_not_found),
+                        "no_ordered": str(no_ordered),
+                        "avg_per_sku": str(avg_per_sku),
+                        "remarks": remarks
+                    },
+                    "start_time": start.strftime("%I:%M %p"),
+                    "end_time": end_time,
+                    "duration_mins": str(duration),
+                    "status": "Completed"
+                }).execute()
+                st.success(f"✅ Medicine Search submitted! Avg time/SKU: {avg_per_sku} mins")
+                st.balloons()
+                st.session_state["medicine_search_start"] = None
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 # ── CALL TEAM FORM ────────────────────────────────────────────────────────────
 def form_call_log():
@@ -2110,6 +2202,35 @@ def show_user_page():
     st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
     st.divider()
 
+    # Check for incomplete In Progress tasks from previous session
+    try:
+        inprog = supabase.table("daily_tasks").select("*")\
+            .eq("person", st.session_state.name)\
+            .eq("status", "In Progress")\
+            .execute()
+        if inprog.data:
+            st.warning(f"⚠️ You have {len(inprog.data)} incomplete task(s) from previous session!")
+            for t in inprog.data:
+                c1,c2,c3 = st.columns([3,1,1])
+                with c1:
+                    st.markdown(f"**{t.get('task_type','')}** started at {t.get('start_time','')} on {t.get('date','')}")
+                with c2:
+                    if st.button("✅ Complete", key=f"comp_{t['id']}"):
+                        supabase.table("daily_tasks").update({
+                            "status": "Completed",
+                            "end_time": time_str(),
+                            "duration_mins": "0"
+                        }).eq("id", t["id"]).execute()
+                        st.rerun()
+                with c3:
+                    if st.button("🗑️ Discard", key=f"disc_{t['id']}"):
+                        supabase.table("daily_tasks").delete()\
+                            .eq("id", t["id"]).execute()
+                        st.rerun()
+            st.divider()
+    except:
+        pass
+
     if team == "Purchase":
         tabs = st.tabs(["🛒 Purchase Order","↩️ Purchase Return","💊 PharmaRack","📋 Bounce Medicine","📦 Arrangement","🚛 Book Porter","💰 Porter Payment","📸 Pickup Images","📒 Register Entry","✔️ Bill Cross Check","📍 Stock Placement","✏️ Other"])
         with tabs[0]: form_purchase_order()
@@ -2142,10 +2263,11 @@ def show_user_page():
         with tabs[12]: form_other_task()
 
     elif team == "Call":
-        tabs = st.tabs(["📞 Call Log","🚛 Book Porter","✏️ Other"])
+        tabs = st.tabs(["📞 Call Log","🔍 Medicine Search","🚛 Book Porter","✏️ Other"])
         with tabs[0]: form_call_log()
-        with tabs[1]: form_book_porter()
-        with tabs[2]: form_other_task()
+        with tabs[1]: form_medicine_search()
+        with tabs[2]: form_book_porter()
+        with tabs[3]: form_other_task()
 
     elif team == "Delivery":
         tabs = st.tabs(["📋 Pending Pickups","🚛 Porter Handover","🚚 Delivery Trip","✏️ Other"])
@@ -2194,20 +2316,40 @@ def show_user_page():
 
     # Show In Progress tasks from session state
     in_progress = []
-    timer_keys = {
-        "purchase_order": "Purchase Order",
-        "purchase_return": "Purchase Return",
-        "pharmarack": "PharmaRack Search",
-        "bounce": "Bounce Medicine Study",
-        "bill_crosscheck": "Bill Cross Check",
-        "stock_placement": "Stock Placement",
-        "rack_cleaning": "Rack Cleaning",
-        "inventory": "Inventory Check",
-        "call_log": "Call Log",
-        "delivery": "Delivery Trip",
-        "other_task": "Other Task",
-        "pickup": "Pickup",
-    }
+    # Show only relevant tasks per team
+    team = st.session_state.team
+    if team == "Purchase":
+        timer_keys = {
+            "purchase_order": "Purchase Order",
+            "purchase_return": "Purchase Return",
+            "pharmarack": "PharmaRack Search",
+            "bounce": "Bounce Medicine Study",
+            "other_task": "Other Task",
+        }
+    elif team == "Stock":
+        timer_keys = {
+            "bill_crosscheck": "Bill Cross Check",
+            "stock_placement": "Stock Placement",
+            "rack_cleaning": "Rack Cleaning",
+            "inventory": "Inventory Check",
+            "other_task": "Other Task",
+        }
+    elif team == "Call":
+        timer_keys = {
+            "call_log": "Call Log",
+            "medicine_search": "Medicine Search",
+            "other_task": "Other Task",
+        }
+    elif team == "Delivery":
+        timer_keys = {
+            "delivery": "Delivery Trip",
+            "pickup": "Pickup",
+            "other_task": "Other Task",
+        }
+    else:
+        timer_keys = {
+            "other_task": "Other Task",
+        }
     for key, task_name in timer_keys.items():
         start_time = st.session_state.get(f"{key}_start")
         if start_time:
@@ -2297,6 +2439,11 @@ def show_user_page():
                     not_picked = sku - picked
                     orders = details.get("orders_delivered",0)
                     extra = f"Made:{sku} | Picked:{picked} | Not Picked:{not_picked} | Orders:{orders}"
+                elif row.get("task_type") == "Medicine Search":
+                    sku = int(float(details.get("no_searched",0) or 0))
+                    found = details.get("no_found",0)
+                    not_found = details.get("no_not_found",0)
+                    extra = f"Searched:{sku} | Found:{found} | Not Found:{not_found}"
                 elif row.get("task_type") == "Register Entry":
                     sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
@@ -2347,16 +2494,25 @@ def show_user_page():
             with c3: st.metric("Total Time", f"{total_duration} mins")
 
             if team == "Call":
-                total_calls = sum([int((row.get("details") or {}).get("calls_made",0) or 0) for _, row in df.iterrows()])
-                total_picked = sum([int((row.get("details") or {}).get("calls_picked",0) or 0) for _, row in df.iterrows()])
-                total_orders = sum([int((row.get("details") or {}).get("orders_delivered",0) or 0) for _, row in df.iterrows()])
+                call_rows = [row for _, row in df.iterrows() if row.get("task_type") == "Call Log"]
+                search_rows = [row for _, row in df.iterrows() if row.get("task_type") == "Medicine Search"]
+
+                total_calls  = sum([int((row.get("details") or {}).get("calls_made",0) or 0) for row in call_rows])
+                total_picked = sum([int((row.get("details") or {}).get("calls_picked",0) or 0) for row in call_rows])
+                total_orders = sum([int((row.get("details") or {}).get("orders_delivered",0) or 0) for row in call_rows])
+
+                # Medicine search stats
+                total_searched  = sum([int((row.get("details") or {}).get("no_searched",0) or 0) for row in search_rows])
+                total_found     = sum([int((row.get("details") or {}).get("no_found",0) or 0) for row in search_rows])
+                total_not_found = sum([int((row.get("details") or {}).get("no_not_found",0) or 0) for row in search_rows])
+                search_duration = sum([int(float(row.get("duration_mins",0) or 0)) for row in search_rows])
+                avg_search_sku  = round(search_duration/total_searched, 2) if total_searched > 0 else 0
                 
                 # Calculate averages per hour
                 total_hours = round(total_duration/60, 2) if total_duration > 0 else 0
                 avg_calls_per_hour = round(total_calls/total_hours, 1) if total_hours > 0 else 0
                 avg_orders_per_hour = round(total_orders/total_hours, 1) if total_hours > 0 else 0
 
-                # Pickup rate
                 pickup_rate = round((total_picked/total_calls)*100, 1) if total_calls > 0 else 0
 
                 with c2: st.metric("Total Calls", total_calls)
@@ -2368,6 +2524,15 @@ def show_user_page():
                 with r2: st.metric("📵 Not Picked", total_calls - total_picked)
                 with r3: st.metric("📊 Pickup Rate", f"{pickup_rate}%")
                 with r4: st.metric("⏱️ Total Time", f"{total_duration} mins")
+
+                if search_rows:
+                    st.divider()
+                    st.markdown("**🔍 Medicine Search:**")
+                    s1,s2,s3,s4 = st.columns(4)
+                    with s1: st.metric("Searched", total_searched)
+                    with s2: st.metric("Found", total_found)
+                    with s3: st.metric("Not Found", total_not_found)
+                    with s4: st.metric("Avg mins/SKU", avg_search_sku)
             elif team == "Purchase":
                 # Calculate purchase metrics
                 normal_orders = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Order"]
