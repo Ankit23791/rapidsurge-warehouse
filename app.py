@@ -107,6 +107,30 @@ for k,v in [("logged_in",False),("username",""),("name",""),("team",""),("role",
     if k not in st.session_state:
         st.session_state[k] = v
 
+# ── PERSISTENT LOGIN via Query Params ─────────────────────────────────────────
+# Auto login if credentials stored in query params
+if not st.session_state.logged_in:
+    try:
+        params = st.query_params
+        if "u" in params and "t" in params:
+            username = params["u"]
+            token    = params["t"]
+            # Verify token matches (simple hash)
+            import hashlib
+            USERS_temp = load_users()
+            if username in USERS_temp:
+                expected = hashlib.md5(
+                    (username + USERS_temp[username]["password"]).encode()
+                ).hexdigest()[:8]
+                if token == expected:
+                    st.session_state.logged_in = True
+                    st.session_state.username  = username
+                    st.session_state.name      = USERS_temp[username]["name"]
+                    st.session_state.team      = USERS_temp[username]["team"]
+                    st.session_state.role      = USERS_temp[username]["role"]
+    except:
+        pass
+
 # ── IMAGE UPLOAD ──────────────────────────────────────────────────────────────
 def upload_image(file, prefix="img"):
     if file is None:
@@ -148,6 +172,11 @@ def show_login():
                 st.session_state.name = USERS[username]["name"]
                 st.session_state.team = USERS[username]["team"]
                 st.session_state.role = USERS[username]["role"]
+                # Store login in URL for persistence
+                import hashlib
+                token = hashlib.md5((username + password).encode()).hexdigest()[:8]
+                st.query_params["u"] = username
+                st.query_params["t"] = token
                 st.rerun()
             else:
                 st.error("❌ Wrong username or password!")
@@ -211,6 +240,7 @@ def show_sidebar():
         if st.button("🚪 Logout", use_container_width=True):
             for k in ["logged_in","username","name","team","role"]:
                 st.session_state[k] = False if k=="logged_in" else ""
+            st.query_params.clear()
             st.rerun()
 
 # ── TIMER BUTTON ──────────────────────────────────────────────────────────────
@@ -2409,6 +2439,12 @@ def show_user_page():
         all_data = (resp.data or []) + arr_tasks + inprogress_data
         if resp.data or arr_tasks:
             df = pd.DataFrame(all_data)
+            # Sort by time
+            try:
+                df["sort_time"] = pd.to_datetime(df["time"], format="%I:%M %p", errors="coerce")
+                df = df.sort_values("sort_time").drop(columns=["sort_time"])
+            except:
+                pass
             display_rows = []
             total_sku = 0
             total_duration = 0
