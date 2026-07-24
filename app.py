@@ -305,6 +305,11 @@ def timer_button(key, task_name=None):
     else:
         elapsed = int((now_ist() - st.session_state[sk]).total_seconds() / 60)
         st.success(f"⏱️ Started at {st.session_state[sk].strftime('%I:%M %p')} — {elapsed} mins elapsed")
+        c1,c2 = st.columns([3,1])
+        with c2:
+            if st.button("❌ Cancel Task", key=f"cancel_{key}", type="secondary"):
+                st.session_state[sk] = None
+                st.rerun()
         return st.session_state[sk]
 
 def end_timer(key, start_time):
