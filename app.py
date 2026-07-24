@@ -2374,6 +2374,66 @@ def show_user_page():
 
     st.divider()
 
+    # ── MY PERFORMANCE TODAY ─────────────────────────────────────────────────
+    with st.expander("📊 My Performance Today", expanded=False):
+        try:
+            perf_resp = supabase.table("daily_tasks").select("*")\
+                .eq("person", st.session_state.name)\
+                .eq("date", date_str()).execute()
+            perf_data = perf_resp.data if perf_resp.data else []
+
+            if not perf_data:
+                st.info("No tasks completed today yet!")
+            else:
+                perf_df = pd.DataFrame(perf_data)
+
+                # Summary metrics
+                total_tasks    = len(perf_df)
+                total_duration = sum([int(float(r.get("duration_mins",0) or 0)) for r in perf_data])
+                completed      = len([r for r in perf_data if r.get("status") == "Completed"])
+
+                c1,c2,c3 = st.columns(3)
+                with c1: st.metric("✅ Tasks Completed", completed)
+                with c2: st.metric("⏱️ Total Time", f"{total_duration} mins")
+                with c3: st.metric("📋 Total Tasks", total_tasks)
+
+                st.divider()
+
+                # Time per task breakdown
+                st.markdown("**⏱️ Time Spent Per Task:**")
+                task_summary = {}
+                for r in perf_data:
+                    task = r.get("task_type","")
+                    dur  = int(float(r.get("duration_mins",0) or 0))
+                    if task not in task_summary:
+                        task_summary[task] = {"count": 0, "duration": 0}
+                    task_summary[task]["count"]    += 1
+                    task_summary[task]["duration"] += dur
+
+                for task, data in task_summary.items():
+                    count = data["count"]
+                    dur   = data["duration"]
+                    avg   = round(dur/count, 1) if count > 0 else 0
+                    c1,c2,c3,c4 = st.columns([3,1,1,1])
+                    with c1: st.markdown(f"**{task}**")
+                    with c2: st.markdown(f"x{count}")
+                    with c3: st.markdown(f"⏱️ {dur} mins")
+                    with c4: st.markdown(f"Avg: {avg} mins")
+
+                st.divider()
+
+                # Bar chart of time per task
+                if task_summary:
+                    chart_data = pd.DataFrame([
+                        {"Task": k, "Minutes": v["duration"]}
+                        for k,v in task_summary.items()
+                    ]).set_index("Task")
+                    st.bar_chart(chart_data)
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    st.divider()
+
     # ── ARRANGEMENT PIPELINE (visible to all) ────────────────────────────────
     with st.expander("🔄 View Today's Arrangement Pipeline", expanded=False):
         try:
@@ -2745,7 +2805,107 @@ def show_admin_page():
         except:
             arr_today = []
 
-        st.subheader("📋 Today Arrangement Summary")
+        # ── ALERTS & BOTTLENECKS ──────────────────────────────────────────────
+        from datetime import datetime as dt
+        alerts = []
+
+        for arr in arr_today:
+            status = arr.get("status","")
+            order_time = arr.get("order_placed_time","")
+            if status not in ["Completed","Bill Uploaded","Stock Placed"] and order_time:
+                try:
+                    order_dt  = dt.strptime(order_time, "%I:%M %p")
+                    now_dt    = dt.strptime(time_str(), "%I:%M %p")
+                    diff_mins = int((now_dt - order_dt).total_seconds() / 60)
+                    if diff_mins > 120:
+                        hours = diff_mins // 60
+                        mins  = diff_mins % 60
+                        alerts.append(f"⚠️ **#{arr.get('arrangement_no')}** — {arr.get('distributor','')} stuck at **{status}** for **{hours}h {mins}m**!")
+                except:
+                    pass
+
+        pending_self = [a for a in arr_today if a.get("status")=="Pending" and a.get("pickup_type")=="Self Pick"]
+        if len(pending_self) > 3:
+            alerts.append(f"⚠️ **{len(pending_self)} arrangements** pending Self Pick!")
+
+        reached = [a for a in arr_today if a.get("status")=="Reached Warehouse"]
+        if len(reached) > 2:
+            alerts.append(f"⚠️ **{len(reached)} arrangements** at warehouse — not cross checked!")
+
+        try:
+            all_users = supabase.table("app_users").select("*").eq("active",True).neq("role","admin").execute()
+            if all_users.data and not df.empty:
+                active_persons = df["person"].unique().tolist() if "person" in df.columns else []
+                for u in all_users.data:
+                    if u["name"] not in active_persons:
+                        alerts.append(f"⚠️ **{u['name']}** ({u['team']}) — No activity today!")
+        except:
+            pass
+
+        # Show as expander
+        with st.expander(f"🚨 Alerts & Bottlenecks ({len(alerts)} alerts)", expanded=len(alerts)>0):
+            if alerts:
+                for alert in alerts:
+                    st.warning(alert)
+            else:
+                st.success("✅ All good! No alerts.")
+
+        st.divider()
+
+        # ── REAL TIME TEAM STATUS ─────────────────────────────────────────────
+        try:
+            all_users_resp = supabase.table("app_users").select("*").eq("active",True).neq("role","admin").execute()
+            all_users_data = all_users_resp.data if all_users_resp.data else []
+
+            latest_tasks = {}
+            if not df.empty:
+                for _, row in df.iterrows():
+                    person = row.get("person","")
+                    if person not in latest_tasks:
+                        latest_tasks[person] = row
+                    else:
+                        try:
+                            existing = dt.strptime(str(latest_tasks[person].get("time","12:00 AM")), "%I:%M %p")
+                            new_t    = dt.strptime(str(row.get("time","12:00 AM")), "%I:%M %p")
+                            if new_t > existing:
+                                latest_tasks[person] = row
+                        except:
+                            pass
+
+            # Team filter
+            selected_team = st.selectbox("👥 View Team Status",
+                ["All Teams","Purchase","Stock","Call","Delivery"],
+                key="team_status_filter")
+
+            teams_to_show = ["Purchase","Stock","Call","Delivery"] if selected_team == "All Teams" else [selected_team]
+
+            with st.expander("👥 Real Time Team Status", expanded=True):
+                for team in teams_to_show:
+                    team_users = [u for u in all_users_data if u.get("team") == team]
+                    if team_users:
+                        st.markdown(f"**{team} Team:**")
+                        for u in team_users:
+                            name = u["name"]
+                            c1,c2,c3 = st.columns([2,3,2])
+                            with c1: st.markdown(f"👤 **{name}**")
+                            if name in latest_tasks:
+                                task = latest_tasks[name]
+                                if task.get("status") == "In Progress":
+                                    with c2: st.markdown(f"🔄 **{task.get('task_type','')}**")
+                                else:
+                                    with c2: st.markdown(f"✅ **{task.get('task_type','')}**")
+                                with c3: st.markdown(f"🕐 {task.get('time','')}")
+                            else:
+                                with c2: st.markdown("⏳ No activity yet")
+                                with c3: st.markdown("")
+                        st.divider()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+        st.divider()
+
+        # ── ARRANGEMENT SUMMARY ───────────────────────────────────────────────
+        st.subheader("📋 Today's Arrangement Summary")
         a1,a2,a3,a4,a5 = st.columns(5)
         with a1: st.metric("Total", len(arr_today))
         with a2: st.metric("🔴 Pending", len([a for a in arr_today if a.get("status")=="Pending"]))
@@ -2755,44 +2915,52 @@ def show_admin_page():
 
         st.divider()
 
-        if not df.empty:
-            st.subheader("👥 Team Tasks Today")
-            teams = ["Purchase","Stock","Call","Delivery"]
-            cols  = st.columns(4)
-            for i,t in enumerate(teams):
-                with cols[i]:
-                    count = len(df[df["team"]==t])
-                    st.metric(t, count, "tasks")
-            st.divider()
-            c1,c2 = st.columns(2)
-            with c1:
-                st.bar_chart(df["team"].value_counts())
-            with c2:
-                st.bar_chart(df["person"].value_counts())
-        else:
-            st.info("No tasks today yet!")
-
-        st.divider()
-
-        st.subheader("🔴 Live Delivery Tracking")
+        # ── PIPELINE HEALTH ───────────────────────────────────────────────────
+        st.subheader("📈 Arrangement Pipeline Health")
         try:
-            live = supabase.table("daily_tasks").select("*")\
-                .eq("team","Delivery").eq("status","In Progress").execute()
-            if live.data:
-                for e in live.data:
-                    d = e.get("details",{})
-                    c1,c2,c3,c4 = st.columns([2,2,2,1])
-                    with c1: st.markdown(f"👤 **{e.get('person','')}**")
-                    with c2: st.markdown(f"📍 **{d.get('location_a','')}**")
-                    with c3: st.markdown(f"🚦 **{d.get('trip_type','')}**")
-                    with c4: st.markdown(f"🕐 **{e.get('start_time','')}**")
+            pipeline_times = []
+            for arr in arr_today:
+                try:
+                    o = dt.strptime(arr.get("order_placed_time",""), "%I:%M %p")
+                    u = dt.strptime(arr.get("bill_upload_time",""), "%I:%M %p")
+                    diff = int((u-o).total_seconds()/60)
+                    if diff > 0:
+                        pipeline_times.append(diff)
+                except:
+                    pass
+            if pipeline_times:
+                avg_t = int(sum(pipeline_times)/len(pipeline_times))
+                min_t = min(pipeline_times)
+                max_t = max(pipeline_times)
+                c1,c2,c3 = st.columns(3)
+                with c1: st.metric("⏱️ Avg Order→Bill Upload", f"{avg_t} mins")
+                with c2: st.metric("⚡ Fastest", f"{min_t} mins")
+                with c3:
+                    icon = "🔴" if max_t > 180 else "🟡" if max_t > 120 else "🟢"
+                    st.metric(f"{icon} Slowest", f"{max_t} mins")
             else:
-                st.info("No delivery in progress.")
+                st.info("No completed pipeline data yet today!")
         except Exception as e:
             st.error(f"Error: {e}")
 
         st.divider()
 
+        # Team tasks
+        st.subheader("👥 Team Tasks Today")
+        if not df.empty:
+            cols = st.columns(4)
+            for i,t in enumerate(["Purchase","Stock","Call","Delivery"]):
+                with cols[i]: st.metric(t, len(df[df["team"]==t]), "tasks")
+            st.divider()
+            c1,c2 = st.columns(2)
+            with c1: st.bar_chart(df["team"].value_counts())
+            with c2: st.bar_chart(df["person"].value_counts())
+        else:
+            st.info("No tasks today yet!")
+
+        st.divider()
+
+        # All arrangements
         st.subheader("📋 All Arrangements Today")
         try:
             arr = supabase.table("arrangements").select("*")\
