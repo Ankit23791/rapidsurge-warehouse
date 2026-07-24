@@ -1310,6 +1310,90 @@ def form_placement_crosscheck():
 
 # ── REGISTER ENTRY FORM ──────────────────────────────────────────────────────
 
+def form_edit_register_entry():
+    st.subheader("✏️ Edit Register Entry")
+    st.caption("You can edit your own entries within 30 mins. After 30 mins only Admin can edit.")
+    try:
+        resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Register Entry")\
+            .eq("person", st.session_state.name)\
+            .eq("date", date_str()).execute()
+        entries = resp.data or []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        entries = []
+
+    if not entries:
+        st.info("No register entries today!")
+        return
+
+    from datetime import datetime as dt
+    editable = []
+    non_editable = []
+    for e in entries:
+        try:
+            entry_time = dt.strptime(e.get("time",""), "%I:%M %p")
+            now_time   = dt.strptime(time_str(), "%I:%M %p")
+            diff = int((now_time - entry_time).total_seconds() / 60)
+            if diff <= 30:
+                editable.append(e)
+            else:
+                non_editable.append(e)
+        except:
+            non_editable.append(e)
+
+    if editable:
+        st.markdown("**✅ Editable (within 30 mins):**")
+        for entry in editable:
+            d = entry.get("details",{}) or {}
+            with st.expander(f"📒 {d.get('distributor','')} | Bill: {d.get('bill_no','')} | Items: {d.get('no_items','')} | {entry.get('time','')}"):
+                with st.form(f"edit_form_{entry['id']}", clear_on_submit=False):
+                    c1,c2 = st.columns(2)
+                    with c1:
+                        new_dist  = st.selectbox("Distributor", DISTRIBUTORS,
+                            index=DISTRIBUTORS.index(d.get("distributor","")) if d.get("distributor","") in DISTRIBUTORS else 0,
+                            key=f"ed_dist_{entry['id']}")
+                        new_bill  = st.text_input("Bill Number", value=d.get("bill_no",""), key=f"ed_bill_{entry['id']}")
+                        new_items = st.number_input("No of Items", value=int(float(d.get("no_items",0) or 0)), min_value=0, step=1, key=f"ed_items_{entry['id']}")
+                    with c2:
+                        new_amount = st.number_input("Bill Amount (₹)", value=float(d.get("bill_amount",0) or 0), min_value=0.0, step=100.0, key=f"ed_amount_{entry['id']}")
+                        new_delby  = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"],
+                            index=["Distributor","Porter","Naresh","Sandeep","Other"].index(d.get("delivery_by","Distributor")) if d.get("delivery_by","") in ["Distributor","Porter","Naresh","Sandeep","Other"] else 0,
+                            key=f"ed_delby_{entry['id']}")
+                    edit_reason = st.text_input("Reason for Edit *", key=f"ed_reason_{entry['id']}")
+                    if st.form_submit_button("Save Changes ✅", type="primary"):
+                        if not edit_reason:
+                            st.error("Enter reason for edit!")
+                        else:
+                            try:
+                                supabase.table("daily_tasks").update({
+                                    "details": {
+                                        "distributor": new_dist,
+                                        "bill_no": new_bill,
+                                        "no_items": str(new_items),
+                                        "bill_amount": str(new_amount),
+                                        "delivery_by": new_delby,
+                                        "edited": True,
+                                        "edit_reason": edit_reason,
+                                        "edited_by": st.session_state.name,
+                                        "edit_time": time_str(),
+                                        "original": d
+                                    }
+                                }).eq("id", entry["id"]).execute()
+                                st.success("✅ Entry updated!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+    else:
+        st.warning("⏰ 30 min window passed! Contact Admin to edit.")
+
+    if non_editable:
+        st.divider()
+        st.markdown("**🔒 Locked entries:**")
+        for entry in non_editable:
+            d = entry.get("details",{}) or {}
+            st.markdown(f"- {entry.get('time','')} | {d.get('distributor','')} | Bill: {d.get('bill_no','')} | Items: {d.get('no_items','')} | ₹{d.get('bill_amount','')}")
+
 def form_register_entry():
     st.subheader("📒 Register Entry")
     st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
@@ -2343,20 +2427,21 @@ def show_user_page():
         with tabs[11]: form_other_task()
 
     elif team == "Stock":
-        tabs = st.tabs(["📒 Register Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","🛒 Purchase Order","📦 Arrangement","✏️ Other"])
+        tabs = st.tabs(["📒 Register Entry","✏️ Edit Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","🛒 Purchase Order","📦 Arrangement","✏️ Other"])
         with tabs[0]: form_register_entry()
-        with tabs[1]: form_bill_upload()
-        with tabs[2]: form_bill_crosscheck()
-        with tabs[3]: form_bill_upload_arrangement()
-        with tabs[4]: form_stock_placement()
-        with tabs[5]: form_placement_crosscheck()
-        with tabs[6]: form_rack_cleaning()
-        with tabs[7]: form_inventory_check()
-        with tabs[8]: form_book_porter()
-        with tabs[9]: form_porter_receive()
-        with tabs[10]: form_purchase_order()
-        with tabs[11]: form_arrangement()
-        with tabs[12]: form_other_task()
+        with tabs[1]: form_edit_register_entry()
+        with tabs[2]: form_bill_upload()
+        with tabs[3]: form_bill_crosscheck()
+        with tabs[4]: form_bill_upload_arrangement()
+        with tabs[5]: form_stock_placement()
+        with tabs[6]: form_placement_crosscheck()
+        with tabs[7]: form_rack_cleaning()
+        with tabs[8]: form_inventory_check()
+        with tabs[9]: form_book_porter()
+        with tabs[10]: form_porter_receive()
+        with tabs[11]: form_purchase_order()
+        with tabs[12]: form_arrangement()
+        with tabs[13]: form_other_task()
 
     elif team == "Call":
         tabs = st.tabs(["📞 Call Log","🔍 Medicine Search","🚛 Book Porter","✏️ Other"])
@@ -3034,6 +3119,359 @@ def show_admin_page():
                         st.markdown(f"⏳ {step_name}")
 
     with tab3:
+        st.subheader("📈 CEO & Stock Operations Dashboard")
+
+        # Date and filters
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            dash_date = st.date_input("Date", value=today_ist(), key="dash_date")
+        with c2:
+            try:
+                areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+                area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+            except:
+                area_list = ["All Areas"]
+            dash_area = st.selectbox("Area", area_list, key="dash_area")
+        with c3:
+            try:
+                users_resp = supabase.table("app_users").select("name").eq("team","Stock").eq("active",True).execute()
+                person_list = ["All Persons"] + [u["name"] for u in (users_resp.data or [])]
+            except:
+                person_list = ["All Persons"]
+            dash_person = st.selectbox("Person", person_list, key="dash_person")
+
+        dash_date_str = dash_date.strftime("%Y-%m-%d")
+
+        try:
+            # Load all tasks for selected date
+            tasks_resp = supabase.table("daily_tasks").select("*").eq("date", dash_date_str).execute()
+            all_tasks = tasks_resp.data or []
+
+            # Load arrangements
+            arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", dash_date_str).execute()
+            arrangements = arr_resp.data or []
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+            all_tasks = []
+            arrangements = []
+
+        # Filter tasks
+        reg_tasks   = [t for t in all_tasks if t.get("task_type") == "Register Entry"]
+        cross_tasks = [t for t in all_tasks if t.get("task_type") == "Bill Cross Check"]
+        upload_tasks= [t for t in all_tasks if t.get("task_type") in ["Bill Upload","Bill Upload (Arrangement)"]]
+        place_tasks = [t for t in all_tasks if t.get("task_type") == "Stock Placement"]
+
+        # Apply area filter
+        if dash_area != "All Areas":
+            arrangements = [a for a in arrangements if a.get("area","") == dash_area]
+
+        # Apply person filter
+        if dash_person != "All Persons":
+            reg_tasks    = [t for t in reg_tasks    if t.get("person") == dash_person]
+            cross_tasks  = [t for t in cross_tasks  if t.get("person") == dash_person]
+            upload_tasks = [t for t in upload_tasks if t.get("person") == dash_person]
+            place_tasks  = [t for t in place_tasks  if t.get("person") == dash_person]
+
+        # ── SECTION 1 — TODAY'S RECEIPTS ─────────────────────────────────────
+        st.markdown("### 📥 Today's Receipts")
+
+        total_bills   = len(reg_tasks)
+        total_skus    = sum([int(float((t.get("details") or {}).get("no_items",0) or 0)) for t in reg_tasks])
+        total_amount  = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in reg_tasks])
+
+        # Time calculations
+        cross_dur  = sum([int(float(t.get("duration_mins",0) or 0)) for t in cross_tasks])
+        upload_dur = sum([int(float(t.get("duration_mins",0) or 0)) for t in upload_tasks])
+        place_dur  = sum([int(float(t.get("duration_mins",0) or 0)) for t in place_tasks])
+
+        avg_cross  = round(cross_dur/len(cross_tasks), 1)  if cross_tasks  else 0
+        avg_upload = round(upload_dur/len(upload_tasks), 1) if upload_tasks else 0
+        avg_place  = round(place_dur/len(place_tasks), 1)  if place_tasks  else 0
+
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            st.metric("📋 Bills Received", total_bills)
+            st.metric("📦 Total SKUs", total_skus)
+            st.metric("💰 Total Amount", f"₹{total_amount:,.0f}")
+        with c2:
+            st.metric("⏱️ Total Check Time", f"{cross_dur} mins")
+            st.metric("⏱️ Total Upload Time", f"{upload_dur} mins")
+            st.metric("⏱️ Total Place Time", f"{place_dur} mins")
+        with c3:
+            st.metric("📊 Avg Check/Bill", f"{avg_cross} mins")
+            st.metric("📊 Avg Upload/Bill", f"{avg_upload} mins")
+            st.metric("📊 Avg Place/Bill", f"{avg_place} mins")
+
+        st.divider()
+
+        # ── SECTION 2 — PENDING WORK ──────────────────────────────────────────
+        st.markdown("### ⏳ Pending Work")
+
+        # Count pending at each stage
+        reached_wh    = [a for a in arrangements if a.get("status") == "Reached Warehouse"]
+        cross_checked = [a for a in arrangements if a.get("status") == "Bill Cross Checked"]
+        bill_uploaded = [a for a in arrangements if a.get("status") == "Bill Uploaded"]
+        stock_placed  = [a for a in arrangements if a.get("status") == "Stock Placed" and a.get("cross_check_status") == "Pending"]
+
+        # Normal orders pending
+        normal_cross_pending  = [t for t in all_tasks if t.get("task_type") == "Register Entry" and not any(c.get("details",{}).get("bill_no","") == t.get("details",{}).get("bill_no","") for c in cross_tasks)]
+        normal_upload_pending = [t for t in cross_tasks if not t.get("details",{}).get("arrangement_no","") and not t.get("details",{}).get("bill_uploaded")]
+        normal_place_pending  = [t for t in upload_tasks if not t.get("details",{}).get("arrangement_no","") and not t.get("details",{}).get("placement_done")]
+
+        p1,p2,p3,p4 = st.columns(4)
+        with p1:
+            total_cross_pending = len(reached_wh) + len(normal_cross_pending)
+            st.metric("✔️ Cross Check Pending", total_cross_pending)
+        with p2:
+            total_upload_pending = len(cross_checked) + len(normal_upload_pending)
+            st.metric("📤 Upload Pending", total_upload_pending)
+        with p3:
+            total_place_pending = len(bill_uploaded) + len(normal_place_pending)
+            st.metric("📍 Placement Pending", total_place_pending)
+        with p4:
+            st.metric("🔍 Final Check Pending", len(stock_placed))
+
+        st.divider()
+
+        # ── SECTION 3 — PERSON WISE PERFORMANCE ──────────────────────────────
+        st.markdown("### 👤 Person Wise Performance")
+
+        # Get all stock team members
+        try:
+            stock_users = supabase.table("app_users").select("name").eq("team","Stock").eq("active",True).execute()
+            stock_names = [u["name"] for u in (stock_users.data or [])]
+        except:
+            stock_names = list(set([t.get("person","") for t in cross_tasks + upload_tasks + place_tasks]))
+
+        person_rows = []
+        for person in stock_names:
+            if dash_person != "All Persons" and person != dash_person:
+                continue
+
+            p_cross  = [t for t in cross_tasks  if t.get("person") == person]
+            p_upload = [t for t in upload_tasks if t.get("person") == person]
+            p_place  = [t for t in place_tasks  if t.get("person") == person]
+
+            p_cross_dur  = sum([int(float(t.get("duration_mins",0) or 0)) for t in p_cross])
+            p_upload_dur = sum([int(float(t.get("duration_mins",0) or 0)) for t in p_upload])
+            p_place_dur  = sum([int(float(t.get("duration_mins",0) or 0)) for t in p_place])
+
+            person_rows.append({
+                "Person": person,
+                "Bills Checked": len(p_cross),
+                "Total Check(mins)": p_cross_dur,
+                "Avg Check/Bill": round(p_cross_dur/len(p_cross),1) if p_cross else "-",
+                "Bills Uploaded": len(p_upload),
+                "Total Upload(mins)": p_upload_dur,
+                "Avg Upload/Bill": round(p_upload_dur/len(p_upload),1) if p_upload else "-",
+                "Bills Placed": len(p_place),
+                "Total Place(mins)": p_place_dur,
+                "Avg Place/Bill": round(p_place_dur/len(p_place),1) if p_place else "-",
+            })
+
+        if person_rows:
+            person_df = pd.DataFrame(person_rows)
+            st.dataframe(person_df, use_container_width=True)
+
+            # Team summary
+            st.markdown("**📊 Team Summary:**")
+            s1,s2,s3 = st.columns(3)
+            with s1:
+                st.metric("Total Bills Checked", sum([r["Bills Checked"] for r in person_rows]))
+                st.metric("Team Avg Check/Bill", f"{round(sum([p_cross_dur for p_cross_dur in [r['Total Check(mins)'] for r in person_rows] if p_cross_dur > 0]) / max(sum([r['Bills Checked'] for r in person_rows]),1), 1)} mins")
+            with s2:
+                st.metric("Total Bills Uploaded", sum([r["Bills Uploaded"] for r in person_rows]))
+                st.metric("Team Avg Upload/Bill", f"{round(sum([r['Total Upload(mins)'] for r in person_rows]) / max(sum([r['Bills Uploaded'] for r in person_rows]),1), 1)} mins")
+            with s3:
+                st.metric("Total Bills Placed", sum([r["Bills Placed"] for r in person_rows]))
+                st.metric("Team Avg Place/Bill", f"{round(sum([r['Total Place(mins)'] for r in person_rows]) / max(sum([r['Bills Placed'] for r in person_rows]),1), 1)} mins")
+        else:
+            st.info("No stock team data for selected filters!")
+
+        st.divider()
+
+        # ── SECTION 4 — AREA WISE SUMMARY ────────────────────────────────────
+        st.markdown("### 📍 Area Wise Summary")
+        try:
+            area_data = {}
+            for arr in arrangements:
+                area = arr.get("area","Unknown")
+                if area not in area_data:
+                    area_data[area] = {"bills": 0, "skus": 0, "amount": 0, "pending": 0}
+                area_data[area]["bills"] += 1
+                area_data[area]["skus"]  += int(float(arr.get("no_medicines",0) or 0))
+                if arr.get("status") not in ["Completed","Stock Placed"]:
+                    area_data[area]["pending"] += 1
+
+            if area_data:
+                area_rows = [{"Area": k, "Bills": v["bills"], "SKUs": v["skus"], "Pending": v["pending"]} for k,v in area_data.items()]
+                st.dataframe(pd.DataFrame(area_rows), use_container_width=True)
+            else:
+                st.info("No area data available!")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+        st.divider()
+
+        st.subheader("📈 CEO Dashboard")
+
+        # Date selector
+        ceo_date = st.date_input("Select Date", value=today_ist(), key="ceo_date")
+        ceo_date_str = ceo_date.strftime("%Y-%m-%d")
+
+        try:
+            # Load all data
+            tasks_resp = supabase.table("daily_tasks").select("*").eq("date", ceo_date_str).execute()
+            tasks = tasks_resp.data or []
+            arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", ceo_date_str).execute()
+            arrangements = arr_resp.data or []
+        except Exception as e:
+            st.error(f"Error: {e}")
+            tasks = []
+            arrangements = []
+
+        # ── FINANCIAL OVERVIEW ────────────────────────────────────────────────
+        st.markdown("### 💰 Financial Overview")
+        reg_entries = [t for t in tasks if t.get("task_type") == "Register Entry"]
+        
+        total_amount = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in reg_entries])
+        arr_amount   = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in reg_entries if (t.get("details") or {}).get("order_type") == "Arrangement"])
+        normal_amount = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in reg_entries if (t.get("details") or {}).get("order_type") == "Normal Order"])
+        porter_payments = supabase.table("porter_bookings").select("*").eq("date", ceo_date_str).eq("status","Payment Done").execute()
+        porter_cost = sum([float(p.get("porter_cost",0) or 0) for p in (porter_payments.data or [])])
+
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: st.metric("💰 Total Purchase", f"₹{total_amount:,.0f}")
+        with c2: st.metric("📋 Arrangement", f"₹{arr_amount:,.0f}")
+        with c3: st.metric("🛒 Normal Orders", f"₹{normal_amount:,.0f}")
+        with c4: st.metric("🚛 Porter Cost", f"₹{porter_cost:,.0f}")
+
+        st.divider()
+
+        # ── WEEK ON WEEK TRENDS ───────────────────────────────────────────────
+        st.markdown("### 📈 Week on Week Trends")
+        try:
+            from datetime import timedelta
+            
+            # This week vs last week
+            this_week_start = (ceo_date - timedelta(days=ceo_date.weekday())).strftime("%Y-%m-%d")
+            last_week_start = (ceo_date - timedelta(days=ceo_date.weekday()+7)).strftime("%Y-%m-%d")
+            last_week_end   = (ceo_date - timedelta(days=ceo_date.weekday()+1)).strftime("%Y-%m-%d")
+
+            this_week_tasks = supabase.table("daily_tasks").select("*")                .gte("date", this_week_start)                .lte("date", ceo_date_str).execute()
+            last_week_tasks = supabase.table("daily_tasks").select("*")                .gte("date", last_week_start)                .lte("date", last_week_end).execute()
+
+            this_week_arr = supabase.table("arrangements").select("*")                .gte("order_placed_date", this_week_start)                .lte("order_placed_date", ceo_date_str).execute()
+            last_week_arr = supabase.table("arrangements").select("*")                .gte("order_placed_date", last_week_start)                .lte("order_placed_date", last_week_end).execute()
+
+            this_week_count = len(this_week_tasks.data or [])
+            last_week_count = len(last_week_tasks.data or [])
+            this_arr_count  = len(this_week_arr.data or [])
+            last_arr_count  = len(last_week_arr.data or [])
+
+            task_delta = this_week_count - last_week_count
+            arr_delta  = this_arr_count - last_arr_count
+
+            c1,c2,c3,c4 = st.columns(4)
+            with c1: st.metric("📋 This Week Tasks", this_week_count, f"{'+' if task_delta>=0 else ''}{task_delta} vs last week")
+            with c2: st.metric("📦 This Week Arrangements", this_arr_count, f"{'+' if arr_delta>=0 else ''}{arr_delta} vs last week")
+            with c3:
+                this_week_amount = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in (this_week_tasks.data or []) if t.get("task_type")=="Register Entry"])
+                last_week_amount = sum([float((t.get("details") or {}).get("bill_amount",0) or 0) for t in (last_week_tasks.data or []) if t.get("task_type")=="Register Entry"])
+                amount_delta = this_week_amount - last_week_amount
+                st.metric("💰 This Week Purchase", f"₹{this_week_amount:,.0f}", f"{'+'if amount_delta>=0 else ''}₹{amount_delta:,.0f}")
+            with c4:
+                # Avg processing time this week
+                pipeline_times = []
+                for arr in (this_week_arr.data or []):
+                    try:
+                        from datetime import datetime as dt
+                        o = dt.strptime(arr.get("order_placed_time",""), "%I:%M %p")
+                        u = dt.strptime(arr.get("bill_upload_time",""), "%I:%M %p")
+                        diff = int((u-o).total_seconds()/60)
+                        if diff > 0:
+                            pipeline_times.append(diff)
+                    except:
+                        pass
+                avg_pipeline = round(sum(pipeline_times)/len(pipeline_times),0) if pipeline_times else 0
+                st.metric("⏱️ Avg Pipeline Time", f"{int(avg_pipeline)} mins")
+
+        except Exception as e:
+            st.error(f"Trends error: {e}")
+
+        st.divider()
+
+        # ── DISTRIBUTOR PERFORMANCE ───────────────────────────────────────────
+        st.markdown("### 🏪 Distributor Performance")
+        try:
+            # Count orders and issues per distributor
+            dist_data = {}
+            for t in tasks:
+                if t.get("task_type") in ["Register Entry","Bill Upload","Bill Cross Check"]:
+                    d = t.get("details",{}) or {}
+                    dist = d.get("distributor","")
+                    if not dist:
+                        continue
+                    if dist not in dist_data:
+                        dist_data[dist] = {
+                            "orders": 0, "amount": 0,
+                            "near_expiry": 0, "damaged": 0,
+                            "contra": 0, "wrong_batch": 0,
+                            "shortage": 0
+                        }
+                    if t.get("task_type") == "Register Entry":
+                        dist_data[dist]["orders"] += 1
+                        dist_data[dist]["amount"] += float(d.get("bill_amount",0) or 0)
+                    if t.get("task_type") == "Bill Cross Check":
+                        dist_data[dist]["near_expiry"] += int(float(d.get("near_expiry",0) or 0))
+                        dist_data[dist]["damaged"]     += int(float(d.get("damaged",0) or 0))
+                        dist_data[dist]["contra"]      += int(float(d.get("contra",0) or 0))
+                        dist_data[dist]["wrong_batch"] += int(float(d.get("wrong_batch",0) or 0))
+                        dist_data[dist]["shortage"]    += int(float(d.get("shortage",0) or 0))
+
+            if dist_data:
+                dist_rows = []
+                for dist, data in dist_data.items():
+                    total_issues = data["near_expiry"] + data["damaged"] + data["contra"] + data["wrong_batch"] + data["shortage"]
+                    status = "🔴 Issues" if total_issues > 0 else "✅ Good"
+                    dist_rows.append({
+                        "Distributor": dist,
+                        "Orders": data["orders"],
+                        "Amount(₹)": f"₹{data['amount']:,.0f}",
+                        "Near Expiry": data["near_expiry"],
+                        "Damaged": data["damaged"],
+                        "Contra": data["contra"],
+                        "Wrong Batch": data["wrong_batch"],
+                        "Shortage": data["shortage"],
+                        "Total Issues": total_issues,
+                        "Status": status
+                    })
+                dist_df = pd.DataFrame(dist_rows).sort_values("Total Issues", ascending=False)
+                st.dataframe(dist_df, use_container_width=True)
+            else:
+                st.info("No distributor data for selected date!")
+        except Exception as e:
+            st.error(f"Distributor error: {e}")
+
+        st.divider()
+
+        # ── TEAM PRODUCTIVITY ─────────────────────────────────────────────────
+        st.markdown("### 👥 Team Productivity")
+        if tasks:
+            tasks_df = pd.DataFrame(tasks)
+            person_summary = tasks_df.groupby(["person","team"]).agg(
+                Tasks=("task_type","count"),
+                Total_mins=("duration_mins", lambda x: sum([int(float(v or 0)) for v in x]))
+            ).reset_index()
+            person_summary = person_summary.sort_values("Tasks", ascending=False)
+            st.dataframe(person_summary, use_container_width=True)
+            st.bar_chart(tasks_df.groupby("person").size())
+        else:
+            st.info("No team data for selected date!")
+
+        st.divider()
+
         st.subheader("📈 Performance Dashboard")
         perf_date = st.date_input("Date", value=today_ist(), key="perf_date_tab")
         perf_date_str = perf_date.strftime("%Y-%m-%d")
