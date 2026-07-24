@@ -132,6 +132,32 @@ if not st.session_state.logged_in:
         pass
 
 # ── IMAGE UPLOAD ──────────────────────────────────────────────────────────────
+def calc_actual_duration(df):
+    """Calculate actual working time by merging overlapping task periods"""
+    try:
+        from datetime import datetime as dt
+        periods = []
+        for _, row in df.iterrows():
+            try:
+                s = dt.strptime(str(row.get("start_time","")), "%I:%M %p")
+                e = dt.strptime(str(row.get("end_time","")), "%I:%M %p")
+                if e > s:
+                    periods.append((s, e))
+            except:
+                pass
+        if not periods:
+            return 0
+        periods.sort()
+        merged = [list(periods[0])]
+        for start, end in periods[1:]:
+            if start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return sum([int((e-s).total_seconds()/60) for s,e in merged])
+    except:
+        return 0
+
 def upload_image(file, prefix="img"):
     if file is None:
         return ""
@@ -244,12 +270,33 @@ def show_sidebar():
             st.rerun()
 
 # ── TIMER BUTTON ──────────────────────────────────────────────────────────────
+def get_active_timer():
+    """Check if any timer is currently running"""
+    timer_keys = [
+        "purchase_order","purchase_return","pharmarack","bounce",
+        "arrangement_order","bill_crosscheck","bill_upload","bill_upload_normal",
+        "stock_placement","rack_cleaning","inventory",
+        "call_log","medicine_search","delivery","other_task","pickup"
+    ]
+    for k in timer_keys:
+        if st.session_state.get(f"{k}_start"):
+            return k, st.session_state[f"{k}_start"]
+    return None, None
+
 def timer_button(key, task_name=None):
     sk = f"{key}_start"
     if sk not in st.session_state:
         st.session_state[sk] = None
 
     if st.session_state[sk] is None:
+        # Check if another task is running
+        active_key, active_start = get_active_timer()
+        if active_key and active_key != key:
+            active_name = active_key.replace("_"," ").title()
+            elapsed = int((now_ist() - active_start).total_seconds() / 60)
+            st.warning(f"⚠️ **{active_name}** is already in progress ({elapsed} mins)! Please complete it first before starting a new task.")
+            return None
+
         st.info("👆 Click START when you begin this task")
         if st.button("▶️ Start", key=f"btn_{key}", type="primary"):
             st.session_state[sk] = now_ist()
@@ -421,6 +468,9 @@ def form_bounce_medicine():
 # ── ARRANGEMENT FORM ──────────────────────────────────────────────────────────
 def form_arrangement():
     st.subheader("📋 New Arrangement Order")
+    start = timer_button("arrangement_order", "Arrangement Order")
+    if start is None:
+        return
 
     AREAS = load_areas() + load_warehouses() + ["Other"]
 
@@ -461,6 +511,8 @@ def form_arrangement():
         if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
             if not arr_no or not medicines:
                 st.error("Fill Arrangement No and Medicines!")
+            elif not img:
+                st.error("⚠️ Image of order is mandatory! Please upload or take photo.")
             else:
                 # Check duplicate arrangement number
                 try:
@@ -505,6 +557,9 @@ def form_arrangement():
 # ── STOCK TEAM FORMS ──────────────────────────────────────────────────────────
 def form_bill_upload():
     st.subheader("🧾 Bill Upload")
+    start = timer_button("bill_upload_normal", "Bill Upload")
+    if start is None:
+        return
     with st.form("bill_upload_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
@@ -800,54 +855,57 @@ def form_pickup():
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
-            arr_id = None
-            arr_no = None
-            if arr_select != "—":
-                selected_arr = arr_options[arr_select]
-                arr_id = selected_arr["id"]
-                arr_no = selected_arr.get("arrangement_no")
+            if not medicine_img:
+                st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
+            else:
+                arr_id = None
+                arr_no = None
+                if arr_select != "—":
+                    selected_arr = arr_options[arr_select]
+                    arr_id = selected_arr["id"]
+                    arr_no = selected_arr.get("arrangement_no")
 
-            med_img_name = upload_image(medicine_img, "pickup") if medicine_img else ""
+                med_img_name = upload_image(medicine_img, "pickup") if medicine_img else ""
 
-            try:
-                supabase.table("daily_tasks").insert({
-                    "date": date_str(),
-                    "time": time_str(),
-                    "person": st.session_state.name,
-                    "team": "Delivery",
-                    "task_type": "Pickup",
-                    "details": {
-                        "distributor": distributor,
-                        "arrangement_no": str(arr_no) if arr_no else "",
-                        "delivery_by": delivery_by,
-                        "pickup_by": st.session_state.name,
-                        "no_sku_received": str(no_sku_received),
-                        "time_reached": str(time_reached),
-                        "time_handover": str(time_handover),
-                        "porter_no": porter_no,
-                        "porter_pickup_time": str(porter_pickup) if porter_no else "",
+                try:
+                    supabase.table("daily_tasks").insert({
+                        "date": date_str(),
+                        "time": time_str(),
+                        "person": st.session_state.name,
+                        "team": "Delivery",
+                        "task_type": "Pickup",
+                        "details": {
+                            "distributor": distributor,
+                            "arrangement_no": str(arr_no) if arr_no else "",
+                            "delivery_by": delivery_by,
+                            "pickup_by": st.session_state.name,
+                            "no_sku_received": str(no_sku_received),
+                            "time_reached": str(time_reached),
+                            "time_handover": str(time_handover),
+                            "porter_no": porter_no,
+                            "porter_pickup_time": str(porter_pickup) if porter_no else "",
                         "medicine_image": med_img_name,
-                        "remarks": remarks
-                    },
-                    "start_time": str(time_reached),
-                    "end_time": str(time_handover),
-                }).execute()
+                            "remarks": remarks
+                        },
+                        "start_time": str(time_reached),
+                        "end_time": str(time_handover),
+                    }).execute()
 
-                if arr_id:
-                    supabase.table("arrangements").update({
-                        "status": "Picked Up - In Transit",
-                        "pickup_by": st.session_state.name,
-                        "pickup_time": str(time_reached),
-                        "handover_type": delivery_by,
-                        "porter_no": porter_no,
-                        "no_sku_received": str(no_sku_received),
-                    }).eq("id", arr_id).execute()
+                    if arr_id:
+                        supabase.table("arrangements").update({
+                            "status": "Picked Up - In Transit",
+                            "pickup_by": st.session_state.name,
+                            "pickup_time": str(time_reached),
+                            "handover_type": delivery_by,
+                            "porter_no": porter_no,
+                            "no_sku_received": str(no_sku_received),
+                        }).eq("id", arr_id).execute()
 
-                st.success("✅ Pickup entry submitted!")
-                st.balloons()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+                    st.success("✅ Pickup entry submitted!")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # ── DELIVERY FORM ─────────────────────────────────────────────────────────────
 def form_delivery():
@@ -1463,6 +1521,9 @@ def form_bill_crosscheck():
 
 def form_bill_upload_arrangement():
     st.subheader("📤 Bill Upload")
+    start = timer_button("bill_upload", "Bill Upload")
+    if start is None:
+        return
 
     # Load cross checked arrangements
     try:
@@ -2354,11 +2415,14 @@ def show_user_page():
             "purchase_return": "Purchase Return",
             "pharmarack": "PharmaRack Search",
             "bounce": "Bounce Medicine Study",
+            "arrangement_order": "Arrangement Order",
             "other_task": "Other Task",
         }
     elif team == "Stock":
         timer_keys = {
             "bill_crosscheck": "Bill Cross Check",
+            "bill_upload": "Bill Upload",
+            "bill_upload_normal": "Bill Upload",
             "stock_placement": "Stock Placement",
             "rack_cleaning": "Rack Cleaning",
             "inventory": "Inventory Check",
