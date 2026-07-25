@@ -830,11 +830,18 @@ def form_pickup():
             st.warning("⚠️ No invoice image uploaded by Purchase Team for this arrangement")
 
     with st.form("pickup_form", clear_on_submit=True):
+        # Auto fill from preview selection
+        auto_dist = st.session_state.get("pickup_auto_dist","")
+        auto_arr  = st.session_state.get("pickup_auto_arr","")
+
         c1, c2 = st.columns(2)
         with c1:
-            distributor   = st.selectbox("Distributor *", DISTRIBUTORS, key="pu_dist")
-            arr_select    = st.selectbox("Arrangement No", ["—"] + list(arr_options.keys()), key="pu_arr")
-            delivery_by   = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
+            dist_index = DISTRIBUTORS.index(auto_dist) if auto_dist in DISTRIBUTORS else 0
+            distributor = st.selectbox("Distributor *", DISTRIBUTORS, index=dist_index, key="pu_dist")
+            arr_keys    = ["—"] + list(arr_options.keys())
+            arr_index   = arr_keys.index(auto_arr) if auto_arr in arr_keys else 0
+            arr_select  = st.selectbox("Arrangement No", arr_keys, index=arr_index, key="pu_arr")
+            delivery_by = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
         with c2:
             no_sku_received = st.number_input("No of SKUs Actually Received", min_value=0, step=1)
             time_reached    = st.time_input("Time Reached Distributor", key="pu_reached")
