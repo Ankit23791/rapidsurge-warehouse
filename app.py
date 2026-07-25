@@ -3061,7 +3061,172 @@ def show_admin_page():
             st.error(f"Error: {e}")
 
     with tab2:
-        st.subheader("🔄 Arrangement Pipeline View")
+        st.subheader("🔄 Pipeline View")
+
+        pipe_type = st.radio("Select Pipeline",
+            ["📦 Arrangement Orders", "🧾 Normal Orders"],
+            horizontal=True, key="pipe_type_tab")
+
+        if pipe_type == "🧾 Normal Orders":
+            st.subheader("🧾 Normal Order Pipeline")
+
+            c1,c2,c3,c4 = st.columns(4)
+            with c1:
+                no_date = st.date_input("Date", value=today_ist(), key="no_date")
+            with c2:
+                try:
+                    areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+                    no_area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+                except:
+                    no_area_list = ["All Areas"]
+                no_area = st.selectbox("Area", no_area_list, key="no_area")
+            with c3:
+                no_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="no_dist")
+            with c4:
+                no_bill = st.text_input("Search Bill No", placeholder="Type bill no...", key="no_bill")
+
+            no_date_str = no_date.strftime("%Y-%m-%d")
+
+            try:
+                reg_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Register Entry")\
+                    .eq("date", no_date_str).execute()
+                register_entries = reg_resp.data or []
+
+                cross_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Bill Cross Check")\
+                    .eq("date", no_date_str).execute()
+                cross_checks = {t.get("details",{}).get("bill_no",""):t for t in (cross_resp.data or []) if not t.get("details",{}).get("arrangement_no","")}
+
+                upload_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Bill Upload")\
+                    .eq("date", no_date_str).execute()
+                uploads = {t.get("details",{}).get("bill_no",""):t for t in (upload_resp.data or []) if not t.get("details",{}).get("arrangement_no","")}
+
+                place_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Stock Placement")\
+                    .eq("date", no_date_str).execute()
+                placements = {t.get("details",{}).get("bill_no",""):t for t in (place_resp.data or []) if not t.get("details",{}).get("arrangement_no","")}
+
+                pcheck_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Placement Cross Check")\
+                    .eq("date", no_date_str).execute()
+                place_checks = {t.get("details",{}).get("bill_no",""):t for t in (pcheck_resp.data or [])}
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+                register_entries = []
+                cross_checks = {}
+                uploads = {}
+                placements = {}
+                place_checks = {}
+
+            if not register_entries:
+                st.info("No normal orders found for selected date!")
+            else:
+                if no_dist:
+                    register_entries = [r for r in register_entries if no_dist.lower() in r.get("details",{}).get("distributor","").lower()]
+                if no_bill:
+                    register_entries = [r for r in register_entries if no_bill.lower() in r.get("details",{}).get("bill_no","").lower()]
+
+                pipeline_rows = []
+                for r in register_entries:
+                    d       = r.get("details",{})
+                    bill_no = d.get("bill_no","")
+                    dist    = d.get("distributor","")
+                    items   = d.get("no_items","")
+                    amount  = d.get("bill_amount","")
+                    delby   = d.get("delivery_by","")
+
+                    cross  = cross_checks.get(bill_no)
+                    upload = uploads.get(bill_no)
+                    place  = placements.get(bill_no)
+                    pcheck = place_checks.get(bill_no)
+
+                    if pcheck:
+                        status = "✅ Completed"
+                    elif place:
+                        status = "🔍 Cross Check Pending"
+                    elif upload:
+                        status = "📍 Placement Pending"
+                    elif cross:
+                        status = "📤 Upload Pending"
+                    else:
+                        status = "✔️ Cross Check Pending"
+
+                    pipeline_rows.append({
+                        "Bill No": bill_no,
+                        "Distributor": dist,
+                        "Date": r.get("date",""),
+                        "SKUs": items,
+                        "Amount(₹)": f"₹{float(amount or 0):,.0f}",
+                        "Arrived": r.get("time",""),
+                        "Received By": r.get("person",""),
+                        "Delivered By": delby,
+                        "Check Time": f"{cross.get('duration_mins','-')} mins" if cross else "⏳",
+                        "Checked By": cross.get("person","") if cross else "⏳",
+                        "Upload Time": f"{upload.get('duration_mins','-')} mins" if upload else "⏳",
+                        "Uploaded By": upload.get("person","") if upload else "⏳",
+                        "Place Time": f"{place.get('duration_mins','-')} mins" if place else "⏳",
+                        "Placed By": place.get("person","") if place else "⏳",
+                        "Cross Check": "✅ " + pcheck.get("person","") if pcheck else "⏳",
+                        "Status": status
+                    })
+
+                if pipeline_rows:
+                    pipeline_df = pd.DataFrame(pipeline_rows)
+                    st.markdown(f"**{len(pipeline_df)} bills found**")
+
+                    status_filter = st.selectbox("Filter by Status", [
+                        "All","✔️ Cross Check Pending","📤 Upload Pending",
+                        "📍 Placement Pending","🔍 Cross Check Pending","✅ Completed"
+                    ], key="no_status")
+
+                    if status_filter != "All":
+                        pipeline_df = pipeline_df[pipeline_df["Status"]==status_filter]
+
+                    st.dataframe(pipeline_df, use_container_width=True)
+
+                    # Detailed expander view
+                    st.markdown("**📋 Detailed View:**")
+                    for r in pipeline_rows:
+                        with st.expander(f"Bill: {r['Bill No']} | {r['Distributor']} | {r['Status']}"):
+                            c1,c2 = st.columns(2)
+                            with c1:
+                                st.markdown("**📒 Register Entry:**")
+                                st.markdown(f"- Arrived: **{r['Arrived']}**")
+                                st.markdown(f"- Received By: **{r['Received By']}**")
+                                st.markdown(f"- Delivered By: **{r['Delivered By']}**")
+                                st.markdown(f"- SKUs: **{r['SKUs']}**")
+                                st.markdown(f"- Amount: **{r['Amount(₹)']}**")
+                                st.divider()
+                                st.markdown("**✔️ Bill Cross Check:**")
+                                st.markdown(f"- Checked By: **{r['Checked By']}**")
+                                st.markdown(f"- Time Taken: **{r['Check Time']}**")
+                            with c2:
+                                st.markdown("**📤 Bill Upload:**")
+                                st.markdown(f"- Uploaded By: **{r['Uploaded By']}**")
+                                st.markdown(f"- Time Taken: **{r['Upload Time']}**")
+                                st.divider()
+                                st.markdown("**📍 Stock Placement:**")
+                                st.markdown(f"- Placed By: **{r['Placed By']}**")
+                                st.markdown(f"- Time Taken: **{r['Place Time']}**")
+                                st.divider()
+                                st.markdown("**🔍 Final Cross Check:**")
+                                st.markdown(f"- Result: **{r['Cross Check']}**")
+
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                        pipeline_df.to_excel(w, index=False)
+                    st.download_button("⬇️ Download Excel", buf.getvalue(),
+                        f"normal_orders_{no_date_str}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="no_excel")
+                else:
+                    st.info("No bills match selected filters!")
+
+        else:
+            st.subheader("🔄 Arrangement Pipeline View")
         c1,c2,c3 = st.columns(3)
         with c1:
             pipeline_date = st.date_input("Date", value=today_ist(), key="pipeline_date_tab")
@@ -3119,7 +3284,164 @@ def show_admin_page():
                         st.markdown(f"⏳ {step_name}")
 
     with tab3:
-        st.subheader("📈 CEO & Stock Operations Dashboard")
+        st.subheader("📈 Performance & CEO Dashboard")
+
+        perf_tab1, perf_tab2 = st.tabs(["👤 Team Performance", "💼 CEO Dashboard"])
+
+        with perf_tab1:
+            st.subheader("👤 Individual Performance")
+
+            c1,c2 = st.columns(2)
+            with c1:
+                perf_date = st.date_input("Date", value=today_ist(), key="perf_date_ind")
+            with c2:
+                try:
+                    users_resp = supabase.table("app_users").select("*")\
+                        .eq("active",True).neq("role","admin").execute()
+                    person_list = [u["name"] for u in (users_resp.data or [])]
+                    teams_dict  = {u["name"]: u["team"] for u in (users_resp.data or [])}
+                except:
+                    person_list = []
+                    teams_dict  = {}
+                sel_person = st.selectbox("Select Person", person_list, key="perf_person")
+
+            perf_date_str = perf_date.strftime("%Y-%m-%d")
+            from datetime import timedelta
+            yesterday_str = (perf_date - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            if sel_person:
+                team = teams_dict.get(sel_person, "")
+
+                # Load today tasks
+                try:
+                    tasks_resp = supabase.table("daily_tasks").select("*")\
+                        .eq("person", sel_person)\
+                        .eq("date", perf_date_str).execute()
+                    tasks = tasks_resp.data or []
+
+                    # Load yesterday tasks
+                    yest_resp = supabase.table("daily_tasks").select("*")\
+                        .eq("person", sel_person)\
+                        .eq("date", yesterday_str).execute()
+                    yest_tasks = yest_resp.data or []
+                except:
+                    tasks = []
+                    yest_tasks = []
+
+                if not tasks:
+                    st.info(f"No tasks found for {sel_person} on {perf_date_str}!")
+                else:
+                    # ── PURCHASE TEAM METRICS ─────────────────────────────
+                    if team == "Purchase":
+                        task_config = {
+                            "Purchase Order":       ("no_sku",     "SKUs"),
+                            "Arrangement Order":    ("no_medicines","Medicines"),
+                            "Purchase Return":      ("no_items",   "Items"),
+                            "PharmaRack Search":    ("no_searched","Searched"),
+                            "Bounce Medicine Study":("no_bounced", "Bounced"),
+                        }
+
+                    # ── STOCK TEAM METRICS ────────────────────────────────
+                    elif team == "Stock":
+                        task_config = {
+                            "Register Entry":       ("no_items",   "Items"),
+                            "Bill Cross Check":     ("no_items",   "Items"),
+                            "Bill Upload":          ("no_items",   "Items"),
+                            "Bill Upload (Arrangement)": ("no_items","Items"),
+                            "Stock Placement":      ("no_medicines","Medicines"),
+                            "Rack Cleaning":        ("no_racks",   "Racks"),
+                            "Inventory Check":      ("no_items",   "Items"),
+                        }
+
+                    # ── CALL TEAM METRICS ─────────────────────────────────
+                    elif team == "Call":
+                        task_config = {
+                            "Call Log":         ("calls_made",  "Calls"),
+                            "Medicine Search":  ("no_searched", "Searched"),
+                        }
+                    else:
+                        task_config = {}
+
+                    # Build performance table
+                    perf_rows = []
+                    total_time  = 0
+                    total_count = 0
+                    total_skus  = 0
+
+                    for task_type, (sku_field, sku_label) in task_config.items():
+                        task_list = [t for t in tasks if t.get("task_type") == task_type]
+                        if not task_list:
+                            continue
+
+                        count    = len(task_list)
+                        duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in task_list])
+                        skus     = sum([int(float((t.get("details") or {}).get(sku_field,0) or 0)) for t in task_list])
+                        avg_sku  = round(duration/skus, 2) if skus > 0 else "-"
+
+                        # Yesterday comparison
+                        yest_list     = [t for t in yest_tasks if t.get("task_type") == task_type]
+                        yest_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in yest_list])
+                        yest_skus     = sum([int(float((t.get("details") or {}).get(sku_field,0) or 0)) for t in yest_list])
+                        yest_avg      = round(yest_duration/yest_skus, 2) if yest_skus > 0 else None
+
+                        # Trend
+                        if avg_sku != "-" and yest_avg:
+                            trend = "✅ Better" if float(avg_sku) < float(yest_avg) else "⚠️ Slower"
+                        else:
+                            trend = "-"
+
+                        total_time  += duration
+                        total_count += count
+                        total_skus  += skus
+
+                        perf_rows.append({
+                            "Task": task_type,
+                            f"Count": count,
+                            "Total Time (mins)": duration,
+                            f"{sku_label}": skus,
+                            "Avg/SKU (mins)": avg_sku,
+                            "Yesterday Avg": yest_avg or "-",
+                            "Trend": trend
+                        })
+
+                    if perf_rows:
+                        # Summary metrics
+                        overall_avg = round(total_time/total_skus, 2) if total_skus > 0 else 0
+                        c1,c2,c3,c4 = st.columns(4)
+                        with c1: st.metric(f"👤 {sel_person}", team)
+                        with c2: st.metric("⏱️ Total Time", f"{total_time} mins")
+                        with c3: st.metric("📋 Total Tasks", total_count)
+                        with c4: st.metric("📦 Total SKUs", total_skus)
+
+                        st.divider()
+
+                        # Performance table
+                        perf_df = pd.DataFrame(perf_rows)
+                        st.dataframe(perf_df, use_container_width=True)
+
+                        # Total row
+                        st.markdown(f"**📊 Overall Avg/SKU: {overall_avg} mins**")
+
+                        # Bar chart - time per task
+                        st.divider()
+                        st.markdown("**⏱️ Time Distribution:**")
+                        chart_df = pd.DataFrame([
+                            {"Task": r["Task"], "Minutes": r["Total Time (mins)"]}
+                            for r in perf_rows
+                        ]).set_index("Task")
+                        st.bar_chart(chart_df)
+
+                        # Trend analysis
+                        st.divider()
+                        st.markdown("**📈 Trend vs Yesterday:**")
+                        for r in perf_rows:
+                            if r["Trend"] != "-":
+                                st.markdown(f"**{r['Task']}**: Today {r['Avg/SKU (mins)']} mins/SKU | Yesterday {r['Yesterday Avg']} mins/SKU | {r['Trend']}")
+                    else:
+                        st.info(f"No matching tasks found for {sel_person}!")
+
+        with perf_tab2:
+            st.subheader("📈 CEO Dashboard")
 
         # Date and filters
         c1,c2,c3 = st.columns(3)
