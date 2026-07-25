@@ -816,7 +816,14 @@ def form_pickup():
                 from PIL import Image
                 import io
                 img = Image.open(io.BytesIO(img_data))
-                st.image(img, caption=f"Invoice - {preview_arr.get('arrangement_no','')}", width=400)
+                st.image(img, caption="Invoice (Download to zoom)", use_container_width=True)
+                st.download_button(
+                    "🔍 Download to Zoom",
+                    img_data,
+                    file_name=f"invoice_{preview_arr.get('arrangement_no','')}.jpg",
+                    mime="image/jpeg",
+                    key=f"dl_inv_{preview_arr.get('arrangement_no','')}"
+                )
             except Exception as img_err:
                 st.warning(f"⚠️ Image error: {img_err}")
         else:
