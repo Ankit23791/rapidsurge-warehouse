@@ -807,7 +807,14 @@ def form_pickup():
     if selected_preview != "—":
         preview_arr = arr_options[selected_preview]
         st.session_state.selected_pickup_arr = selected_preview
-        st.info(f"📋 Area: **{preview_arr.get('area','N/A')}** | Bill/Order ID: **{preview_arr.get('bill_order_id','N/A')}** | Medicines to Pick: **{preview_arr.get('no_medicines','N/A')}**")
+        # Store for auto-fill in form
+        st.session_state["pickup_auto_dist"] = preview_arr.get("distributor","")
+        st.session_state["pickup_auto_arr"]  = selected_preview
+
+        c1,c2,c3 = st.columns(3)
+        with c1: st.info(f"📍 Area: **{preview_arr.get('area','N/A')}**")
+        with c2: st.info(f"🧾 Bill/Order ID: **{preview_arr.get('bill_order_id','N/A')}**")
+        with c3: st.info(f"💊 Medicines to Pick: **{preview_arr.get('no_medicines','N/A')}**")
         order_img = preview_arr.get("order_image","")
         if order_img and order_img.strip():
             st.markdown("**📄 Invoice Image from Purchase Team:**")
@@ -829,18 +836,29 @@ def form_pickup():
         else:
             st.warning("⚠️ No invoice image uploaded by Purchase Team for this arrangement")
 
-    with st.form("pickup_form", clear_on_submit=True):
-        # Auto fill from preview selection
-        auto_dist = st.session_state.get("pickup_auto_dist","")
-        auto_arr  = st.session_state.get("pickup_auto_arr","")
+    # Auto fill from preview
+    auto_dist = st.session_state.get("pickup_auto_dist","")
+    auto_arr  = st.session_state.get("pickup_auto_arr","")
+    arr_keys  = ["—"] + list(arr_options.keys())
 
+    # Show selected info above form
+    if auto_dist:
+        st.success(f"✅ Auto-filled: **{auto_dist}** | **{auto_arr}**")
+
+    with st.form("pickup_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            dist_index = DISTRIBUTORS.index(auto_dist) if auto_dist in DISTRIBUTORS else 0
-            distributor = st.selectbox("Distributor *", DISTRIBUTORS, index=dist_index, key="pu_dist")
-            arr_keys    = ["—"] + list(arr_options.keys())
-            arr_index   = arr_keys.index(auto_arr) if auto_arr in arr_keys else 0
-            arr_select  = st.selectbox("Arrangement No", arr_keys, index=arr_index, key="pu_arr")
+            # Show auto-filled values as text info
+            st.markdown(f"**Distributor:** {auto_dist if auto_dist else 'Select below'}")
+            distributor = st.selectbox("Change Distributor (if needed)",
+                DISTRIBUTORS,
+                index=DISTRIBUTORS.index(auto_dist) if auto_dist in DISTRIBUTORS else 0,
+                key="pu_dist")
+            st.markdown(f"**Arrangement:** {auto_arr if auto_arr else 'Select below'}")
+            arr_select = st.selectbox("Change Arrangement (if needed)",
+                arr_keys,
+                index=arr_keys.index(auto_arr) if auto_arr in arr_keys else 0,
+                key="pu_arr")
             delivery_by = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
         with c2:
             no_sku_received = st.number_input("No of SKUs Actually Received", min_value=0, step=1)
@@ -3797,9 +3815,11 @@ def show_admin_page():
         if tasks:
             tasks_df = pd.DataFrame(tasks)
             person_summary = tasks_df.groupby(["person","team"]).agg(
-                Tasks=("task_type","count"),
-                Total_mins=("duration_mins", lambda x: sum([int(float(v or 0)) for v in x]))
+                Tasks=("task_type","count")
             ).reset_index()
+            person_summary["Total_mins"] = person_summary.apply(
+                lambda row: sum([int(float(t.get("duration_mins",0) or 0)) 
+                    for t in tasks if t.get("person")==row["person"]]), axis=1)
             person_summary = person_summary.sort_values("Tasks", ascending=False)
             st.dataframe(person_summary, use_container_width=True)
             st.bar_chart(tasks_df.groupby("person").size())
