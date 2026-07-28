@@ -3320,6 +3320,30 @@ def show_admin_page():
                                 st.markdown("**🔍 Final Cross Check:**")
                                 st.markdown(f"- Result: **{r['Cross Check']}**")
 
+                            # Show invoice image if available
+                            reg_entry = next((t for t in register_entries 
+                                if t.get("details",{}).get("bill_no","") == r["Bill No"]), None)
+                            if reg_entry:
+                                img_name = reg_entry.get("details",{}).get("invoice_image","")
+                                if img_name:
+                                    st.divider()
+                                    st.markdown("**📸 Invoice Image:**")
+                                    try:
+                                        img_data = supabase.storage.from_("Images").download(img_name)
+                                        from PIL import Image
+                                        import io as io_mod
+                                        pil_img = Image.open(io_mod.BytesIO(img_data))
+                                        st.image(pil_img, use_container_width=True)
+                                        st.download_button(
+                                            "🔍 Download Full Size",
+                                            img_data,
+                                            file_name=f"invoice_{r['Bill No']}.jpg",
+                                            mime="image/jpeg",
+                                            key=f"dl_inv_{r['Bill No']}"
+                                        )
+                                    except:
+                                        st.warning("Image not available")
+
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine="openpyxl") as w:
                         pipeline_df.to_excel(w, index=False)
