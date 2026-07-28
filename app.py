@@ -103,7 +103,7 @@ IMG_FOLDER = "images"
 os.makedirs(IMG_FOLDER, exist_ok=True)
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
-for k,v in [("logged_in",False),("username",""),("name",""),("team",""),("role","")]:
+for k,v in [("logged_in",False),("username",""),("name",""),("team",""),("role",""),("work_area","")]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -198,6 +198,7 @@ def show_login():
                 st.session_state.name = USERS[username]["name"]
                 st.session_state.team = USERS[username]["team"]
                 st.session_state.role = USERS[username]["role"]
+                st.session_state.work_area = ""
                 # Store login in URL for persistence
                 import hashlib
                 token = hashlib.md5((username + password).encode()).hexdigest()[:8]
@@ -262,9 +263,30 @@ def show_sidebar():
         st.markdown(f"**Team:** {st.session_state.team}")
         if st.session_state.role == "admin":
             st.success("👑 Admin")
-        st.divider()
+        # Show current work area for Stock team
+        if st.session_state.team == "Stock" and st.session_state.work_area:
+            st.markdown(f"📍 **Area:** {st.session_state.work_area}")
+            if st.button("🔄 Change Area", use_container_width=True):
+                st.session_state.work_area = ""
+                st.rerun()
+            st.divider()
+
+                        # Pipeline buttons
+            st.markdown("**📋 View Pipeline:**")
+            if st.button("🧾 Normal Order Pipeline", use_container_width=True, key="btn_normal_pipe"):
+                st.session_state["show_pipeline"] = "normal"
+                st.rerun()
+            if st.button("📦 Arrangement Pipeline", use_container_width=True, key="btn_arr_pipe"):
+                st.session_state["show_pipeline"] = "arrangement"
+                st.rerun()
+            if st.session_state.get("show_pipeline"):
+                if st.button("❌ Close Pipeline", use_container_width=True, key="btn_close_pipe"):
+                    st.session_state["show_pipeline"] = None
+                    st.rerun()
+            st.divider()
+
         if st.button("🚪 Logout", use_container_width=True):
-            for k in ["logged_in","username","name","team","role"]:
+            for k in ["logged_in","username","name","team","role","work_area"]:
                 st.session_state[k] = False if k=="logged_in" else ""
             st.query_params.clear()
             st.rerun()
@@ -1053,7 +1075,10 @@ def form_stock_placement():
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
         except:
             area_list = ["All Areas"]
-        sp_area = st.selectbox("Filter by Area", area_list, key="sp_area_filter")
+        default_sp_area_idx = 0
+        if st.session_state.get("work_area") and st.session_state.work_area in area_list:
+            default_sp_area_idx = area_list.index(st.session_state.work_area)
+        sp_area = st.selectbox("Filter by Area", area_list, index=default_sp_area_idx, key="sp_area_filter")
     with c2:
         sp_date = st.date_input("Filter by Date", value=today_ist(), key="sp_date_filter",
             min_value=today_ist()-timedelta(days=7), max_value=today_ist())
@@ -1461,7 +1486,10 @@ def form_register_entry():
                 area_options = [a["name"] for a in (areas_resp.data or [])]
             except:
                 area_options = ["Gaur City","Sector 78","Indirapuram"]
-            re_area = st.selectbox("Warehouse/Area *", area_options, key="re_area")
+            default_re_area = 0
+            if st.session_state.get("work_area") and st.session_state.work_area in area_options:
+                default_re_area = area_options.index(st.session_state.work_area)
+            re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key="re_area")
 
         st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
         st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
@@ -1641,7 +1669,11 @@ def form_bill_crosscheck():
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
         except:
             area_list = ["All Areas"]
-        bc_area = st.selectbox("Filter by Area", area_list, key="bc_area_filter")
+        # Auto select work area if set
+        default_area_idx = 0
+        if st.session_state.get("work_area") and st.session_state.work_area in area_list:
+            default_area_idx = area_list.index(st.session_state.work_area)
+        bc_area = st.selectbox("Filter by Area", area_list, index=default_area_idx, key="bc_area_filter")
     with c2:
         bc_date = st.date_input("Filter by Date", value=today_ist(), key="bc_date_filter",
             min_value=today_ist()-timedelta(days=7), max_value=today_ist(),
@@ -1820,7 +1852,10 @@ def form_bill_upload_arrangement():
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
         except:
             area_list = ["All Areas"]
-        bu_area = st.selectbox("Filter by Area", area_list, key="bu_area_filter")
+        default_bu_area_idx = 0
+        if st.session_state.get("work_area") and st.session_state.work_area in area_list:
+            default_bu_area_idx = area_list.index(st.session_state.work_area)
+        bu_area = st.selectbox("Filter by Area", area_list, index=default_bu_area_idx, key="bu_area_filter")
     with c2:
         bu_date = st.date_input("Filter by Date", value=today_ist(), key="bu_date_filter",
             min_value=today_ist()-timedelta(days=7), max_value=today_ist())
@@ -2516,9 +2551,171 @@ def form_porter_payment():
 # ── USER PAGE ─────────────────────────────────────────────────────────────────
 def show_user_page():
     team = st.session_state.team
+
+    # Area selection for Stock team
+    if team == "Stock" and not st.session_state.work_area:
+        st.title("📍 Select Your Work Area")
+        st.markdown(f"### Welcome {st.session_state.name}! Which area are you working in today?")
+        st.divider()
+        try:
+            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+            area_options = [a["name"] for a in (areas_resp.data or [])] + ["All Areas"]
+        except:
+            area_options = ["Gaur City","Sector 78","Indirapuram","All Areas"]
+
+        cols = st.columns(len(area_options))
+        for i, area in enumerate(area_options):
+            with cols[i]:
+                if st.button(f"📍 {area}", use_container_width=True, type="primary"):
+                    st.session_state.work_area = area
+                    st.rerun()
+        return
+
     st.title(f"💊 RapidSurge — {team} Team")
     st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
     st.divider()
+
+    # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
+    if team == "Stock" and st.session_state.get("show_pipeline"):
+        work_area = st.session_state.get("work_area","All Areas")
+
+        if st.session_state["show_pipeline"] == "normal":
+            st.subheader("🧾 Normal Order Pipeline")
+            try:
+                reg_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Register Entry")\
+                    .eq("date", date_str()).execute()
+                reg_entries = [t for t in (reg_resp.data or [])
+                    if work_area == "All Areas" or t.get("details",{}).get("area","") == work_area]
+
+                cross_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Bill Cross Check")\
+                    .eq("date", date_str()).execute()
+                cross_dict = {t.get("details",{}).get("bill_no",""):t for t in (cross_resp.data or [])}
+
+                upload_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Bill Upload (Software)")\
+                    .eq("date", date_str()).execute()
+                upload_dict = {t.get("details",{}).get("bill_no",""):t for t in (upload_resp.data or [])}
+
+                place_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type", "Stock Placement")\
+                    .eq("date", date_str()).execute()
+                place_dict = {t.get("details",{}).get("bill_no",""):t for t in (place_resp.data or [])}
+
+                if not reg_entries:
+                    st.info(f"No bills found for {work_area} today!")
+                else:
+                    rows = []
+                    for i, r in enumerate(reg_entries):
+                        d      = r.get("details",{})
+                        bill_no = d.get("bill_no","")
+                        cross  = cross_dict.get(bill_no)
+                        upload = upload_dict.get(bill_no)
+                        place  = place_dict.get(bill_no)
+
+                        if place:
+                            status = "✅ Placed"
+                        elif upload:
+                            status = "📍 Placement Pending"
+                        elif cross:
+                            status = "📤 Upload Pending"
+                        else:
+                            status = "✔️ Cross Check Pending"
+
+                        # Calculate total time from register to placement
+                        try:
+                            from datetime import datetime as dt
+                            reg_t   = dt.strptime(r.get("time",""), "%I:%M %p")
+                            if place:
+                                end_t = dt.strptime(place.get("end_time",""), "%I:%M %p")
+                            elif upload:
+                                end_t = dt.strptime(upload.get("end_time",""), "%I:%M %p")
+                            elif cross:
+                                end_t = dt.strptime(cross.get("end_time",""), "%I:%M %p")
+                            else:
+                                end_t = dt.strptime(time_str(), "%I:%M %p")
+                            total_mins = int((end_t - reg_t).total_seconds() / 60)
+                        except:
+                            total_mins = "-"
+
+                        rows.append({
+                            "S.No": i+1,
+                            "Bill No": bill_no,
+                            "Distributor": d.get("distributor",""),
+                            "Items": d.get("no_items",""),
+                            "Amount": f"₹{float(d.get('bill_amount',0) or 0):,.0f}",
+                            "Reg Time": r.get("time",""),
+                            "Reg By": r.get("person",""),
+                            "Check By": cross.get("person","") if cross else "⏳",
+                            "Check Start": cross.get("start_time","") if cross else "⏳",
+                            "Check End": cross.get("end_time","") if cross else "⏳",
+                            "Check Mins": cross.get("duration_mins","") if cross else "-",
+                            "Upload By": upload.get("person","") if upload else "⏳",
+                            "Upload Start": upload.get("start_time","") if upload else "⏳",
+                            "Upload End": upload.get("end_time","") if upload else "⏳",
+                            "Upload Mins": upload.get("duration_mins","") if upload else "-",
+                            "Place By": place.get("person","") if place else "⏳",
+                            "Place Start": place.get("start_time","") if place else "⏳",
+                            "Place End": place.get("end_time","") if place else "⏳",
+                            "Place Mins": place.get("duration_mins","") if place else "-",
+                            "Total Mins": total_mins,
+                            "Status": status
+                        })
+
+                    pipeline_df = pd.DataFrame(rows)
+                    st.dataframe(pipeline_df, use_container_width=True)
+
+                    # Download
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                        pipeline_df.to_excel(w, index=False)
+                    st.download_button("⬇️ Download Excel", buf.getvalue(),
+                        f"stock_pipeline_{date_str()}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="stock_pipeline_dl")
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+        elif st.session_state["show_pipeline"] == "arrangement":
+            st.subheader("📦 Arrangement Pipeline")
+            try:
+                work_area = st.session_state.get("work_area","All Areas")
+                arr_resp = supabase.table("arrangements").select("*")\
+                    .eq("order_placed_date", date_str()).execute()
+                arrangements = arr_resp.data or []
+                if work_area != "All Areas":
+                    arrangements = [a for a in arrangements if a.get("area","") == work_area]
+
+                if not arrangements:
+                    st.info(f"No arrangements for {work_area} today!")
+                else:
+                    for arr in arrangements:
+                        status  = arr.get("status","")
+                        urgency = arr.get("urgency","Normal")
+                        urgency_color = "🔴" if urgency == "Very Urgent" else "🟡" if urgency == "Urgent" else "🟢"
+                        with st.expander(f"{urgency_color} #{arr.get('arrangement_no','')} | {arr.get('distributor','')} | {status}"):
+                            steps = [
+                                ("Order Placed", arr.get("order_placed_time",""), arr.get("order_by",""), True),
+                                ("Picked Up", arr.get("pickup_time",""), arr.get("pickup_by",""), bool(arr.get("pickup_time",""))),
+                                ("Reached Warehouse", "", "", status in ["Reached Warehouse","Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]),
+                                ("Bill Cross Checked", arr.get("cross_check_time",""), arr.get("cross_checked_by",""), status in ["Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]),
+                                ("Bill Uploaded", arr.get("bill_upload_time",""), arr.get("bill_uploaded_by",""), status in ["Bill Uploaded","Stock Placed","Completed"]),
+                                ("Stock Placed", arr.get("placement_time",""), arr.get("placed_by",""), status in ["Stock Placed","Completed"]),
+                                ("Completed", "", "", status == "Completed"),
+                            ]
+                            for step_name, step_time, step_by, done in steps:
+                                time_val = f"— {step_time}" if step_time else ""
+                                by_val   = f"— {step_by}" if step_by else ""
+                                if done:
+                                    st.markdown(f"✅ **{step_name}** {time_val} {by_val}")
+                                else:
+                                    st.markdown(f"⏳ {step_name}")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+        st.divider()
 
     # Check for incomplete In Progress tasks from previous session
     try:
