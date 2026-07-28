@@ -2014,6 +2014,71 @@ def form_bill_upload_arrangement():
                     st.error(f"Error: {e}")
 
 
+def show_pickup_images():
+    st.subheader("📸 Pickup Images from Naresh/Sandeep")
+    try:
+        from datetime import timedelta
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        resp = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Pickup")\
+            .eq("team", "Delivery")\
+            .gte("date", two_days_ago)\
+            .execute()
+        pickups = resp.data if resp.data else []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        pickups = []
+
+    if not pickups:
+        st.info("No pickup images found for last 2 days!")
+        return
+
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        filter_date = st.date_input("Filter by Date", value=today_ist(), key="pi_date")
+    with c2:
+        filter_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pi_dist")
+    with c3:
+        filter_arr = st.text_input("Arrangement No", placeholder="e.g. ARR-001", key="pi_arr")
+
+    filter_date_str = filter_date.strftime("%Y-%m-%d")
+    filtered = [p for p in pickups if p.get("date","") == filter_date_str]
+    if filter_dist:
+        filtered = [p for p in filtered if filter_dist.lower() in p.get("details",{}).get("distributor","").lower()]
+    if filter_arr:
+        filtered = [p for p in filtered if filter_arr.lower() in p.get("details",{}).get("arrangement_no","").lower()]
+
+    st.markdown(f"**{len(filtered)} pickup entries found**")
+
+    for p in filtered:
+        d = p.get("details",{})
+        img_name = d.get("medicine_image","")
+        with st.expander(f"📦 {d.get('distributor','')} | Arr: {d.get('arrangement_no','')} | By: {p.get('person','')} | {p.get('start_time','')}"):
+            c1,c2 = st.columns([2,1])
+            with c1:
+                if img_name:
+                    try:
+                        img_data = supabase.storage.from_("Images").download(img_name)
+                        from PIL import Image
+                        import io as io_module
+                        img = Image.open(io_module.BytesIO(img_data))
+                        st.image(img, use_container_width=True)
+                        st.download_button("🔍 Download",
+                            img_data,
+                            file_name=f"pickup_{d.get('arrangement_no','')}.jpg",
+                            mime="image/jpeg",
+                            key=f"dl_pickup_{p['id']}")
+                    except:
+                        st.warning("Image not available")
+                else:
+                    st.warning("⚠️ No image uploaded!")
+            with c2:
+                st.markdown(f"**Distributor:** {d.get('distributor','')}")
+                st.markdown(f"**Arrangement:** {d.get('arrangement_no','')}")
+                st.markdown(f"**Picked by:** {p.get('person','')}")
+                st.markdown(f"**Time:** {p.get('start_time','')}")
+                st.markdown(f"**SKUs:** {d.get('no_sku_received','')}")
+
 def form_book_porter():
     st.subheader("🚛 Book Porter")
 
