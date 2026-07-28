@@ -96,7 +96,7 @@ DISTRIBUTORS = [
     "Shivshakti Enterprises","Shree Maruti Nandan Pharmaceuticals Pvt Ltd",
     "Shri Radhey Krishan Trading Co.","Shri Rudram Enterprises","Silvertone Networks",
     "Trisha Pharma","Vashudev Enterprises","Vijaydeep Medicose",
-    "Vtc Tradewings Pvt Ltd","Xcelent Pharmaceuticals Private Limited",
+    "Vtc Tradewings Pvt Ltd","Xcelent Pharmaceuticals Private Limited","Unnati",
 ]
 
 IMG_FOLDER = "images"
@@ -1044,15 +1044,32 @@ def form_other_task():
 def form_stock_placement():
     st.subheader("📍 Stock Placement")
 
+    # Area and date filter
+    from datetime import timedelta
+    c1,c2 = st.columns(2)
+    with c1:
+        try:
+            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+            area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+        except:
+            area_list = ["All Areas"]
+        sp_area = st.selectbox("Filter by Area", area_list, key="sp_area_filter")
+    with c2:
+        sp_date = st.date_input("Filter by Date", value=today_ist(), key="sp_date_filter",
+            min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+
     # Load Bill Uploaded arrangements
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        two_days_ago = (sp_date - timedelta(days=2)).strftime("%Y-%m-%d")
+        sp_date_str  = sp_date.strftime("%Y-%m-%d")
         arr_resp = supabase.table("arrangements").select("*")\
             .eq("status", "Bill Uploaded")\
             .gte("order_placed_date", two_days_ago)\
+            .lte("order_placed_date", sp_date_str)\
             .execute()
         arrangements = arr_resp.data if arr_resp.data else []
+        if sp_area != "All Areas":
+            arrangements = [a for a in arrangements if a.get("area","") == sp_area]
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
@@ -1439,6 +1456,19 @@ def form_register_entry():
         with c2:
             no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
             delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key="re_delby")
+            try:
+                areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+                area_options = [a["name"] for a in (areas_resp.data or [])]
+            except:
+                area_options = ["Gaur City","Sector 78","Indirapuram"]
+            re_area = st.selectbox("Warehouse/Area *", area_options, key="re_area")
+
+        st.markdown("📸 **Image of Invoice/Bill (Mandatory)**")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="re_radio", label_visibility="collapsed")
+        if upload_opt == "Upload":
+            invoice_img = st.file_uploader("Select Invoice Image", type=["jpg","jpeg","png"], key="re_upload")
+        else:
+            invoice_img = st.camera_input("Take Photo of Invoice", key="re_cam")
 
         # Show arrangement dropdown if arrangement selected
         arr_no = ""
@@ -1467,7 +1497,10 @@ def form_register_entry():
         if st.form_submit_button("Submit Entry ✅", type="primary", use_container_width=True):
             if not bill_no or no_items == 0:
                 st.error("Fill Bill Number and No of Items!")
+            elif not invoice_img:
+                st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
             else:
+                img_name = upload_image(invoice_img, "invoice") if invoice_img else ""
                 try:
                     supabase.table("daily_tasks").insert({
                         "date": date_str(),
@@ -1483,6 +1516,8 @@ def form_register_entry():
                             "no_items": str(no_items),
                             "delivery_by": delivery_by,
                             "arrangement_no": arr_no,
+                            "area": re_area,
+                            "invoice_image": img_name,
                             "remarks": remarks
                         },
                         "start_time": time_str(),
@@ -1498,15 +1533,32 @@ def form_register_entry():
 def form_bill_crosscheck():
     st.subheader("✔️ Bill Cross Check")
 
+    # Area and date filter
+    from datetime import timedelta
+    c1,c2 = st.columns(2)
+    with c1:
+        try:
+            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+            area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+        except:
+            area_list = ["All Areas"]
+        bc_area = st.selectbox("Filter by Area", area_list, key="bc_area_filter")
+    with c2:
+        bc_date = st.date_input("Filter by Date", value=today_ist(), key="bc_date_filter",
+            min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+
+
     # Load arrangements that reached warehouse
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        two_days_ago = (bc_date - timedelta(days=2)).strftime("%Y-%m-%d")
         resp = supabase.table("arrangements").select("*")\
             .eq("status", "Reached Warehouse")\
             .gte("order_placed_date", two_days_ago)\
+            .lte("order_placed_date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
         arrangements = resp.data if resp.data else []
+        if bc_area != "All Areas":
+            arrangements = [a for a in arrangements if a.get("area","") == bc_area]
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
@@ -1515,12 +1567,16 @@ def form_bill_crosscheck():
     try:
         normal_resp = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Register Entry")\
-            .eq("date", date_str())\
+            .eq("date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
         normal_orders = normal_resp.data if normal_resp.data else []
         # Filter out already cross checked
         normal_orders = [n for n in normal_orders 
                         if not n.get("details",{}).get("cross_checked")]
+        # Apply area filter
+        if bc_area != "All Areas":
+            normal_orders = [n for n in normal_orders 
+                           if n.get("details",{}).get("area","") == bc_area]
     except:
         normal_orders = []
 
@@ -1642,36 +1698,53 @@ def form_bill_crosscheck():
 
 def form_bill_upload_arrangement():
     st.subheader("📤 Bill Upload")
+
+    # Area and date filter
+    from datetime import timedelta
+    c1,c2 = st.columns(2)
+    with c1:
+        try:
+            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+            area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+        except:
+            area_list = ["All Areas"]
+        bu_area = st.selectbox("Filter by Area", area_list, key="bu_area_filter")
+    with c2:
+        bu_date = st.date_input("Filter by Date", value=today_ist(), key="bu_date_filter",
+            min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+
     start = timer_button("bill_upload", "Bill Upload")
     if start is None:
         return
 
     # Load cross checked arrangements
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        two_days_ago = (bu_date - timedelta(days=2)).strftime("%Y-%m-%d")
         arr_resp = supabase.table("arrangements").select("*")\
             .eq("status", "Bill Cross Checked")\
             .gte("order_placed_date", two_days_ago)\
+            .lte("order_placed_date", bu_date.strftime("%Y-%m-%d"))\
             .execute()
         arrangements = arr_resp.data if arr_resp.data else []
+        if bu_area != "All Areas":
+            arrangements = [a for a in arrangements if a.get("area","") == bu_area]
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
 
-    # Load cross checked normal orders (last 2 days)
+    # Load cross checked normal orders filtered by date and area
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        two_days_ago = (bu_date - timedelta(days=2)).strftime("%Y-%m-%d")
         normal_resp = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Bill Cross Check")\
-            .gte("date", two_days_ago)\
+            .eq("date", bu_date.strftime("%Y-%m-%d"))\
             .execute()
         cross_checked_normal = []
         for t in (normal_resp.data or []):
             d = t.get("details",{})
             # Show only normal orders (no arrangement_no) not yet uploaded
-            if not d.get("arrangement_no","") and not d.get("bill_uploaded"):
+            area_match = bu_area == "All Areas" or d.get("area","") == bu_area
+            if not d.get("arrangement_no","") and not d.get("bill_uploaded") and area_match:
                 cross_checked_normal.append(t)
     except Exception as e:
         st.error(f"Error loading normal orders: {e}")
