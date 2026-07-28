@@ -1463,12 +1463,13 @@ def form_register_entry():
                 area_options = ["Gaur City","Sector 78","Indirapuram"]
             re_area = st.selectbox("Warehouse/Area *", area_options, key="re_area")
 
-        st.markdown("📸 **Image of Invoice/Bill (Mandatory)**")
+        st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
+        st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
         upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="re_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
-            invoice_img = st.file_uploader("Select Invoice Image", type=["jpg","jpeg","png"], key="re_upload")
+            invoice_img = st.file_uploader("Select Packet Image", type=["jpg","jpeg","png"], key="re_upload")
         else:
-            invoice_img = st.camera_input("Take Photo of Invoice", key="re_cam")
+            invoice_img = st.camera_input("Take Photo of Packet", key="re_cam")
 
         # Show arrangement dropdown if arrangement selected
         arr_no = ""
@@ -1533,6 +1534,104 @@ def form_register_entry():
 def form_bill_crosscheck():
     st.subheader("✔️ Bill Cross Check")
 
+    # ── PENDING BILLS SUMMARY ─────────────────────────────────────────────────
+    try:
+        from datetime import timedelta, datetime as dt
+        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        # Pending arrangements
+        arr_pending = supabase.table("arrangements").select("*")\
+            .eq("status", "Reached Warehouse")\
+            .gte("order_placed_date", two_days_ago)\
+            .execute()
+
+        # Pending normal orders
+        reg_pending = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Register Entry")\
+            .gte("date", two_days_ago)\
+            .execute()
+
+        # Cross checked bills (all time - to exclude already checked)
+        crossed = supabase.table("daily_tasks").select("*")\
+            .eq("task_type", "Bill Cross Check")\
+            .execute()
+        crossed_bills = [t.get("details",{}).get("bill_no","") for t in (crossed.data or [])]
+
+        # Normal orders pending cross check (last 2 days)
+        normal_pending = [t for t in (reg_pending.data or [])
+            if not t.get("details",{}).get("cross_checked")
+            and t.get("details",{}).get("bill_no","") not in crossed_bills]
+
+        # Build area wise summary
+        area_summary = {}
+        now_time = dt.strptime(time_str(), "%I:%M %p")
+
+        # From arrangements
+        for arr in (arr_pending.data or []):
+            area = arr.get("area","Unknown")
+            if area not in area_summary:
+                area_summary[area] = {"count": 0, "oldest_wait": 0, "total_wait": 0}
+            area_summary[area]["count"] += 1
+            try:
+                arr_time = dt.strptime(arr.get("order_placed_time",""), "%I:%M %p")
+                wait = int((now_time - arr_time).total_seconds() / 60)
+                if wait > area_summary[area]["oldest_wait"]:
+                    area_summary[area]["oldest_wait"] = wait
+                area_summary[area]["total_wait"] += wait
+            except:
+                pass
+
+        # From normal orders
+        for n in normal_pending:
+            area = n.get("details",{}).get("area","Unknown")
+            if area not in area_summary:
+                area_summary[area] = {"count": 0, "oldest_wait": 0, "total_wait": 0}
+            area_summary[area]["count"] += 1
+            try:
+                reg_time = dt.strptime(n.get("time",""), "%I:%M %p")
+                wait = int((now_time - reg_time).total_seconds() / 60)
+                if wait > area_summary[area]["oldest_wait"]:
+                    area_summary[area]["oldest_wait"] = wait
+                area_summary[area]["total_wait"] += wait
+            except:
+                pass
+
+        if area_summary:
+            total_pending = sum([v["count"] for v in area_summary.values()])
+            st.warning(f"⚠️ **{total_pending} bills pending cross check!**")
+
+            # Show table
+            summary_rows = []
+            for area, data in area_summary.items():
+                oldest = data["oldest_wait"]
+                avg_wait = round(data["total_wait"] / data["count"], 0) if data["count"] > 0 else 0
+                if oldest > 60:
+                    oldest_str = f"🔴 {oldest//60}h {oldest%60}m"
+                elif oldest > 30:
+                    oldest_str = f"🟡 {oldest} mins"
+                else:
+                    oldest_str = f"🟢 {oldest} mins"
+                summary_rows.append({
+                    "Area": area,
+                    "Pending Bills": data["count"],
+                    "Oldest Waiting": oldest_str,
+                    "Avg Wait (mins)": int(avg_wait)
+                })
+
+            import pandas as pd
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+            st.divider()
+        else:
+            st.success("✅ No bills pending cross check!")
+
+    except Exception as e:
+        st.error(f"Error loading summary: {e}")
+
+    # Start timer at TOP so they dont have to scroll
+    start = timer_button("bill_crosscheck", "Bill Cross Check")
+    if start is None:
+        return
+
     # Area and date filter
     from datetime import timedelta
     c1,c2 = st.columns(2)
@@ -1545,7 +1644,8 @@ def form_bill_crosscheck():
         bc_area = st.selectbox("Filter by Area", area_list, key="bc_area_filter")
     with c2:
         bc_date = st.date_input("Filter by Date", value=today_ist(), key="bc_date_filter",
-            min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+            min_value=today_ist()-timedelta(days=7), max_value=today_ist(),
+            help="Select yesterday to see bills entered last night")
 
 
     # Load arrangements that reached warehouse
@@ -1565,9 +1665,11 @@ def form_bill_crosscheck():
 
     # Load normal orders from register entry
     try:
+        # Show register entries from bc_date and day before
         normal_resp = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Register Entry")\
-            .eq("date", bc_date.strftime("%Y-%m-%d"))\
+            .gte("date", (bc_date - timedelta(days=1)).strftime("%Y-%m-%d"))\
+            .lte("date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
         normal_orders = normal_resp.data if normal_resp.data else []
         # Filter out already cross checked
@@ -1600,10 +1702,6 @@ def form_bill_crosscheck():
         d = n.get("details",{})
         arr_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
-    start = timer_button("bill_crosscheck")
-    if start is None:
-        return
-
     with st.form("bill_crosscheck_form", clear_on_submit=True):
         selected_label = st.selectbox("Select Item *", list(arr_options.keys()), key="bc_arr")
         selected_item  = arr_options[selected_label]
@@ -1631,8 +1729,21 @@ def form_bill_crosscheck():
             wrong_calc   = st.number_input("Wrong Calculation", min_value=0, step=1)
             shortage     = st.number_input("Shortage Items", min_value=0, step=1)
 
+        st.divider()
+        st.markdown("📸 **Image of Physical Bill After Cross Check (Mandatory)**")
+        st.caption("⚠️ Take photo of bill after you have checked and marked it — this is your proof of checking!")
+        upload_opt_cc = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="cc_img_radio", label_visibility="collapsed")
+        if upload_opt_cc == "Upload":
+            bill_check_img = st.file_uploader("Select Bill Image", type=["jpg","jpeg","png"], key="cc_img_upload")
+        else:
+            bill_check_img = st.camera_input("Take Photo of Bill", key="cc_img_cam")
+
+        st.markdown("📝 **Comments/Notes on Bill**")
+        bill_comments = st.text_area("Write any comments, notes or issues found on bill",
+            placeholder="e.g. Batch no written incorrectly, discount not matching, item substituted...")
+
         st.markdown("---")
-        st.markdown("📹 **Video Evidence**")
+        st.markdown("📹 **Video Evidence (Optional)**")
         st.markdown("[📁 Open RapidSurge Stock Videos Folder](https://drive.google.com/drive/folders/1DbkuKSFeftMVpVFqVwcRRDssc49X9YJQ)")
         st.caption("Record video → Upload to folder → Copy link → Paste below")
         video_link = st.text_input("Paste Video Link", placeholder="https://drive.google.com/file/d/...")
@@ -1697,11 +1808,12 @@ def form_bill_crosscheck():
                 st.error(f"Error: {e}")
 
 def form_bill_upload_arrangement():
-    st.subheader("📤 Bill Upload")
+    st.subheader("📤 Bill Upload (Software Screenshot)")
+    st.info("📌 Upload screenshot of bill from your **billing software** — NOT the physical bill from distributor!")
 
     # Area and date filter
     from datetime import timedelta
-    c1,c2 = st.columns(2)
+    c1,c2,c3 = st.columns(3)
     with c1:
         try:
             areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
@@ -1712,6 +1824,8 @@ def form_bill_upload_arrangement():
     with c2:
         bu_date = st.date_input("Filter by Date", value=today_ist(), key="bu_date_filter",
             min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+    with c3:
+        order_type_filter = st.selectbox("Order Type", ["All","Arrangement","Normal Order"], key="bu_type_filter")
 
     start = timer_button("bill_upload", "Bill Upload")
     if start is None:
@@ -1732,9 +1846,8 @@ def form_bill_upload_arrangement():
         st.error(f"Error: {e}")
         arrangements = []
 
-    # Load cross checked normal orders filtered by date and area
+    # Load cross checked normal orders
     try:
-        two_days_ago = (bu_date - timedelta(days=2)).strftime("%Y-%m-%d")
         normal_resp = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Bill Cross Check")\
             .eq("date", bu_date.strftime("%Y-%m-%d"))\
@@ -1742,19 +1855,22 @@ def form_bill_upload_arrangement():
         cross_checked_normal = []
         for t in (normal_resp.data or []):
             d = t.get("details",{})
-            # Show only normal orders (no arrangement_no) not yet uploaded
             area_match = bu_area == "All Areas" or d.get("area","") == bu_area
             if not d.get("arrangement_no","") and not d.get("bill_uploaded") and area_match:
                 cross_checked_normal.append(t)
-    except Exception as e:
-        st.error(f"Error loading normal orders: {e}")
+    except:
         cross_checked_normal = []
+
+    # Apply order type filter
+    if order_type_filter == "Arrangement":
+        cross_checked_normal = []
+    elif order_type_filter == "Normal Order":
+        arrangements = []
 
     if not arrangements and not cross_checked_normal:
         st.info("No items pending bill upload!")
         return
 
-    # Show pending counts
     st.markdown(f"**Pending:** {len(arrangements)} Arrangements + {len(cross_checked_normal)} Normal Orders")
 
     # Build combined options
@@ -1771,22 +1887,21 @@ def form_bill_upload_arrangement():
         item_type      = selected_item["type"]
         selected_data  = selected_item["data"]
 
-        # Auto fill details
         if item_type == "arrangement":
-            auto_bill_no  = selected_data.get("bill_order_id","")
-            auto_dist     = selected_data.get("distributor","")
-            auto_area     = selected_data.get("area","")
-            auto_items    = 0
-            auto_amount   = 0.0
-            st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}**")
+            auto_bill_no = selected_data.get("bill_order_id","")
+            auto_dist    = selected_data.get("distributor","")
+            auto_area    = selected_data.get("area","")
+            auto_items   = 0
+            auto_amount  = 0.0
+            st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}** | Type: **Arrangement**")
         else:
             d = selected_data.get("details",{})
-            auto_bill_no  = d.get("bill_no","")
-            auto_dist     = d.get("distributor","")
-            auto_area     = ""
-            auto_items    = int(d.get("no_items",0) or 0)
-            auto_amount   = float(d.get("bill_amount",0) or 0)
-            st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Amount: ₹**{auto_amount}**")
+            auto_bill_no = d.get("bill_no","")
+            auto_dist    = d.get("distributor","")
+            auto_area    = d.get("area","")
+            auto_items   = int(float(d.get("no_items",0) or 0))
+            auto_amount  = float(d.get("bill_amount",0) or 0)
+            st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Type: **Normal Order**")
 
         c1,c2 = st.columns(2)
         with c1:
@@ -1794,14 +1909,13 @@ def form_bill_upload_arrangement():
             bill_date = st.date_input("Bill Date")
             bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount)
         with c2:
-            no_items   = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
-            order_type = st.selectbox("Order Type", ["Arrangement","Normal Order"], key="ba_type")
+            no_items  = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
 
-        st.markdown("📸 **Bill Image**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+        st.markdown("📸 **Software Bill Screenshot (Mandatory)**")
+        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True,
             key="ba_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
-            bill_img = st.file_uploader("Select Bill Image",
+            bill_img = st.file_uploader("Select Bill Screenshot",
                 type=["jpg","jpeg","png","pdf"], key="ba_upload")
         else:
             bill_img = st.camera_input("Take Photo", key="ba_cam")
@@ -1811,7 +1925,10 @@ def form_bill_upload_arrangement():
         if st.form_submit_button("Upload Bill ✅", type="primary", use_container_width=True):
             if not bill_no:
                 st.error("Enter Bill Number!")
+            elif not bill_img:
+                st.error("⚠️ Bill screenshot is mandatory!")
             else:
+                end_time, duration = end_timer("bill_upload", start)
                 img_name = upload_image(bill_img, "bill_arr") if bill_img else ""
                 try:
                     if item_type == "arrangement":
@@ -1834,11 +1951,10 @@ def form_bill_upload_arrangement():
                         arr_no = ""
                         dist   = d.get("distributor","")
 
-                    # Save to daily tasks
                     supabase.table("daily_tasks").insert({
                         "date": date_str(), "time": time_str(),
                         "person": st.session_state.name, "team": st.session_state.team,
-                        "task_type": "Bill Upload",
+                        "task_type": "Bill Upload (Software)",
                         "details": {
                             "arrangement_no": arr_no,
                             "distributor": dist,
@@ -1846,12 +1962,14 @@ def form_bill_upload_arrangement():
                             "bill_date": str(bill_date),
                             "bill_amount": str(bill_amt),
                             "no_items": str(no_items),
-                            "order_type": order_type,
+                            "order_type": item_type,
                             "bill_image": img_name,
                             "remarks": remarks
                         },
-                        "start_time": time_str(),
-                        "end_time": time_str(),
+                        "start_time": start.strftime("%I:%M %p"),
+                        "end_time": end_time,
+                        "duration_mins": str(duration),
+                        "status": "Completed"
                     }).execute()
 
                     st.success("✅ Bill uploaded successfully!")
@@ -1860,91 +1978,6 @@ def form_bill_upload_arrangement():
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-# ── PICKUP IMAGES VIEWER ─────────────────────────────────────────────────────
-
-def show_pickup_images():
-    st.subheader("📸 Pickup Images from Naresh/Sandeep")
-
-    try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-
-        # Load pickup tasks with images
-        resp = supabase.table("daily_tasks").select("*")\
-            .eq("task_type", "Pickup")\
-            .eq("team", "Delivery")\
-            .gte("date", two_days_ago)\
-            .execute()
-        pickups = resp.data if resp.data else []
-    except Exception as e:
-        st.error(f"Error: {e}")
-        pickups = []
-
-    if not pickups:
-        st.info("No pickup images found for last 2 days!")
-        return
-
-    # Filter by date, distributor and arrangement number
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        filter_date = st.date_input("Filter by Date", value=today_ist(), key="pi_date")
-    with c2:
-        filter_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pi_dist")
-    with c3:
-        filter_arr = st.text_input("Arrangement No", placeholder="e.g. ARR-20260718-001", key="pi_arr")
-
-    filter_date_str = filter_date.strftime("%Y-%m-%d")
-    filtered = [p for p in pickups if p.get("date","") == filter_date_str]
-    if filter_dist:
-        filtered = [p for p in filtered if filter_dist.lower() in p.get("details",{}).get("distributor","").lower()]
-    if filter_arr:
-        filtered = [p for p in filtered if filter_arr.lower() in p.get("details",{}).get("arrangement_no","").lower()]
-
-    st.markdown(f"**{len(filtered)} pickup entries found**")
-
-    for p in filtered:
-        d = p.get("details",{})
-        dist      = d.get("distributor","")
-        arr_no    = d.get("arrangement_no","")
-        img_name  = d.get("medicine_image","")
-        pickup_by = p.get("person","")
-        pickup_time = p.get("start_time","")
-        no_sku    = d.get("no_sku_received","")
-
-        with st.expander(f"📦 {dist} | Arr: {arr_no} | By: {pickup_by} | Time: {pickup_time}"):
-            c1,c2 = st.columns([2,1])
-            with c1:
-                if img_name:
-                    try:
-                        img_data = supabase.storage.from_("Images").download(img_name)
-                        from PIL import Image
-                        import io as io_module
-                        img = Image.open(io_module.BytesIO(img_data))
-                        st.image(img, caption=f"Pickup by {pickup_by}", use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Image not available: {e}")
-                else:
-                    st.warning("⚠️ No image uploaded for this pickup!")
-            with c2:
-                st.markdown(f"**Distributor:** {dist}")
-                st.markdown(f"**Arrangement:** {arr_no}")
-                st.markdown(f"**Picked by:** {pickup_by}")
-                st.markdown(f"**Time:** {pickup_time}")
-                st.markdown(f"**SKUs Received:** {no_sku}")
-                if img_name:
-                    try:
-                        img_data = supabase.storage.from_("Images").download(img_name)
-                        st.download_button(
-                            "⬇️ Download Image",
-                            img_data,
-                            file_name=f"pickup_{arr_no}_{pickup_by}.jpg",
-                            mime="image/jpeg",
-                            key=f"dl_pickup_{p['id']}"
-                        )
-                    except:
-                        pass
-
-# ── PORTER FORMS ─────────────────────────────────────────────────────────────
 
 def form_book_porter():
     st.subheader("🚛 Book Porter")
@@ -2532,21 +2565,20 @@ def show_user_page():
         with tabs[11]: form_other_task()
 
     elif team == "Stock":
-        tabs = st.tabs(["📒 Register Entry","✏️ Edit Entry","🧾 Bill Upload","✔️ Bill Cross Check","📤 Bill Upload (Arr)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","🛒 Purchase Order","📦 Arrangement","✏️ Other"])
+        tabs = st.tabs(["📒 Register Entry","✏️ Edit Entry","✔️ Bill Cross Check","📤 Bill Upload (Software)","📍 Stock Placement","🔍 Placement Check","🧹 Rack Cleaning","📊 Inventory","🚛 Book Porter","📦 Receive Porter","🛒 Purchase Order","📦 Arrangement","✏️ Other"])
         with tabs[0]: form_register_entry()
         with tabs[1]: form_edit_register_entry()
-        with tabs[2]: form_bill_upload()
-        with tabs[3]: form_bill_crosscheck()
-        with tabs[4]: form_bill_upload_arrangement()
-        with tabs[5]: form_stock_placement()
-        with tabs[6]: form_placement_crosscheck()
-        with tabs[7]: form_rack_cleaning()
-        with tabs[8]: form_inventory_check()
-        with tabs[9]: form_book_porter()
-        with tabs[10]: form_porter_receive()
-        with tabs[11]: form_purchase_order()
-        with tabs[12]: form_arrangement()
-        with tabs[13]: form_other_task()
+        with tabs[2]: form_bill_crosscheck()
+        with tabs[3]: form_bill_upload_arrangement()
+        with tabs[4]: form_stock_placement()
+        with tabs[5]: form_placement_crosscheck()
+        with tabs[6]: form_rack_cleaning()
+        with tabs[7]: form_inventory_check()
+        with tabs[8]: form_book_porter()
+        with tabs[9]: form_porter_receive()
+        with tabs[10]: form_purchase_order()
+        with tabs[11]: form_arrangement()
+        with tabs[12]: form_other_task()
 
     elif team == "Call":
         tabs = st.tabs(["📞 Call Log","🔍 Medicine Search","🚛 Book Porter","✏️ Other"])
