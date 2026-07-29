@@ -17,20 +17,6 @@ st.set_page_config(
 # ── CUSTOM CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Hide sidebar on mobile and show menu in main area */
-@media (max-width: 768px) {
-    section[data-testid="stSidebar"] {
-        display: none !important;
-    }
-    .mobile-menu {
-        display: block !important;
-    }
-}
-@media (min-width: 769px) {
-    .mobile-menu {
-        display: none !important;
-    }
-}
 /* Reduce top padding */
 .block-container {
     padding-top: 1rem !important;
@@ -2724,7 +2710,6 @@ def show_user_page():
 
     st.title(f"💊 RapidSurge — {team} Team")
     st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
-
     st.divider()
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
@@ -3198,98 +3183,453 @@ def show_user_page():
                 st.error(f"Dashboard error: {e}")
 
     elif team == "Delivery":
-        if "delivery_active_form" not in st.session_state:
-            st.session_state.delivery_active_form = None
+        tabs = st.tabs(["📋 Pending Pickups","🚛 Porter Handover","🚚 Delivery Trip","✏️ Other"])
+        with tabs[0]: form_pickup()
+        with tabs[1]: form_porter_handover()
+        with tabs[2]: form_delivery()
+        with tabs[3]: form_other_task()
 
-        if st.session_state.delivery_active_form:
-            # Show back button and form
-            if st.button("← Back", key="del_back"):
-                st.session_state.delivery_active_form = None
-                st.rerun()
-            st.divider()
-            form_map = {
-                "pickup":   form_pickup,
-                "handover": form_porter_handover,
-                "delivery": form_delivery,
-                "other":    form_other_task,
-            }
-            if st.session_state.delivery_active_form in form_map:
-                form_map[st.session_state.delivery_active_form]()
-        else:
-            # Main dashboard with big buttons
-            try:
-                from datetime import timedelta
-                pending_resp = supabase.table("arrangements").select("*")\
-                    .eq("status","Pending")\
-                    .eq("pickup_type","Self Pick")\
-                    .eq("order_placed_date", date_str())\
-                    .execute()
-                pending_count = len(pending_resp.data or [])
-            except:
-                pending_count = 0
+    st.divider()
 
-            # Pending alert
-            if pending_count > 0:
-                st.error(f"🔴 {pending_count} Pickup(s) Pending Today!")
+    # ── MY PERFORMANCE TODAY ─────────────────────────────────────────────────
+    with st.expander("📊 My Performance Today", expanded=False):
+        try:
+            perf_resp = supabase.table("daily_tasks").select("*")\
+                .eq("person", st.session_state.name)\
+                .eq("date", date_str()).execute()
+            perf_data = perf_resp.data if perf_resp.data else []
+
+            if not perf_data:
+                st.info("No tasks completed today yet!")
             else:
-                st.success("✅ No pending pickups!")
+                perf_df = pd.DataFrame(perf_data)
 
+                # Summary metrics
+                total_tasks    = len(perf_df)
+                total_duration = sum([int(float(r.get("duration_mins",0) or 0)) for r in perf_data])
+                completed      = len([r for r in perf_data if r.get("status") == "Completed"])
+
+                c1,c2,c3 = st.columns(3)
+                with c1: st.metric("✅ Tasks Completed", completed)
+                with c2: st.metric("⏱️ Total Time", f"{total_duration} mins")
+                with c3: st.metric("📋 Total Tasks", total_tasks)
+
+                st.divider()
+
+                # Time per task breakdown
+                st.markdown("**⏱️ Time Spent Per Task:**")
+                task_summary = {}
+                for r in perf_data:
+                    task = r.get("task_type","")
+                    dur  = int(float(r.get("duration_mins",0) or 0))
+                    if task not in task_summary:
+                        task_summary[task] = {"count": 0, "duration": 0}
+                    task_summary[task]["count"]    += 1
+                    task_summary[task]["duration"] += dur
+
+                for task, data in task_summary.items():
+                    count = data["count"]
+                    dur   = data["duration"]
+                    avg   = round(dur/count, 1) if count > 0 else 0
+                    c1,c2,c3,c4 = st.columns([3,1,1,1])
+                    with c1: st.markdown(f"**{task}**")
+                    with c2: st.markdown(f"x{count}")
+                    with c3: st.markdown(f"⏱️ {dur} mins")
+                    with c4: st.markdown(f"Avg: {avg} mins")
+
+                st.divider()
+
+                # Bar chart of time per task
+                if task_summary:
+                    chart_data = pd.DataFrame([
+                        {"Task": k, "Minutes": v["duration"]}
+                        for k,v in task_summary.items()
+                    ]).set_index("Task")
+                    st.bar_chart(chart_data)
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    st.divider()
+
+    # ── ARRANGEMENT PIPELINE (visible to all) ────────────────────────────────
+    with st.expander("🔄 View Today's Arrangement Pipeline", expanded=False):
+        try:
+            arr_resp = supabase.table("arrangements").select("*")\
+                .eq("order_placed_date", date_str()).execute()
+            arr_today = arr_resp.data if arr_resp.data else []
+        except:
+            arr_today = []
+
+        if not arr_today:
+            st.info("No arrangements today!")
+        else:
+            st.markdown(f"**{len(arr_today)} arrangements today**")
+            for arr in arr_today:
+                status  = arr.get("status","")
+                urgency = arr.get("urgency","Normal")
+                urgency_color = "🔴" if urgency == "Very Urgent" else "🟡" if urgency == "Urgent" else "🟢"
+                pickup_type = arr.get("pickup_type","")
+                if pickup_type == "Self Pick":
+                    pickup_icon = "🚚 Naresh/Sandeep"
+                elif pickup_type == "Porter":
+                    pickup_icon = "🚛 Porter"
+                elif pickup_type == "Distributor Delivers":
+                    pickup_icon = "🏪 Distributor Delivers"
+                else:
+                    pickup_icon = pickup_type
+
+                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | {pickup_icon} | **{status}**")
+
+    # ── TEAM FORMS ───────────────────────────────────────────────────────────
+    if team == "Purchase":
+        if "purchase_active_form" not in st.session_state:
+            st.session_state.purchase_active_form = None
+
+        with st.sidebar:
             st.divider()
+            st.markdown("### 📦 Ordering")
+            if st.button("🛒 Purchase Order", use_container_width=True, key="p_purchase",
+                type="primary" if st.session_state.purchase_active_form=="purchase" else "secondary"):
+                st.session_state.purchase_active_form = "purchase"
+                st.rerun()
+            if st.button("↩️ Purchase Return", use_container_width=True, key="p_return",
+                type="primary" if st.session_state.purchase_active_form=="return" else "secondary"):
+                st.session_state.purchase_active_form = "return"
+                st.rerun()
+            if st.button("📦 Arrangement Order", use_container_width=True, key="p_arrangement",
+                type="primary" if st.session_state.purchase_active_form=="arrangement" else "secondary"):
+                st.session_state.purchase_active_form = "arrangement"
+                st.rerun()
 
-            # Big buttons - 2 columns for mobile
-            st.markdown("### What do you want to do?")
-            c1,c2 = st.columns(2)
-            with c1:
-                if st.button("📋 View & Pickup", use_container_width=True,
-                    key="d_pickup", type="primary",
-                    help="See pending arrangements and do pickup"):
-                    st.session_state.delivery_active_form = "pickup"
-                    st.rerun()
-            with c2:
-                if st.button("🚛 Porter Handover", use_container_width=True,
-                    key="d_handover", type="primary",
-                    help="Hand over medicines to porter"):
-                    st.session_state.delivery_active_form = "handover"
+            st.markdown("### 🔍 Research")
+            if st.button("💊 PharmaRack Search", use_container_width=True, key="p_pharma",
+                type="primary" if st.session_state.purchase_active_form=="pharma" else "secondary"):
+                st.session_state.purchase_active_form = "pharma"
+                st.rerun()
+            if st.button("📋 Bounce Medicine", use_container_width=True, key="p_bounce",
+                type="primary" if st.session_state.purchase_active_form=="bounce" else "secondary"):
+                st.session_state.purchase_active_form = "bounce"
+                st.rerun()
+
+            st.markdown("### 🚛 Logistics")
+            if st.button("🚛 Book Porter", use_container_width=True, key="p_porter",
+                type="primary" if st.session_state.purchase_active_form=="porter" else "secondary"):
+                st.session_state.purchase_active_form = "porter"
+                st.rerun()
+            if st.button("💰 Porter Payment", use_container_width=True, key="p_payment",
+                type="primary" if st.session_state.purchase_active_form=="payment" else "secondary"):
+                st.session_state.purchase_active_form = "payment"
+                st.rerun()
+            if st.button("📸 Pickup Images", use_container_width=True, key="p_pickup",
+                type="primary" if st.session_state.purchase_active_form=="pickup" else "secondary"):
+                st.session_state.purchase_active_form = "pickup"
+                st.rerun()
+
+            st.markdown("### 📦 Stock Work")
+            if st.button("📒 Register Entry", use_container_width=True, key="p_register",
+                type="primary" if st.session_state.purchase_active_form=="register" else "secondary"):
+                st.session_state.purchase_active_form = "register"
+                st.rerun()
+            if st.button("✔️ Bill Cross Check", use_container_width=True, key="p_crosscheck",
+                type="primary" if st.session_state.purchase_active_form=="crosscheck" else "secondary"):
+                st.session_state.purchase_active_form = "crosscheck"
+                st.rerun()
+            if st.button("📍 Stock Placement", use_container_width=True, key="p_placement",
+                type="primary" if st.session_state.purchase_active_form=="placement" else "secondary"):
+                st.session_state.purchase_active_form = "placement"
+                st.rerun()
+            if st.button("✏️ Other", use_container_width=True, key="p_other",
+                type="primary" if st.session_state.purchase_active_form=="other" else "secondary"):
+                st.session_state.purchase_active_form = "other"
+                st.rerun()
+
+            if st.session_state.purchase_active_form:
+                st.divider()
+                if st.button("✖️ Close Form", use_container_width=True, key="p_close"):
+                    st.session_state.purchase_active_form = None
                     st.rerun()
 
-            c1,c2 = st.columns(2)
-            with c1:
-                if st.button("🚚 Delivery Trip", use_container_width=True,
-                    key="d_delivery",
-                    help="Log a delivery trip"):
-                    st.session_state.delivery_active_form = "delivery"
-                    st.rerun()
-            with c2:
-                if st.button("✏️ Other Task", use_container_width=True,
-                    key="d_other",
-                    help="Log other tasks"):
-                    st.session_state.delivery_active_form = "other"
-                    st.rerun()
-
+            # My Tasks Today in sidebar
             st.divider()
+            st.markdown("**📋 My Tasks Today:**")
+            try:
+                resp = supabase.table("daily_tasks").select("*")\
+                    .eq("person", st.session_state.name)\
+                    .eq("date", date_str()).execute()
+                tasks = resp.data or []
+                if tasks:
+                    for t in sorted(tasks, key=lambda x: x.get("time","")):
+                        status_icon = "🔄" if t.get("status")=="In Progress" else "✅"
+                        st.markdown(f"{status_icon} {t.get('time','')} — **{t.get('task_type','')}**")
+                else:
+                    st.caption("No tasks yet today!")
+            except:
+                st.caption("Error loading tasks")
 
-            # Today's tasks summary
-            st.markdown("### 📊 Today's Summary")
+        # Main area
+        if st.session_state.purchase_active_form:
+            form_map = {
+                "purchase":    form_purchase_order,
+                "return":      form_purchase_return,
+                "arrangement": form_arrangement,
+                "pharma":      form_pharmarack,
+                "bounce":      form_bounce_medicine,
+                "porter":      form_book_porter,
+                "payment":     form_porter_payment,
+                "pickup":      show_pickup_images,
+                "register":    form_register_entry,
+                "crosscheck":  form_bill_crosscheck,
+                "placement":   form_stock_placement,
+                "other":       form_other_task,
+            }
+            if st.session_state.purchase_active_form in form_map:
+                form_map[st.session_state.purchase_active_form]()
+        else:
+            # Dashboard
+            st.markdown("### 📊 Today's Purchase Summary")
             try:
                 tasks_resp = supabase.table("daily_tasks").select("*")\
                     .eq("person", st.session_state.name)\
                     .eq("date", date_str()).execute()
                 tasks = tasks_resp.data or []
-                pickups  = len([t for t in tasks if t.get("task_type")=="Pickup"])
-                trips    = len([t for t in tasks if t.get("task_type")=="Delivery Trip"])
-                handover = len([t for t in tasks if t.get("task_type")=="Porter Handover"])
 
-                c1,c2,c3 = st.columns(3)
-                with c1: st.metric("📋 Pickups", pickups)
-                with c2: st.metric("🚚 Trips", trips)
-                with c3: st.metric("🚛 Handovers", handover)
+                purchase_orders  = [t for t in tasks if t.get("task_type") == "Purchase Order"]
+                arrangements     = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
+                returns          = [t for t in tasks if t.get("task_type") == "Purchase Return"]
+                pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
 
-                if tasks:
-                    st.markdown("**Recent tasks:**")
-                    for t in sorted(tasks, key=lambda x: x.get("time",""), reverse=True)[:5]:
-                        st.markdown(f"✅ {t.get('time','')} — {t.get('task_type','')}")
+                total_skus  = sum([int(float((t.get("details") or {}).get("no_sku",0) or 0)) for t in purchase_orders])
+                total_meds  = sum([int(float((t.get("details") or {}).get("no_medicines",0) or 0)) for t in arrangements])
+                po_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in purchase_orders])
+                arr_duration= sum([int(float(t.get("duration_mins",0) or 0)) for t in arrangements])
+                avg_po_sku  = round(po_duration/total_skus, 2) if total_skus > 0 else 0
+                avg_arr     = round(arr_duration/len(arrangements), 1) if arrangements else 0
+
+                c1,c2,c3,c4 = st.columns(4)
+                with c1: st.metric("🛒 Purchase Orders", len(purchase_orders))
+                with c2: st.metric("📦 Arrangements", len(arrangements))
+                with c3: st.metric("↩️ Returns", len(returns))
+                with c4: st.metric("💊 PharmaRack", len(pharmarack))
+
+                st.divider()
+                st.markdown("#### 📋 Order Details")
+                st.dataframe(pd.DataFrame([{
+                    "Purchase Orders": len(purchase_orders),
+                    "Total SKUs Ordered": total_skus,
+                    "Avg mins/SKU": avg_po_sku,
+                    "Arrangements": len(arrangements),
+                    "Total Medicines": total_meds,
+                    "Avg mins/Arrangement": avg_arr,
+                    "Returns": len(returns),
+                    "PharmaRack Searches": len(pharmarack),
+                }]), use_container_width=True, hide_index=True)
+
+                # Arrangement pipeline
+                st.divider()
+                st.markdown("#### 📦 Today's Arrangements")
+                try:
+                    arr_resp = supabase.table("arrangements").select("*")\
+                        .eq("order_placed_date", date_str())\
+                        .eq("order_by", st.session_state.name).execute()
+                    my_arrangements = arr_resp.data or []
+                    if my_arrangements:
+                        for arr in my_arrangements:
+                            status = arr.get("status","")
+                            urgency = arr.get("urgency","Normal")
+                            icon = "🔴" if urgency=="Very Urgent" else "🟡" if urgency=="Urgent" else "🟢"
+                            st.markdown(f"{icon} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | **{status}**")
+                    else:
+                        st.info("No arrangements placed today!")
+                except:
+                    pass
+
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Dashboard error: {e}")
+
+    elif team == "Stock":
+        if "stock_active_form" not in st.session_state:
+            st.session_state.stock_active_form = None
+
+        with st.sidebar:
+            st.divider()
+            st.markdown("### 📥 Incoming Stock")
+            if st.button("📒 Register Entry", use_container_width=True, key="s_register",
+                type="primary" if st.session_state.stock_active_form=="register" else "secondary"):
+                st.session_state.stock_active_form = "register"
+                st.rerun()
+            if st.button("📦 Receive Porter", use_container_width=True, key="s_receive",
+                type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
+                st.session_state.stock_active_form = "receive"
+                st.rerun()
+            st.markdown("### ✅ Processing")
+            if st.button("✔️ Bill Cross Check", use_container_width=True, key="s_crosscheck",
+                type="primary" if st.session_state.stock_active_form=="crosscheck" else "secondary"):
+                st.session_state.stock_active_form = "crosscheck"
+                st.rerun()
+            if st.button("📤 Bill Upload", use_container_width=True, key="s_upload",
+                type="primary" if st.session_state.stock_active_form=="upload" else "secondary"):
+                st.session_state.stock_active_form = "upload"
+                st.rerun()
+            if st.button("📍 Stock Placement", use_container_width=True, key="s_placement",
+                type="primary" if st.session_state.stock_active_form=="placement" else "secondary"):
+                st.session_state.stock_active_form = "placement"
+                st.rerun()
+            if st.button("🔍 Placement Check", use_container_width=True, key="s_plcheck",
+                type="primary" if st.session_state.stock_active_form=="plcheck" else "secondary"):
+                st.session_state.stock_active_form = "plcheck"
+                st.rerun()
+            st.markdown("### 🔧 Other Work")
+            if st.button("↩️ Purchase Return", use_container_width=True, key="s_return",
+                type="primary" if st.session_state.stock_active_form=="return" else "secondary"):
+                st.session_state.stock_active_form = "return"
+                st.rerun()
+            if st.button("🧹 Rack Cleaning", use_container_width=True, key="s_rack",
+                type="primary" if st.session_state.stock_active_form=="rack" else "secondary"):
+                st.session_state.stock_active_form = "rack"
+                st.rerun()
+            if st.button("📊 Inventory Check", use_container_width=True, key="s_inventory",
+                type="primary" if st.session_state.stock_active_form=="inventory" else "secondary"):
+                st.session_state.stock_active_form = "inventory"
+                st.rerun()
+            if st.button("🚛 Book Porter", use_container_width=True, key="s_porter",
+                type="primary" if st.session_state.stock_active_form=="porter" else "secondary"):
+                st.session_state.stock_active_form = "porter"
+                st.rerun()
+            if st.button("🛒 Purchase Order", use_container_width=True, key="s_purchase",
+                type="primary" if st.session_state.stock_active_form=="purchase" else "secondary"):
+                st.session_state.stock_active_form = "purchase"
+                st.rerun()
+            if st.button("📦 Arrangement", use_container_width=True, key="s_arrangement",
+                type="primary" if st.session_state.stock_active_form=="arrangement" else "secondary"):
+                st.session_state.stock_active_form = "arrangement"
+                st.rerun()
+            if st.button("✏️ Edit Entry", use_container_width=True, key="s_edit",
+                type="primary" if st.session_state.stock_active_form=="edit" else "secondary"):
+                st.session_state.stock_active_form = "edit"
+                st.rerun()
+            if st.button("✏️ Other", use_container_width=True, key="s_other",
+                type="primary" if st.session_state.stock_active_form=="other" else "secondary"):
+                st.session_state.stock_active_form = "other"
+                st.rerun()
+
+            if st.session_state.stock_active_form:
+                st.divider()
+                if st.button("✖️ Close Form", use_container_width=True, key="s_close"):
+                    st.session_state.stock_active_form = None
+                    st.rerun()
+
+            # My Tasks Today in sidebar
+            st.divider()
+            st.markdown("**📋 My Tasks Today:**")
+            try:
+                resp = supabase.table("daily_tasks").select("*")\
+                    .eq("person", st.session_state.name)\
+                    .eq("date", date_str()).execute()
+                tasks = resp.data or []
+                if tasks:
+                    for t in sorted(tasks, key=lambda x: x.get("time","")):
+                        status_icon = "🔄" if t.get("status")=="In Progress" else "✅"
+                        st.markdown(f"{status_icon} {t.get('time','')} — **{t.get('task_type','')}**")
+                else:
+                    st.caption("No tasks yet today!")
+            except:
+                st.caption("Error loading tasks")
+
+        # Main area
+        if st.session_state.stock_active_form:
+            form_map = {
+                "register":    form_register_entry,
+                "receive":     form_porter_receive,
+                "crosscheck":  form_bill_crosscheck,
+                "upload":      form_bill_upload_arrangement,
+                "placement":   form_stock_placement,
+                "plcheck":     form_placement_crosscheck,
+                "return":      form_purchase_return,
+                "rack":        form_rack_cleaning,
+                "inventory":   form_inventory_check,
+                "porter":      form_book_porter,
+                "purchase":    form_purchase_order,
+                "arrangement": form_arrangement,
+                "edit":        form_edit_register_entry,
+                "other":       form_other_task,
+            }
+            if st.session_state.stock_active_form in form_map:
+                form_map[st.session_state.stock_active_form]()
+        else:
+            # Dashboard
+            work_area = st.session_state.get("work_area","All Areas")
+            st.markdown(f"### 📊 Today's Summary — {work_area}")
+            try:
+                reg_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type","Register Entry").eq("date",date_str()).execute()
+                reg_entries = [t for t in (reg_resp.data or [])
+                    if work_area=="All Areas" or t.get("details",{}).get("area","")==work_area]
+                cross_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type","Bill Cross Check").eq("date",date_str()).execute()
+                cross_tasks = cross_resp.data or []
+                upload_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type","Bill Upload (Software)").eq("date",date_str()).execute()
+                upload_tasks = upload_resp.data or []
+                place_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("task_type","Stock Placement").eq("date",date_str()).execute()
+                place_tasks = place_resp.data or []
+                crossed_bills = [t.get("details",{}).get("bill_no","") for t in cross_tasks]
+                uploaded_bills = [t.get("details",{}).get("bill_no","") for t in upload_tasks]
+                placed_bills = [t.get("details",{}).get("bill_no","") for t in place_tasks]
+                normal_entries = [t for t in reg_entries if t.get("details",{}).get("order_type","") == "Normal Order"]
+                normal_cross_pending  = len([t for t in normal_entries if t.get("details",{}).get("bill_no","") not in crossed_bills])
+                normal_upload_pending = len([t for t in normal_entries if t.get("details",{}).get("bill_no","") in crossed_bills and t.get("details",{}).get("bill_no","") not in uploaded_bills])
+                normal_place_pending  = len([t for t in normal_entries if t.get("details",{}).get("bill_no","") in uploaded_bills and t.get("details",{}).get("bill_no","") not in placed_bills])
+                normal_cross_tasks  = [t for t in cross_tasks if not t.get("details",{}).get("arrangement_no","")]
+                normal_upload_tasks = [t for t in upload_tasks if not t.get("details",{}).get("arrangement_no","")]
+                normal_place_tasks  = [t for t in place_tasks if not t.get("details",{}).get("arrangement_no","")]
+                def avg_sku(tasks, field="no_items"):
+                    dur = sum([int(float(t.get("duration_mins",0) or 0)) for t in tasks])
+                    sku = sum([int(float((t.get("details") or {}).get(field,0) or 0)) for t in tasks])
+                    return round(dur/sku, 2) if sku > 0 else 0
+                arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", date_str()).execute()
+                arr_today = arr_resp.data or []
+                if work_area != "All Areas":
+                    arr_today = [a for a in arr_today if a.get("area","") == work_area]
+                arr_reached    = [a for a in arr_today if a.get("status") in ["Reached Warehouse","Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"]]
+                arr_cross_pend = len([a for a in arr_today if a.get("status")=="Reached Warehouse"])
+                arr_upload_pend= len([a for a in arr_today if a.get("status")=="Bill Cross Checked"])
+                arr_place_pend = len([a for a in arr_today if a.get("status")=="Bill Uploaded"])
+                arr_cross_tasks  = [t for t in cross_tasks if t.get("details",{}).get("arrangement_no","")]
+                arr_upload_tasks = [t for t in upload_tasks if t.get("details",{}).get("arrangement_no","")]
+                arr_place_tasks  = [t for t in place_tasks if t.get("details",{}).get("arrangement_no","")]
+                st.markdown("#### 🧾 Normal Orders")
+                st.dataframe(pd.DataFrame([{
+                    "Bills Received": len(normal_entries),
+                    "Cross Check Pending": normal_cross_pending,
+                    "Upload Pending": normal_upload_pending,
+                    "Placement Pending": normal_place_pending,
+                    "Avg Check/SKU": f"{avg_sku(normal_cross_tasks)} mins",
+                    "Avg Upload/SKU": f"{avg_sku(normal_upload_tasks)} mins",
+                    "Avg Place/SKU": f"{avg_sku(normal_place_tasks,'no_medicines')} mins",
+                }]), use_container_width=True, hide_index=True)
+                st.divider()
+                st.markdown("#### 📦 Arrangement Orders")
+                st.dataframe(pd.DataFrame([{
+                    "Bills Received": len(arr_reached),
+                    "Cross Check Pending": arr_cross_pend,
+                    "Upload Pending": arr_upload_pend,
+                    "Placement Pending": arr_place_pend,
+                    "Avg Check/SKU": f"{avg_sku(arr_cross_tasks)} mins",
+                    "Avg Upload/SKU": f"{avg_sku(arr_upload_tasks)} mins",
+                    "Avg Place/SKU": f"{avg_sku(arr_place_tasks,'no_medicines')} mins",
+                }]), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Dashboard error: {e}")
+
+
+
+    elif team == "Delivery":
+        tabs = st.tabs(["📋 Pending Pickups","🚛 Porter Handover","🚚 Delivery Trip","✏️ Other"])
+        with tabs[0]: form_pickup()
+        with tabs[1]: form_porter_handover()
+        with tabs[2]: form_delivery()
+        with tabs[3]: form_other_task()
 
     st.divider()
     c1,c2 = st.columns([3,1])
