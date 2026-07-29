@@ -17,6 +17,20 @@ st.set_page_config(
 # ── CUSTOM CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+/* Hide sidebar on mobile and show menu in main area */
+@media (max-width: 768px) {
+    section[data-testid="stSidebar"] {
+        display: none !important;
+    }
+    .mobile-menu {
+        display: block !important;
+    }
+}
+@media (min-width: 769px) {
+    .mobile-menu {
+        display: none !important;
+    }
+}
 /* Reduce top padding */
 .block-container {
     padding-top: 1rem !important;
@@ -2710,6 +2724,12 @@ def show_user_page():
 
     st.title(f"💊 RapidSurge — {team} Team")
     st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
+    # Mobile hint
+    st.markdown("""
+    <div style="background:#1e3a5f;padding:8px;border-radius:5px;margin-bottom:10px;display:block;">
+    📱 <b>Mobile users:</b> Tap <b>☰</b> (top-left) to see task menu
+    </div>
+    """, unsafe_allow_html=True)
     st.divider()
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
