@@ -3183,11 +3183,75 @@ def show_user_page():
                 st.error(f"Dashboard error: {e}")
 
     elif team == "Delivery":
-        tabs = st.tabs(["📋 Pending Pickups","🚛 Porter Handover","🚚 Delivery Trip","✏️ Other"])
-        with tabs[0]: form_pickup()
-        with tabs[1]: form_porter_handover()
-        with tabs[2]: form_delivery()
-        with tabs[3]: form_other_task()
+        if "delivery_active_form" not in st.session_state:
+            st.session_state.delivery_active_form = None
+
+        if st.session_state.delivery_active_form:
+            if st.button("← Back", key="del_back"):
+                st.session_state.delivery_active_form = None
+                st.rerun()
+            st.divider()
+            form_map = {
+                "pickup":   form_pickup,
+                "handover": form_porter_handover,
+                "delivery": form_delivery,
+                "other":    form_other_task,
+            }
+            if st.session_state.delivery_active_form in form_map:
+                form_map[st.session_state.delivery_active_form]()
+        else:
+            try:
+                pending_resp = supabase.table("arrangements").select("*")\
+                    .eq("status","Pending")\
+                    .eq("pickup_type","Self Pick")\
+                    .eq("order_placed_date", date_str()).execute()
+                pending_count = len(pending_resp.data or [])
+            except:
+                pending_count = 0
+            if pending_count > 0:
+                st.error(f"🔴 {pending_count} Pickup(s) Pending Today!")
+            else:
+                st.success("✅ No pending pickups!")
+            st.divider()
+            st.markdown("### What do you want to do?")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("📋 View & Pickup", use_container_width=True, key="d_pickup", type="primary"):
+                    st.session_state.delivery_active_form = "pickup"
+                    st.rerun()
+            with c2:
+                if st.button("🚛 Porter Handover", use_container_width=True, key="d_handover", type="primary"):
+                    st.session_state.delivery_active_form = "handover"
+                    st.rerun()
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("🚚 Delivery Trip", use_container_width=True, key="d_delivery"):
+                    st.session_state.delivery_active_form = "delivery"
+                    st.rerun()
+            with c2:
+                if st.button("✏️ Other Task", use_container_width=True, key="d_other"):
+                    st.session_state.delivery_active_form = "other"
+                    st.rerun()
+            st.divider()
+            st.markdown("### 📊 Today's Summary")
+            try:
+                tasks_resp = supabase.table("daily_tasks").select("*")\
+                    .eq("person", st.session_state.name)\
+                    .eq("date", date_str()).execute()
+                tasks = tasks_resp.data or []
+                pickups  = len([t for t in tasks if t.get("task_type")=="Pickup"])
+                trips    = len([t for t in tasks if t.get("task_type")=="Delivery Trip"])
+                handover = len([t for t in tasks if t.get("task_type")=="Porter Handover"])
+                c1,c2,c3 = st.columns(3)
+                with c1: st.metric("📋 Pickups", pickups)
+                with c2: st.metric("🚚 Trips", trips)
+                with c3: st.metric("🚛 Handovers", handover)
+                if tasks:
+                    st.markdown("**Recent tasks:**")
+                    for t in sorted(tasks, key=lambda x: x.get("time",""), reverse=True)[:5]:
+                        st.markdown(f"✅ {t.get('time','')} — {t.get('task_type','')}")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
     st.divider()
 
@@ -3624,12 +3688,7 @@ def show_user_page():
 
 
 
-    elif team == "Delivery":
-        tabs = st.tabs(["📋 Pending Pickups","🚛 Porter Handover","🚚 Delivery Trip","✏️ Other"])
-        with tabs[0]: form_pickup()
-        with tabs[1]: form_porter_handover()
-        with tabs[2]: form_delivery()
-        with tabs[3]: form_other_task()
+
 
     st.divider()
     c1,c2 = st.columns([3,1])
