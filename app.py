@@ -2724,12 +2724,7 @@ def show_user_page():
 
     st.title(f"💊 RapidSurge — {team} Team")
     st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
-    # Mobile hint
-    st.markdown("""
-    <div style="background:#1e3a5f;padding:8px;border-radius:5px;margin-bottom:10px;display:block;">
-    📱 <b>Mobile users:</b> Tap <b>☰</b> (top-left) to see task menu
-    </div>
-    """, unsafe_allow_html=True)
+
     st.divider()
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
