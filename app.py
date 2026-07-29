@@ -1303,6 +1303,7 @@ def form_stock_placement():
                     "task_type": "Stock Placement",
                     "details": {
                         "arrangement_no": selected_data.get("arrangement_no","") if item_type=="arrangement" else "",
+                        "bill_no": "" if item_type=="arrangement" else selected_data.get("details",{}).get("bill_no",""),
                         "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor",""),
                         "no_medicines": str(len(medicines)),
                         "placement_image": img_name,
@@ -1590,6 +1591,18 @@ def form_register_entry():
                 st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
             else:
                 img_name = upload_image(invoice_img, "invoice") if invoice_img else ""
+                # Check duplicate bill number - show warning
+                try:
+                    dup_check = supabase.table("daily_tasks").select("*")\
+                        .eq("task_type", "Register Entry")\
+                        .eq("date", date_str())\
+                        .execute()
+                    existing_bills = [t.get("details",{}).get("bill_no","").strip()
+                                     for t in (dup_check.data or [])]
+                    if bill_no.strip() in existing_bills:
+                        st.warning(f"⚠️ Bill No **{bill_no}** already entered today!")
+                except:
+                    pass
                 try:
                     supabase.table("daily_tasks").insert({
                         "date": date_str(),
@@ -1622,10 +1635,29 @@ def form_register_entry():
 def form_bill_crosscheck():
     st.subheader("✔️ Bill Cross Check")
 
+    # Area and date filter FIRST - before summary
+    from datetime import timedelta, datetime as dt
+    c1,c2 = st.columns(2)
+    with c1:
+        try:
+            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+            area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
+        except:
+            area_list = ["All Areas"]
+        # Default to work area
+        default_area_idx = 0
+        work_area = st.session_state.get("work_area","")
+        if work_area and work_area in area_list:
+            default_area_idx = area_list.index(work_area)
+        bc_area = st.selectbox("Filter by Area", area_list, index=default_area_idx, key="bc_area_filter")
+    with c2:
+        bc_date = st.date_input("Filter by Date", value=today_ist(), key="bc_date_filter",
+            min_value=today_ist()-timedelta(days=7), max_value=today_ist(),
+            help="Select yesterday to see bills entered last night")
+
     # ── PENDING BILLS SUMMARY ─────────────────────────────────────────────────
     try:
-        from datetime import timedelta, datetime as dt
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        two_days_ago = (bc_date - timedelta(days=2)).strftime("%Y-%m-%d")
 
         # Pending arrangements
         arr_pending = supabase.table("arrangements").select("*")\
@@ -1636,7 +1668,7 @@ def form_bill_crosscheck():
         # Pending normal orders (last 2 days)
         reg_pending = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Register Entry")\
-            .gte("date", two_days_ago)\
+            .eq("date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
 
         # Cross checked bills
@@ -1727,25 +1759,6 @@ def form_bill_crosscheck():
     start = timer_button("bill_crosscheck", "Bill Cross Check")
     if start is None:
         return
-
-    # Area and date filter
-    from datetime import timedelta
-    c1,c2 = st.columns(2)
-    with c1:
-        try:
-            areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
-            area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-        except:
-            area_list = ["All Areas"]
-        # Auto select work area if set
-        default_area_idx = 0
-        if st.session_state.get("work_area") and st.session_state.work_area in area_list:
-            default_area_idx = area_list.index(st.session_state.work_area)
-        bc_area = st.selectbox("Filter by Area", area_list, index=default_area_idx, key="bc_area_filter")
-    with c2:
-        bc_date = st.date_input("Filter by Date", value=today_ist(), key="bc_date_filter",
-            min_value=today_ist()-timedelta(days=7), max_value=today_ist(),
-            help="Select yesterday to see bills entered last night")
 
 
     # Load arrangements that reached warehouse
@@ -2170,7 +2183,21 @@ def form_book_porter():
     with st.form("book_porter_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
-            porter_no    = st.text_input("Porter Number *", placeholder="e.g. 9876543210")
+            # Auto-generate System Porter ID
+            try:
+                today_str = date_str()
+                existing = supabase.table("porter_bookings").select("porter_no")\
+                    .like("porter_no", f"PRT-{today_str}-%")\
+                    .execute()
+                next_num = len(existing.data or []) + 1
+                auto_porter_no = f"PRT-{today_str}-{next_num:03d}"
+            except:
+                auto_porter_no = f"PRT-{date_str()}-001"
+            porter_no    = st.text_input("System Porter ID", value=auto_porter_no,
+                help="Auto-generated ID for tracking")
+            porter_phone = st.text_input("Porter Phone Number *",
+                placeholder="e.g. 9876543210",
+                help="Actual porter contact number")
             vehicle_no   = st.text_input("Vehicle Number", placeholder="e.g. UP16 AB 1234")
             pickup_point = st.text_input("Pickup Point *", placeholder="Distributor name/address")
         with c2:
@@ -2188,8 +2215,8 @@ def form_book_porter():
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Book Porter ✅", type="primary", use_container_width=True):
-            if not porter_no or not pickup_point or not delivery_point:
-                st.error("Fill Porter No, Pickup and Delivery Point!")
+            if not porter_phone or not pickup_point or not delivery_point:
+                st.error("Fill Porter Phone, Pickup and Delivery Point!")
             elif not selected_arrs:
                 st.error("Select at least one arrangement!")
             else:
@@ -2204,6 +2231,7 @@ def form_book_porter():
                         "time": time_str(),
                         "booked_by": st.session_state.name,
                         "porter_no": porter_no,
+                        "porter_phone": porter_phone,
                         "vehicle_no": vehicle_no,
                         "pickup_point": pickup_point,
                         "delivery_point": delivery_point,
@@ -2230,10 +2258,17 @@ def form_book_porter():
 def form_porter_handover():
     st.subheader("🚛 Handover to Porter")
 
+    # Date filter
+    from datetime import timedelta
+    handover_date = st.date_input("Filter by Date", value=today_ist(), key="handover_date",
+        min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+
     # Load porter booked arrangements
     try:
         resp = supabase.table("porter_bookings").select("*")\
-            .eq("status", "Booked").execute()
+            .eq("status", "Booked")\
+            .eq("date", handover_date.strftime("%Y-%m-%d"))\
+            .execute()
         bookings = resp.data if resp.data else []
     except Exception as e:
         st.error(f"Error: {e}")
@@ -2342,9 +2377,14 @@ def form_porter_receive():
     # ── INCOMING STOCK DASHBOARD ─────────────────────────────────────────────
     st.markdown("### 📊 All Incoming Stock Today")
 
+    # Date filter
+    from datetime import timedelta
+    receive_date = st.date_input("Filter by Date", value=today_ist(), key="receive_date",
+        min_value=today_ist()-timedelta(days=7), max_value=today_ist())
+
     try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        receive_date_str = receive_date.strftime("%Y-%m-%d")
+        two_days_ago = receive_date_str  # Use selected date only
 
         # All arrangements not yet received
         all_resp = supabase.table("arrangements").select("*")\
@@ -2352,6 +2392,7 @@ def form_porter_receive():
                                   "Bill Uploaded","Stock Placed","Completed",
                                   "Placement Issue Found"])\
             .gte("order_placed_date", two_days_ago)\
+            .lte("order_placed_date", receive_date_str)\
             .execute()
         all_incoming = all_resp.data if all_resp.data else []
 
@@ -2366,8 +2407,14 @@ def form_porter_receive():
         
         c1,c2 = st.columns(2)
         with c1:
-            selected_area = st.selectbox("Filter by Area/Warehouse", 
-                ["All Areas"] + all_areas, key="incoming_area_filter")
+            # Default to work area if set
+            area_options = ["All Areas"] + all_areas
+            default_area_idx = 0
+            work_area = st.session_state.get("work_area","")
+            if work_area and work_area in area_options:
+                default_area_idx = area_options.index(work_area)
+            selected_area = st.selectbox("Filter by Area/Warehouse",
+                area_options, index=default_area_idx, key="incoming_area_filter")
         with c2:
             selected_status = st.selectbox("Filter by Status",
                 ["All Status","Pending","In Transit","Porter Booked","Porter On Way"],
