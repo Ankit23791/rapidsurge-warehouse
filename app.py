@@ -17,6 +17,14 @@ st.set_page_config(
 # ── CUSTOM CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+/* Force sidebar to stay open */
+[data-testid="collapsedControl"] {
+    display: none !important;
+}
+section[data-testid="stSidebar"] {
+    min-width: 250px !important;
+    width: 250px !important;
+}
 /* Reduce top padding */
 .block-container {
     padding-top: 1rem !important;
