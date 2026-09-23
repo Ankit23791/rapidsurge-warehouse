@@ -3192,6 +3192,29 @@ def show_user_page():
             if st.session_state.call_active_form in form_map:
                 form_map[st.session_state.call_active_form]()
         else:
+            # Mobile task buttons
+            st.markdown("### 📋 Select Task:")
+            st.markdown("#### 📞 Calls")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("📞 Call Log", key="mc_calllog", type="primary", use_container_width=True):
+                    st.session_state.call_active_form = "calllog"
+                    st.rerun()
+            with c2:
+                if st.button("🔍 Medicine Search", key="mc_medsearch", type="primary", use_container_width=True):
+                    st.session_state.call_active_form = "medsearch"
+                    st.rerun()
+            st.markdown("#### 🚛 Logistics")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("🚛 Book Porter", key="mc_porter", use_container_width=True):
+                    st.session_state.call_active_form = "porter"
+                    st.rerun()
+            with c2:
+                if st.button("✏️ Other", key="mc_other", use_container_width=True):
+                    st.session_state.call_active_form = "other"
+                    st.rerun()
+            st.divider()
             # Dashboard
             st.markdown("### 📊 Today's Call Summary")
             try:
@@ -3506,6 +3529,57 @@ def show_user_page():
             if st.session_state.purchase_active_form in form_map:
                 form_map[st.session_state.purchase_active_form]()
         else:
+            # Mobile task buttons
+            st.markdown("### 📋 Select Task:")
+            st.markdown("#### 📦 Ordering")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("🛒 Purchase Order", key="mp_purchase", type="primary", use_container_width=True):
+                    st.session_state.purchase_active_form = "purchase"
+                    st.rerun()
+            with c2:
+                if st.button("📦 Arrangement", key="mp_arrangement", type="primary", use_container_width=True):
+                    st.session_state.purchase_active_form = "arrangement"
+                    st.rerun()
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("↩️ Return", key="mp_return", use_container_width=True):
+                    st.session_state.purchase_active_form = "return"
+                    st.rerun()
+            with c2:
+                if st.button("💊 PharmaRack", key="mp_pharma", use_container_width=True):
+                    st.session_state.purchase_active_form = "pharma"
+                    st.rerun()
+            st.markdown("#### 🚛 Logistics")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("🚛 Book Porter", key="mp_porter", use_container_width=True):
+                    st.session_state.purchase_active_form = "porter"
+                    st.rerun()
+            with c2:
+                if st.button("💰 Porter Payment", key="mp_payment", use_container_width=True):
+                    st.session_state.purchase_active_form = "payment"
+                    st.rerun()
+            st.markdown("#### 📦 Stock Work")
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("📒 Register Entry", key="mp_register", use_container_width=True):
+                    st.session_state.purchase_active_form = "register"
+                    st.rerun()
+            with c2:
+                if st.button("✔️ Bill Check", key="mp_crosscheck", use_container_width=True):
+                    st.session_state.purchase_active_form = "crosscheck"
+                    st.rerun()
+            c1,c2 = st.columns(2)
+            with c1:
+                if st.button("📍 Stock Placement", key="mp_placement", use_container_width=True):
+                    st.session_state.purchase_active_form = "placement"
+                    st.rerun()
+            with c2:
+                if st.button("✏️ Other", key="mp_other", use_container_width=True):
+                    st.session_state.purchase_active_form = "other"
+                    st.rerun()
+            st.divider()
             # Dashboard
             st.markdown("### 📊 Today's Purchase Summary")
             try:
