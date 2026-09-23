@@ -3802,8 +3802,8 @@ def show_user_page():
                 "Start": start_time.strftime("%I:%M %p"),
                 "End": "In Progress",
                 "Duration": f"{elapsed} mins",
-                "Count": "-",
-                "Avg/Item": "-",
+                "Count": 0,
+                "Avg/Item": "0 mins",
             })
 
     if in_progress:
