@@ -257,7 +257,7 @@ def show_login():
         st.markdown("---")
         username = st.text_input("👤 Username", placeholder="Enter username")
         password = st.text_input("🔒 Password", type="password", placeholder="Enter password")
-        if st.button("🚀 Login", use_container_width=True, type="primary"):
+        if st.button("🚀 Login", width='stretch', type="primary"):
             if username in USERS and USERS[username]["password"] == password:
                 st.session_state.logged_in = True
                 st.session_state.username = username
@@ -332,26 +332,26 @@ def show_sidebar():
         # Show current work area for Stock team
         if st.session_state.team == "Stock" and st.session_state.work_area:
             st.markdown(f"📍 **Area:** {st.session_state.work_area}")
-            if st.button("🔄 Change Area", use_container_width=True):
+            if st.button("🔄 Change Area", width='stretch'):
                 st.session_state.work_area = ""
                 st.rerun()
             st.divider()
 
                         # Pipeline buttons
             st.markdown("**📋 View Pipeline:**")
-            if st.button("🧾 Normal Order Pipeline", use_container_width=True, key="btn_normal_pipe"):
+            if st.button("🧾 Normal Order Pipeline", width='stretch', key="btn_normal_pipe"):
                 st.session_state["show_pipeline"] = "normal"
                 st.rerun()
-            if st.button("📦 Arrangement Pipeline", use_container_width=True, key="btn_arr_pipe"):
+            if st.button("📦 Arrangement Pipeline", width='stretch', key="btn_arr_pipe"):
                 st.session_state["show_pipeline"] = "arrangement"
                 st.rerun()
             if st.session_state.get("show_pipeline"):
-                if st.button("❌ Close Pipeline", use_container_width=True, key="btn_close_pipe"):
+                if st.button("❌ Close Pipeline", width='stretch', key="btn_close_pipe"):
                     st.session_state["show_pipeline"] = None
                     st.rerun()
             st.divider()
 
-        if st.button("🚪 Logout", use_container_width=True):
+        if st.button("🚪 Logout", width='stretch'):
             for k in ["logged_in","username","name","team","role","work_area"]:
                 st.session_state[k] = False if k=="logged_in" else ""
             st.query_params.clear()
@@ -433,7 +433,7 @@ def form_purchase_order():
             mode        = st.selectbox("Mode", ["Through Call","Pharma Rack","Excel Send"], key="po_mode")
             urgency     = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="po_urgency")
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("purchase_order", start)
             try:
                 supabase.table("daily_tasks").insert({
@@ -471,7 +471,7 @@ def form_purchase_return():
             reason      = st.selectbox("Return Reason", ["Expired","Damaged","Wrong Item","Excess Stock","Other"], key="pr_reason")
         items    = st.text_area("Items Returned")
         remarks  = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not bill_no:
                 st.error("Fill Bill Number!")
             else:
@@ -505,7 +505,7 @@ def form_pharmarack():
             no_not_found = st.number_input("No of Medicines Not Found", min_value=0, step=1)
             no_ordered   = st.number_input("No of Medicines Ordered", min_value=0, step=1)
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("pharmarack", start)
             try:
                 supabase.table("daily_tasks").insert({
@@ -540,7 +540,7 @@ def form_bounce_medicine():
         else:
             img = st.camera_input("Take Photo", key="bounce_cam")
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("bounce", start)
             img_name = upload_image(img, "bounce") if img else ""
             try:
@@ -601,7 +601,7 @@ def form_arrangement():
             img = st.camera_input("Take Photo", key="arr_cam")
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not arr_no or not medicines:
                 st.error("Fill Arrangement No and Medicines!")
             elif not img:
@@ -669,7 +669,7 @@ def form_bill_upload():
         else:
             img = st.camera_input("Take Photo", key="bu_cam")
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not bill_no:
                 st.error("Fill Bill Number!")
             else:
@@ -703,7 +703,7 @@ def form_rack_cleaning():
             expiry_found = st.selectbox("Expiry Items Found?", ["No","Yes"], key="rc_exp")
             expiry_items = st.text_input("Expiry Items (if any)")
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not rack_no:
                 st.error("Fill Rack No!")
             else:
@@ -739,7 +739,7 @@ def form_inventory_check():
             no_wrong     = st.number_input("No of Wrong Batch Items", min_value=0, step=1)
         shortage_items = st.text_area("Shortage Items List")
         remarks        = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not location:
                 st.error("Fill Location!")
             else:
@@ -781,7 +781,7 @@ def form_medicine_search():
             no_ordered   = st.number_input("No Ordered After Search", min_value=0, step=1)
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("medicine_search", start)
             avg_per_sku = round(duration/no_searched, 2) if no_searched > 0 else 0
             try:
@@ -824,7 +824,7 @@ def form_call_log():
         with c2:
             orders_del   = st.number_input("Orders Delivered", min_value=0, step=1)
         remarks = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             calls_not_picked = max(0, calls_made - calls_picked)
             end_time, duration = end_timer("call_log", start)
             try:
@@ -911,7 +911,7 @@ def form_pickup():
                 from PIL import Image
                 import io
                 img = Image.open(io.BytesIO(img_data))
-                st.image(img, caption="Invoice (Download to zoom)", use_container_width=True)
+                st.image(img, caption="Invoice (Download to zoom)", width='stretch')
                 st.download_button(
                     "🔍 Download to Zoom",
                     img_data,
@@ -979,7 +979,7 @@ def form_pickup():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not medicine_img:
                 st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
             else:
@@ -1060,7 +1060,7 @@ def form_delivery():
             else:
                 no_bills, no_sku = 0, 0
             remarks = st.text_input("Remarks")
-            if st.form_submit_button("▶️ Start Trip", type="primary", use_container_width=True):
+            if st.form_submit_button("▶️ Start Trip", type="primary", width='stretch'):
                 start_t = time_str()
                 try:
                     result = supabase.table("daily_tasks").insert({
@@ -1082,7 +1082,7 @@ def form_delivery():
         elapsed = int((now_ist() - st.session_state.delivery_start_time).total_seconds() / 60)
         st.success(f"⏱️ Trip in progress — {elapsed} minutes elapsed")
         st.info("Click Complete when activity is done")
-        if st.button("✅ Complete This Activity", type="primary", use_container_width=True):
+        if st.button("✅ Complete This Activity", type="primary", width='stretch'):
             end_t    = time_str()
             duration = elapsed
             try:
@@ -1108,7 +1108,7 @@ def form_other_task():
         task_name = st.text_input("Task Name *", placeholder="What did you do?")
         details   = st.text_area("Task Details", placeholder="Describe the task...")
         remarks   = st.text_input("Remarks")
-        if st.form_submit_button("Submit ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not task_name:
                 st.error("Fill Task Name!")
             else:
@@ -1255,7 +1255,7 @@ def form_stock_placement():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Placement ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Placement ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("stock_placement", start)
             img_name = upload_image(placement_img, "placement") if placement_img else ""
 
@@ -1408,7 +1408,7 @@ def form_placement_crosscheck():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Cross Check ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Cross Check ✅", type="primary", width='stretch'):
             try:
                 # Check if any issues found
                 issues = [k for k,v in results.items()
@@ -1592,7 +1592,7 @@ def form_register_entry():
         bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
         remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
 
-        if st.form_submit_button("Submit Entry ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
             if not bill_no or no_items == 0:
                 st.error("Fill Bill Number and No of Items!")
             elif not invoice_img:
@@ -1755,7 +1755,7 @@ def form_bill_crosscheck():
                 })
 
             import pandas as pd
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(summary_rows), width='stretch')
             st.divider()
         else:
             st.success("✅ No bills pending cross check!")
@@ -1870,7 +1870,7 @@ def form_bill_crosscheck():
         video_link = st.text_input("Paste Video Link", placeholder="https://drive.google.com/file/d/...")
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Cross Check ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Cross Check ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("bill_crosscheck", start)
             # Calculate avg time per item
             avg_time = round(duration / no_items, 2) if no_items > 0 else 0
@@ -2050,7 +2050,7 @@ def form_bill_upload_arrangement():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Upload Bill ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Upload Bill ✅", type="primary", width='stretch'):
             if not bill_no:
                 st.error("Enter Bill Number!")
             elif not bill_img:
@@ -2155,7 +2155,7 @@ def show_pickup_images():
                         from PIL import Image
                         import io as io_module
                         img = Image.open(io_module.BytesIO(img_data))
-                        st.image(img, use_container_width=True)
+                        st.image(img, width='stretch')
                         st.download_button("🔍 Download",
                             img_data,
                             file_name=f"pickup_{d.get('arrangement_no','')}.jpg",
@@ -2222,7 +2222,7 @@ def form_book_porter():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Book Porter ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Book Porter ✅", type="primary", width='stretch'):
             if not porter_phone or not pickup_point or not delivery_point:
                 st.error("Fill Porter Phone, Pickup and Delivery Point!")
             elif not selected_arrs:
@@ -2336,7 +2336,7 @@ def form_porter_handover():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Handover ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Handover ✅", type="primary", width='stretch'):
             img_name = upload_image(handover_img, "handover") if handover_img else ""
             try:
                 # Update porter booking
@@ -2536,7 +2536,7 @@ def form_porter_receive():
 
             remarks = st.text_input("Remarks", key="dr_remarks")
 
-            if st.form_submit_button("Confirm Receipt ✅", type="primary", use_container_width=True):
+            if st.form_submit_button("Confirm Receipt ✅", type="primary", width='stretch'):
                 img_name = upload_image(recv_img, "dist_recv") if recv_img else ""
                 try:
                     supabase.table("arrangements").update({
@@ -2629,7 +2629,7 @@ def form_porter_receive():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Confirm Receipt ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Confirm Receipt ✅", type="primary", width='stretch'):
             try:
                 # Upload images
                 uploaded_images = {}
@@ -2719,7 +2719,7 @@ def form_porter_payment():
 
         remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Payment ✅", type="primary", use_container_width=True):
+        if st.form_submit_button("Submit Payment ✅", type="primary", width='stretch'):
             if amount <= 0:
                 st.error("Enter valid amount!")
             else:
@@ -2758,7 +2758,7 @@ def show_user_page():
         cols = st.columns(len(area_options))
         for i, area in enumerate(area_options):
             with cols[i]:
-                if st.button(f"📍 {area}", use_container_width=True, type="primary"):
+                if st.button(f"📍 {area}", width='stretch', type="primary"):
                     st.session_state.work_area = area
                     st.rerun()
         return
@@ -2856,7 +2856,7 @@ def show_user_page():
                         })
 
                     pipeline_df = pd.DataFrame(rows)
-                    st.dataframe(pipeline_df, use_container_width=True)
+                    st.dataframe(pipeline_df, width='stretch')
 
                     # Download
                     buf = io.BytesIO()
@@ -2914,7 +2914,7 @@ def show_user_page():
                                 {"Step":"📍 Stock Placed","By":arr.get("placed_by",""),"Time":arr.get("placement_time",""),"Details":"-","Status":"✅" if status in ["Stock Placed","Completed"] else "⏳"},
                                 {"Step":"✅ Completed","By":arr.get("cross_checked_by_placement",""),"Time":"","Details":"-","Status":"✅" if status=="Completed" else "⏳"},
                             ]
-                            st.dataframe(pd.DataFrame(pipeline_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(pipeline_rows), width='stretch', hide_index=True)
                             st.divider()
                             st.markdown("**📸 Images:**")
                             img_c1,img_c2,img_c3,img_c4 = st.columns(4)
@@ -2966,42 +2966,42 @@ def show_user_page():
             except Exception as e:
                 st.error(f"Pipeline error: {e}")
             st.markdown("### 🔧 Other Work")
-            if st.button("↩️ Purchase Return", use_container_width=True,
+            if st.button("↩️ Purchase Return", width='stretch',
                 key="s_return",
                 type="primary" if st.session_state.stock_active_form=="return" else "secondary"):
                 st.session_state.stock_active_form = "return"
                 st.rerun()
-            if st.button("🧹 Rack Cleaning", use_container_width=True,
+            if st.button("🧹 Rack Cleaning", width='stretch',
                 key="s_rack",
                 type="primary" if st.session_state.stock_active_form=="rack" else "secondary"):
                 st.session_state.stock_active_form = "rack"
                 st.rerun()
-            if st.button("📊 Inventory Check", use_container_width=True,
+            if st.button("📊 Inventory Check", width='stretch',
                 key="s_inventory",
                 type="primary" if st.session_state.stock_active_form=="inventory" else "secondary"):
                 st.session_state.stock_active_form = "inventory"
                 st.rerun()
-            if st.button("🚛 Book Porter", use_container_width=True,
+            if st.button("🚛 Book Porter", width='stretch',
                 key="s_porter",
                 type="primary" if st.session_state.stock_active_form=="porter" else "secondary"):
                 st.session_state.stock_active_form = "porter"
                 st.rerun()
-            if st.button("🛒 Purchase Order", use_container_width=True,
+            if st.button("🛒 Purchase Order", width='stretch',
                 key="s_purchase",
                 type="primary" if st.session_state.stock_active_form=="purchase" else "secondary"):
                 st.session_state.stock_active_form = "purchase"
                 st.rerun()
-            if st.button("📦 Arrangement", use_container_width=True,
+            if st.button("📦 Arrangement", width='stretch',
                 key="s_arrangement",
                 type="primary" if st.session_state.stock_active_form=="arrangement" else "secondary"):
                 st.session_state.stock_active_form = "arrangement"
                 st.rerun()
-            if st.button("✏️ Edit Entry", use_container_width=True,
+            if st.button("✏️ Edit Entry", width='stretch',
                 key="s_edit",
                 type="primary" if st.session_state.stock_active_form=="edit" else "secondary"):
                 st.session_state.stock_active_form = "edit"
                 st.rerun()
-            if st.button("✏️ Other", use_container_width=True,
+            if st.button("✏️ Other", width='stretch',
                 key="s_other",
                 type="primary" if st.session_state.stock_active_form=="other" else "secondary"):
                 st.session_state.stock_active_form = "other"
@@ -3009,7 +3009,7 @@ def show_user_page():
 
             if st.session_state.stock_active_form:
                 st.divider()
-                if st.button("✖️ Close Form", use_container_width=True, key="s_close"):
+                if st.button("✖️ Close Form", width='stretch', key="s_close"):
                     st.session_state.stock_active_form = None
                     st.rerun()
 
@@ -3110,7 +3110,7 @@ def show_user_page():
                     "Avg Upload/SKU": f"{avg_time_per_sku(normal_upload_tasks)} mins",
                     "Avg Place/SKU": f"{avg_time_per_sku(normal_place_tasks, 'no_medicines')} mins",
                 }]
-                st.dataframe(pd.DataFrame(normal_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(normal_data), width='stretch', hide_index=True)
 
                 st.divider()
 
@@ -3125,7 +3125,7 @@ def show_user_page():
                     "Avg Upload/SKU": f"{avg_time_per_sku(arr_upload_tasks)} mins",
                     "Avg Place/SKU": f"{avg_time_per_sku(arr_place_tasks, 'no_medicines')} mins",
                 }]
-                st.dataframe(pd.DataFrame(arr_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(arr_data), width='stretch', hide_index=True)
 
             except Exception as e:
                 st.error(f"Dashboard error: {e}")
@@ -3137,28 +3137,28 @@ def show_user_page():
         with st.sidebar:
             st.divider()
             st.markdown("### 📞 Calls")
-            if st.button("📞 Call Log", use_container_width=True, key="c_calllog",
+            if st.button("📞 Call Log", width='stretch', key="c_calllog",
                 type="primary" if st.session_state.call_active_form=="calllog" else "secondary"):
                 st.session_state.call_active_form = "calllog"
                 st.rerun()
-            if st.button("🔍 Medicine Search", use_container_width=True, key="c_medsearch",
+            if st.button("🔍 Medicine Search", width='stretch', key="c_medsearch",
                 type="primary" if st.session_state.call_active_form=="medsearch" else "secondary"):
                 st.session_state.call_active_form = "medsearch"
                 st.rerun()
 
             st.markdown("### 🚛 Logistics")
-            if st.button("🚛 Book Porter", use_container_width=True, key="c_porter",
+            if st.button("🚛 Book Porter", width='stretch', key="c_porter",
                 type="primary" if st.session_state.call_active_form=="porter" else "secondary"):
                 st.session_state.call_active_form = "porter"
                 st.rerun()
-            if st.button("✏️ Other", use_container_width=True, key="c_other",
+            if st.button("✏️ Other", width='stretch', key="c_other",
                 type="primary" if st.session_state.call_active_form=="other" else "secondary"):
                 st.session_state.call_active_form = "other"
                 st.rerun()
 
             if st.session_state.call_active_form:
                 st.divider()
-                if st.button("✖️ Close Form", use_container_width=True, key="c_close"):
+                if st.button("✖️ Close Form", width='stretch', key="c_close"):
                     st.session_state.call_active_form = None
                     st.rerun()
 
@@ -3271,20 +3271,20 @@ def show_user_page():
             st.markdown("### What do you want to do?")
             c1,c2 = st.columns(2)
             with c1:
-                if st.button("📋 View & Pickup", use_container_width=True, key="d_pickup", type="primary"):
+                if st.button("📋 View & Pickup", width='stretch', key="d_pickup", type="primary"):
                     st.session_state.delivery_active_form = "pickup"
                     st.rerun()
             with c2:
-                if st.button("🚛 Porter Handover", use_container_width=True, key="d_handover", type="primary"):
+                if st.button("🚛 Porter Handover", width='stretch', key="d_handover", type="primary"):
                     st.session_state.delivery_active_form = "handover"
                     st.rerun()
             c1,c2 = st.columns(2)
             with c1:
-                if st.button("🚚 Delivery Trip", use_container_width=True, key="d_delivery"):
+                if st.button("🚚 Delivery Trip", width='stretch', key="d_delivery"):
                     st.session_state.delivery_active_form = "delivery"
                     st.rerun()
             with c2:
-                if st.button("✏️ Other Task", use_container_width=True, key="d_other"):
+                if st.button("✏️ Other Task", width='stretch', key="d_other"):
                     st.session_state.delivery_active_form = "other"
                     st.rerun()
             st.divider()
@@ -3407,64 +3407,64 @@ def show_user_page():
         with st.sidebar:
             st.divider()
             st.markdown("### 📦 Ordering")
-            if st.button("🛒 Purchase Order", use_container_width=True, key="p_purchase",
+            if st.button("🛒 Purchase Order", width='stretch', key="p_purchase",
                 type="primary" if st.session_state.purchase_active_form=="purchase" else "secondary"):
                 st.session_state.purchase_active_form = "purchase"
                 st.rerun()
-            if st.button("↩️ Purchase Return", use_container_width=True, key="p_return",
+            if st.button("↩️ Purchase Return", width='stretch', key="p_return",
                 type="primary" if st.session_state.purchase_active_form=="return" else "secondary"):
                 st.session_state.purchase_active_form = "return"
                 st.rerun()
-            if st.button("📦 Arrangement Order", use_container_width=True, key="p_arrangement",
+            if st.button("📦 Arrangement Order", width='stretch', key="p_arrangement",
                 type="primary" if st.session_state.purchase_active_form=="arrangement" else "secondary"):
                 st.session_state.purchase_active_form = "arrangement"
                 st.rerun()
 
             st.markdown("### 🔍 Research")
-            if st.button("💊 PharmaRack Search", use_container_width=True, key="p_pharma",
+            if st.button("💊 PharmaRack Search", width='stretch', key="p_pharma",
                 type="primary" if st.session_state.purchase_active_form=="pharma" else "secondary"):
                 st.session_state.purchase_active_form = "pharma"
                 st.rerun()
-            if st.button("📋 Bounce Medicine", use_container_width=True, key="p_bounce",
+            if st.button("📋 Bounce Medicine", width='stretch', key="p_bounce",
                 type="primary" if st.session_state.purchase_active_form=="bounce" else "secondary"):
                 st.session_state.purchase_active_form = "bounce"
                 st.rerun()
 
             st.markdown("### 🚛 Logistics")
-            if st.button("🚛 Book Porter", use_container_width=True, key="p_porter",
+            if st.button("🚛 Book Porter", width='stretch', key="p_porter",
                 type="primary" if st.session_state.purchase_active_form=="porter" else "secondary"):
                 st.session_state.purchase_active_form = "porter"
                 st.rerun()
-            if st.button("💰 Porter Payment", use_container_width=True, key="p_payment",
+            if st.button("💰 Porter Payment", width='stretch', key="p_payment",
                 type="primary" if st.session_state.purchase_active_form=="payment" else "secondary"):
                 st.session_state.purchase_active_form = "payment"
                 st.rerun()
-            if st.button("📸 Pickup Images", use_container_width=True, key="p_pickup",
+            if st.button("📸 Pickup Images", width='stretch', key="p_pickup",
                 type="primary" if st.session_state.purchase_active_form=="pickup" else "secondary"):
                 st.session_state.purchase_active_form = "pickup"
                 st.rerun()
 
             st.markdown("### 📦 Stock Work")
-            if st.button("📒 Register Entry", use_container_width=True, key="p_register",
+            if st.button("📒 Register Entry", width='stretch', key="p_register",
                 type="primary" if st.session_state.purchase_active_form=="register" else "secondary"):
                 st.session_state.purchase_active_form = "register"
                 st.rerun()
-            if st.button("✔️ Bill Cross Check", use_container_width=True, key="p_crosscheck",
+            if st.button("✔️ Bill Cross Check", width='stretch', key="p_crosscheck",
                 type="primary" if st.session_state.purchase_active_form=="crosscheck" else "secondary"):
                 st.session_state.purchase_active_form = "crosscheck"
                 st.rerun()
-            if st.button("📍 Stock Placement", use_container_width=True, key="p_placement",
+            if st.button("📍 Stock Placement", width='stretch', key="p_placement",
                 type="primary" if st.session_state.purchase_active_form=="placement" else "secondary"):
                 st.session_state.purchase_active_form = "placement"
                 st.rerun()
-            if st.button("✏️ Other", use_container_width=True, key="p_other",
+            if st.button("✏️ Other", width='stretch', key="p_other",
                 type="primary" if st.session_state.purchase_active_form=="other" else "secondary"):
                 st.session_state.purchase_active_form = "other"
                 st.rerun()
 
             if st.session_state.purchase_active_form:
                 st.divider()
-                if st.button("✖️ Close Form", use_container_width=True, key="p_close"):
+                if st.button("✖️ Close Form", width='stretch', key="p_close"):
                     st.session_state.purchase_active_form = None
                     st.rerun()
 
@@ -3541,7 +3541,7 @@ def show_user_page():
                     "Avg mins/Arrangement": avg_arr,
                     "Returns": len(returns),
                     "PharmaRack Searches": len(pharmarack),
-                }]), use_container_width=True, hide_index=True)
+                }]), width='stretch', hide_index=True)
 
                 # Arrangement pipeline
                 st.divider()
@@ -3572,68 +3572,68 @@ def show_user_page():
         with st.sidebar:
             st.divider()
             st.markdown("### 📥 Incoming Stock")
-            if st.button("📒 Register Entry", use_container_width=True, key="s_register",
+            if st.button("📒 Register Entry", width='stretch', key="s_register",
                 type="primary" if st.session_state.stock_active_form=="register" else "secondary"):
                 st.session_state.stock_active_form = "register"
                 st.rerun()
-            if st.button("📦 Receive Porter", use_container_width=True, key="s_receive",
+            if st.button("📦 Receive Porter", width='stretch', key="s_receive",
                 type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
                 st.session_state.stock_active_form = "receive"
                 st.rerun()
             st.markdown("### ✅ Processing")
-            if st.button("✔️ Bill Cross Check", use_container_width=True, key="s_crosscheck",
+            if st.button("✔️ Bill Cross Check", width='stretch', key="s_crosscheck",
                 type="primary" if st.session_state.stock_active_form=="crosscheck" else "secondary"):
                 st.session_state.stock_active_form = "crosscheck"
                 st.rerun()
-            if st.button("📤 Bill Upload", use_container_width=True, key="s_upload",
+            if st.button("📤 Bill Upload", width='stretch', key="s_upload",
                 type="primary" if st.session_state.stock_active_form=="upload" else "secondary"):
                 st.session_state.stock_active_form = "upload"
                 st.rerun()
-            if st.button("📍 Stock Placement", use_container_width=True, key="s_placement",
+            if st.button("📍 Stock Placement", width='stretch', key="s_placement",
                 type="primary" if st.session_state.stock_active_form=="placement" else "secondary"):
                 st.session_state.stock_active_form = "placement"
                 st.rerun()
-            if st.button("🔍 Placement Check", use_container_width=True, key="s_plcheck",
+            if st.button("🔍 Placement Check", width='stretch', key="s_plcheck",
                 type="primary" if st.session_state.stock_active_form=="plcheck" else "secondary"):
                 st.session_state.stock_active_form = "plcheck"
                 st.rerun()
             st.markdown("### 🔧 Other Work")
-            if st.button("↩️ Purchase Return", use_container_width=True, key="s_return",
+            if st.button("↩️ Purchase Return", width='stretch', key="s_return",
                 type="primary" if st.session_state.stock_active_form=="return" else "secondary"):
                 st.session_state.stock_active_form = "return"
                 st.rerun()
-            if st.button("🧹 Rack Cleaning", use_container_width=True, key="s_rack",
+            if st.button("🧹 Rack Cleaning", width='stretch', key="s_rack",
                 type="primary" if st.session_state.stock_active_form=="rack" else "secondary"):
                 st.session_state.stock_active_form = "rack"
                 st.rerun()
-            if st.button("📊 Inventory Check", use_container_width=True, key="s_inventory",
+            if st.button("📊 Inventory Check", width='stretch', key="s_inventory",
                 type="primary" if st.session_state.stock_active_form=="inventory" else "secondary"):
                 st.session_state.stock_active_form = "inventory"
                 st.rerun()
-            if st.button("🚛 Book Porter", use_container_width=True, key="s_porter",
+            if st.button("🚛 Book Porter", width='stretch', key="s_porter",
                 type="primary" if st.session_state.stock_active_form=="porter" else "secondary"):
                 st.session_state.stock_active_form = "porter"
                 st.rerun()
-            if st.button("🛒 Purchase Order", use_container_width=True, key="s_purchase",
+            if st.button("🛒 Purchase Order", width='stretch', key="s_purchase",
                 type="primary" if st.session_state.stock_active_form=="purchase" else "secondary"):
                 st.session_state.stock_active_form = "purchase"
                 st.rerun()
-            if st.button("📦 Arrangement", use_container_width=True, key="s_arrangement",
+            if st.button("📦 Arrangement", width='stretch', key="s_arrangement",
                 type="primary" if st.session_state.stock_active_form=="arrangement" else "secondary"):
                 st.session_state.stock_active_form = "arrangement"
                 st.rerun()
-            if st.button("✏️ Edit Entry", use_container_width=True, key="s_edit",
+            if st.button("✏️ Edit Entry", width='stretch', key="s_edit",
                 type="primary" if st.session_state.stock_active_form=="edit" else "secondary"):
                 st.session_state.stock_active_form = "edit"
                 st.rerun()
-            if st.button("✏️ Other", use_container_width=True, key="s_other",
+            if st.button("✏️ Other", width='stretch', key="s_other",
                 type="primary" if st.session_state.stock_active_form=="other" else "secondary"):
                 st.session_state.stock_active_form = "other"
                 st.rerun()
 
             if st.session_state.stock_active_form:
                 st.divider()
-                if st.button("✖️ Close Form", use_container_width=True, key="s_close"):
+                if st.button("✖️ Close Form", width='stretch', key="s_close"):
                     st.session_state.stock_active_form = None
                     st.rerun()
 
@@ -3726,7 +3726,7 @@ def show_user_page():
                     "Avg Check/SKU": f"{avg_sku(normal_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_sku(normal_upload_tasks)} mins",
                     "Avg Place/SKU": f"{avg_sku(normal_place_tasks,'no_medicines')} mins",
-                }]), use_container_width=True, hide_index=True)
+                }]), width='stretch', hide_index=True)
                 st.divider()
                 st.markdown("#### 📦 Arrangement Orders")
                 st.dataframe(pd.DataFrame([{
@@ -3737,7 +3737,7 @@ def show_user_page():
                     "Avg Check/SKU": f"{avg_sku(arr_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_sku(arr_upload_tasks)} mins",
                     "Avg Place/SKU": f"{avg_sku(arr_place_tasks,'no_medicines')} mins",
-                }]), use_container_width=True, hide_index=True)
+                }]), width='stretch', hide_index=True)
             except Exception as e:
                 st.error(f"Dashboard error: {e}")
 
@@ -3808,7 +3808,7 @@ def show_user_page():
 
     if in_progress:
         st.warning(f"⏳ {len(in_progress)} task(s) in progress:")
-        st.dataframe(pd.DataFrame(in_progress), use_container_width=True)
+        st.dataframe(pd.DataFrame(in_progress), width='stretch')
     try:
         resp = supabase.table("daily_tasks").select("*")\
             .eq("person", st.session_state.name)\
@@ -3930,7 +3930,7 @@ def show_user_page():
                     avg_label: f"{avg} mins" if avg != 0 else "0 mins",
                 })
 
-            st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(display_rows), width='stretch')
 
             # Smart Summary based on team
             overall_avg = round(total_duration/total_sku, 1) if total_sku > 0 else 0
@@ -4251,7 +4251,7 @@ def show_admin_page():
                 arr_df = pd.DataFrame(arr.data)
                 display_cols = ["arrangement_no","distributor","area","order_placed_time","order_by","urgency","pickup_type","status"]
                 existing_cols = [c for c in display_cols if c in arr_df.columns]
-                st.dataframe(arr_df[existing_cols], use_container_width=True)
+                st.dataframe(arr_df[existing_cols], width='stretch')
             else:
                 st.info("No arrangements today.")
         except Exception as e:
@@ -4382,7 +4382,7 @@ def show_admin_page():
                     if status_filter != "All":
                         pipeline_df = pipeline_df[pipeline_df["Status"]==status_filter]
 
-                    st.dataframe(pipeline_df, use_container_width=True)
+                    st.dataframe(pipeline_df, width='stretch')
 
                     # Detailed expander view
                     st.markdown("**📋 Detailed View:**")
@@ -4425,7 +4425,7 @@ def show_admin_page():
                                         from PIL import Image
                                         import io as io_mod
                                         pil_img = Image.open(io_mod.BytesIO(img_data))
-                                        st.image(pil_img, use_container_width=True)
+                                        st.image(pil_img, width='stretch')
                                         st.download_button(
                                             "🔍 Download Full Size",
                                             img_data,
@@ -4638,7 +4638,7 @@ def show_admin_page():
 
                         # Performance table
                         perf_df = pd.DataFrame(perf_rows)
-                        st.dataframe(perf_df, use_container_width=True)
+                        st.dataframe(perf_df, width='stretch')
 
                         # Total row
                         st.markdown(f"**📊 Overall Avg/SKU: {overall_avg} mins**")
@@ -4815,7 +4815,7 @@ def show_admin_page():
 
         if person_rows:
             person_df = pd.DataFrame(person_rows)
-            st.dataframe(person_df, use_container_width=True)
+            st.dataframe(person_df, width='stretch')
 
             # Team summary
             st.markdown("**📊 Team Summary:**")
@@ -4849,7 +4849,7 @@ def show_admin_page():
 
             if area_data:
                 area_rows = [{"Area": k, "Bills": v["bills"], "SKUs": v["skus"], "Pending": v["pending"]} for k,v in area_data.items()]
-                st.dataframe(pd.DataFrame(area_rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(area_rows), width='stretch')
             else:
                 st.info("No area data available!")
         except Exception as e:
@@ -4991,7 +4991,7 @@ def show_admin_page():
                         "Status": status
                     })
                 dist_df = pd.DataFrame(dist_rows).sort_values("Total Issues", ascending=False)
-                st.dataframe(dist_df, use_container_width=True)
+                st.dataframe(dist_df, width='stretch')
             else:
                 st.info("No distributor data for selected date!")
         except Exception as e:
@@ -5010,7 +5010,7 @@ def show_admin_page():
                 lambda row: sum([int(float(t.get("duration_mins",0) or 0)) 
                     for t in tasks if t.get("person")==row["person"]]), axis=1)
             person_summary = person_summary.sort_values("Tasks", ascending=False)
-            st.dataframe(person_summary, use_container_width=True)
+            st.dataframe(person_summary, width='stretch')
             st.bar_chart(tasks_df.groupby("person").size())
         else:
             st.info("No team data for selected date!")
@@ -5032,7 +5032,7 @@ def show_admin_page():
             tasks_df = pd.DataFrame(tasks)
             st.markdown("### 👥 Team Performance")
             person_summary = tasks_df.groupby(["person","team","task_type"]).size().reset_index(name="count")
-            st.dataframe(person_summary, use_container_width=True)
+            st.dataframe(person_summary, width='stretch')
             st.bar_chart(tasks_df.groupby("person").size())
 
     with tab4:
@@ -5064,7 +5064,7 @@ def show_admin_page():
                 with c2:
                     new_team = st.selectbox("Team", ["Purchase","Stock","Call","Delivery","Admin"], key="nu_team")
                     new_role = st.selectbox("Role", ["user","admin"], key="nu_role")
-                if st.form_submit_button("Add User ✅", type="primary", use_container_width=True):
+                if st.form_submit_button("Add User ✅", type="primary", width='stretch'):
                     if not new_username or not new_name or not new_password:
                         st.error("Fill all fields!")
                     else:
@@ -5181,7 +5181,7 @@ def show_admin_page():
                 elif date_f == "Last 7 Days": filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=7)]
                 elif date_f == "Last 30 Days": filtered = filtered[filtered["date"]>=pd.Timestamp.now()-pd.Timedelta(days=30)]
                 st.markdown(f"**{len(filtered)} tasks found**")
-                st.dataframe(filtered.sort_values("date", ascending=False), use_container_width=True)
+                st.dataframe(filtered.sort_values("date", ascending=False), width='stretch')
                 c1,c2 = st.columns(2)
                 with c1:
                     buf = io.BytesIO()
