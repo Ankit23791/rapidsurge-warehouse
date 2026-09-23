@@ -2835,22 +2835,22 @@ def show_user_page():
                             "S.No": i+1,
                             "Bill No": bill_no,
                             "Distributor": d.get("distributor",""),
-                            "Items": d.get("no_items",""),
+                            "Items": int(float(d.get("no_items",0) or 0)),
                             "Amount": f"₹{float(d.get('bill_amount',0) or 0):,.0f}",
                             "Reg Time": r.get("time",""),
                             "Reg By": r.get("person",""),
                             "Check By": cross.get("person","") if cross else "⏳",
                             "Check Start": cross.get("start_time","") if cross else "⏳",
                             "Check End": cross.get("end_time","") if cross else "⏳",
-                            "Check Mins": cross.get("duration_mins","") if cross else "-",
+                            "Check Mins": int(float(cross.get("duration_mins",0) or 0)) if cross else 0,
                             "Upload By": upload.get("person","") if upload else "⏳",
                             "Upload Start": upload.get("start_time","") if upload else "⏳",
                             "Upload End": upload.get("end_time","") if upload else "⏳",
-                            "Upload Mins": upload.get("duration_mins","") if upload else "-",
+                            "Upload Mins": int(float(upload.get("duration_mins",0) or 0)) if upload else 0,
                             "Place By": place.get("person","") if place else "⏳",
                             "Place Start": place.get("start_time","") if place else "⏳",
                             "Place End": place.get("end_time","") if place else "⏳",
-                            "Place Mins": place.get("duration_mins","") if place else "-",
+                            "Place Mins": int(float(place.get("duration_mins",0) or 0)) if place else 0,
                             "Total Mins": total_mins,
                             "Status": status
                         })
@@ -2906,8 +2906,8 @@ def show_user_page():
                                 porter_data = None
                             pipeline_rows = [
                                 {"Step":"📋 Order Placed","By":arr.get("order_by",""),"Time":arr.get("order_placed_time",""),"Details":f"Medicines:{arr.get('no_medicines','')} Bill:{arr.get('bill_order_id','')}","Status":"✅"},
-                                {"Step":"🚚 Picked Up","By":pickup_data.get("person","") if pickup_data else arr.get("pickup_by",""),"Time":pickup_data.get("start_time","") if pickup_data else arr.get("pickup_time",""),"Details":f"SKUs:{pickup_data.get('details',{}).get('no_sku_received','')}" if pickup_data else "-","Status":"✅" if arr.get("pickup_by") or pickup_data else "⏳"},
-                                {"Step":"🚛 Porter Handover","By":porter_data.get("handover_by","") if porter_data else "-","Time":porter_data.get("handover_time","") if porter_data else "-","Details":f"Bills:{porter_data.get('no_bills','')} Polythene:{porter_data.get('no_polythene','')}" if porter_data else "-","Status":"✅" if porter_data and porter_data.get("handover_by") else "⏳"},
+                                {"Step":"🚚 Picked Up","By":pickup_data.get("person","") if pickup_data else arr.get("pickup_by",""),"Time":pickup_data.get("start_time","") if pickup_data else arr.get("pickup_time",""),"Details":f"SKUs:{pickup_data.get('details',{}).get('no_sku_received','')}" if pickup_data else "","Status":"✅" if arr.get("pickup_by") or pickup_data else "⏳"},
+                                {"Step":"🚛 Porter Handover","By":porter_data.get("handover_by","") if porter_data else "","Time":porter_data.get("handover_time","") if porter_data else "","Details":f"Bills:{porter_data.get('no_bills','')} Polythene:{porter_data.get('no_polythene','')}" if porter_data else "","Status":"✅" if porter_data and porter_data.get("handover_by") else "⏳"},
                                 {"Step":"🏭 Reached Warehouse","By":"","Time":"","Details":"-","Status":"✅" if status in ["Reached Warehouse","Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"] else "⏳"},
                                 {"Step":"✔️ Bill Cross Check","By":arr.get("cross_checked_by",""),"Time":arr.get("cross_check_time",""),"Details":"-","Status":"✅" if status in ["Bill Cross Checked","Bill Uploaded","Stock Placed","Completed"] else "⏳"},
                                 {"Step":"📤 Bill Upload","By":arr.get("bill_uploaded_by",""),"Time":arr.get("bill_upload_time",""),"Details":"-","Status":"✅" if status in ["Bill Uploaded","Stock Placed","Completed"] else "⏳"},
@@ -3898,7 +3898,7 @@ def show_user_page():
                     sku = 0
                     extra = details.get("distributor","") or details.get("task_name","")
 
-                avg = round(duration/sku, 1) if sku > 0 and duration > 0 else "-"
+                avg = round(duration/sku, 1) if sku > 0 and duration > 0 else 0
                 total_sku += sku
                 total_duration += duration
 
@@ -3926,8 +3926,8 @@ def show_user_page():
                     "Start": row.get("start_time",""),
                     "End": row.get("end_time",""),
                     "Duration": f"{duration} mins",
-                    count_label: sku if sku > 0 else "-",
-                    avg_label: f"{avg} mins" if avg != "-" else "-",
+                    count_label: sku if sku > 0 else 0,
+                    avg_label: f"{avg} mins" if avg != 0 else "0 mins",
                 })
 
             st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
@@ -4597,7 +4597,7 @@ def show_admin_page():
                         count    = len(task_list)
                         duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in task_list])
                         skus     = sum([int(float((t.get("details") or {}).get(sku_field,0) or 0)) for t in task_list])
-                        avg_sku  = round(duration/skus, 2) if skus > 0 else "-"
+                        avg_sku  = round(duration/skus, 2) if skus > 0 else 0
 
                         # Yesterday comparison
                         yest_list     = [t for t in yest_tasks if t.get("task_type") == task_type]
@@ -4621,7 +4621,7 @@ def show_admin_page():
                             "Total Time (mins)": duration,
                             f"{sku_label}": skus,
                             "Avg/SKU (mins)": avg_sku,
-                            "Yesterday Avg": yest_avg or "-",
+                            "Yesterday Avg": yest_avg or "",
                             "Trend": trend
                         })
 
