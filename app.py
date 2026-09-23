@@ -1245,7 +1245,7 @@ def form_stock_placement():
 
         st.divider()
         st.markdown("**📸 Photo of Placement Area**")
-        upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+        upload_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
             key="sp_radio", label_visibility="collapsed")
         if upload_opt == "Upload":
             placement_img = st.file_uploader("Select Image",
@@ -2527,7 +2527,7 @@ def form_porter_receive():
                 receive_time = st.time_input("Receive Time", key="dr_time")
 
             st.markdown("📸 **Image of Stock Received**")
-            upload_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+            upload_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
                 key="dr_radio", label_visibility="collapsed")
             if upload_opt == "Upload":
                 recv_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="dr_upload")
@@ -2618,7 +2618,7 @@ def form_porter_receive():
         arr_images = {}
         for arr_no in arr_nos:
             st.markdown(f"Arrangement #{arr_no}")
-            up_opt = st.radio("", ["Upload","Camera"], horizontal=True,
+            up_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
                 key=f"pr_radio_{arr_no}", label_visibility="collapsed")
             if up_opt == "Upload":
                 img = st.file_uploader(f"Image for #{arr_no}",
