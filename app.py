@@ -4804,13 +4804,13 @@ def show_admin_page():
                 "Person": person,
                 "Bills Checked": len(p_cross),
                 "Total Check(mins)": p_cross_dur,
-                "Avg Check/Bill": round(p_cross_dur/len(p_cross),1) if p_cross else "-",
+                "Avg Check/Bill": round(p_cross_dur/len(p_cross),1) if p_cross else 0,
                 "Bills Uploaded": len(p_upload),
                 "Total Upload(mins)": p_upload_dur,
-                "Avg Upload/Bill": round(p_upload_dur/len(p_upload),1) if p_upload else "-",
+                "Avg Upload/Bill": round(p_upload_dur/len(p_upload),1) if p_upload else 0,
                 "Bills Placed": len(p_place),
                 "Total Place(mins)": p_place_dur,
-                "Avg Place/Bill": round(p_place_dur/len(p_place),1) if p_place else "-",
+                "Avg Place/Bill": round(p_place_dur/len(p_place),1) if p_place else 0,
             })
 
         if person_rows:
