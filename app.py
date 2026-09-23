@@ -22,8 +22,19 @@ st.markdown("""
     display: none !important;
 }
 section[data-testid="stSidebar"] {
-    min-width: 250px !important;
-    width: 250px !important;
+    min-width: 200px !important;
+    width: 200px !important;
+}
+/* Mobile sidebar */
+@media (max-width: 768px) {
+    section[data-testid="stSidebar"] {
+        min-width: 100% !important;
+        width: 100% !important;
+        position: relative !important;
+    }
+    section.main {
+        margin-left: 0 !important;
+    }
 }
 /* Reduce top padding */
 .block-container {
