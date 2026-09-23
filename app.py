@@ -2765,8 +2765,17 @@ def show_user_page():
                     st.rerun()
         return
 
-    st.title(f"💊 RapidSurge — {team} Team")
-    st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
+    c1,c2 = st.columns([4,1])
+    with c1:
+        st.title(f"💊 RapidSurge — {team} Team")
+        st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
+    with c2:
+        st.write("")
+        if st.button("🚪 Logout", key="mobile_logout"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.query_params.clear()
+            st.rerun()
     st.divider()
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
