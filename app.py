@@ -606,7 +606,7 @@ def form_arrangement():
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not arr_no or not medicines:
                 st.error("Fill Arrangement No and Medicines!")
-            elif not img:
+            elif img is None:
                 st.error("⚠️ Image of order is mandatory! Please upload or take photo.")
             else:
                 # Check duplicate arrangement number
