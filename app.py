@@ -1945,7 +1945,6 @@ def form_bill_crosscheck():
                     "task_type": "Bill Cross Check",
                     "details": {
                         "arrangement_no": arr_no,
-                        "distributor": dist,
                         "bill_no": bill_no,
                         "no_items": str(no_items),
                         "near_expiry": str(near_expiry),
@@ -3081,7 +3080,6 @@ def show_user_page():
                 st.caption("Error loading tasks")
 
         # ── MAIN AREA ─────────────────────────────────────────────────────
-                form_map[st.session_state.stock_active_form]()
         else:
             # ── DASHBOARD ─────────────────────────────────────────────────
             work_area = st.session_state.get("work_area","All Areas")
@@ -3641,10 +3639,20 @@ def show_user_page():
                 pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
                 arr_timer        = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
                 # Load arrangements from arrangements table
-                arr_db_resp = supabase.table("arrangements").select("*")\
-                    .eq("order_placed_date", date_str())\
-                    .eq("order_by", st.session_state.name).execute()
-                arrangements = arr_db_resp.data if arr_db_resp.data else arr_timer
+                try:
+                    arr_db_resp = supabase.table("arrangements").select("*")\
+                        .eq("order_placed_date", date_str())\
+                        .eq("order_by", st.session_state.name).execute()
+                    arrangements = arr_db_resp.data if arr_db_resp.data else arr_timer
+                    if not arr_db_resp.data:
+                        # TEMP DEBUG: shows why the count is 0 (remove once fixed)
+                        all_today = supabase.table("arrangements").select("order_by")\
+                            .eq("order_placed_date", date_str()).execute().data or []
+                        names = sorted(set(str(a.get("order_by","")) for a in all_today))
+                        st.caption(f"🔍 Debug: {len(all_today)} arrangement(s) saved today ({date_str()}) by {names} — you are logged in as '{st.session_state.name}'")
+                except Exception as arr_err:
+                    st.warning(f"Arr load error: {arr_err}")
+                    arrangements = arr_timer
                 total_medicines = sum([int(float(a.get("no_medicines",0) or 0)) for a in arrangements])
                 arr_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in arr_timer])
                 avg_arr = round(arr_duration/len(arr_timer), 1) if arr_timer else 0
@@ -3665,7 +3673,7 @@ def show_user_page():
                     "Total SKUs Ordered": total_skus,
                     "Avg mins/SKU": avg_po_sku,
                     "Arrangements": len(arrangements),
-                    "Total Medicines": total_meds,
+                    "Total Medicines": total_medicines,
                     "Avg mins/Arrangement": avg_arr,
                     "Returns": len(returns),
                     "PharmaRack Searches": len(pharmarack),
