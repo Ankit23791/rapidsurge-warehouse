@@ -582,11 +582,7 @@ def form_arrangement():
     st.info(f"🔢 Auto Arrangement No: **{auto_arr_no}**")
 
     st.markdown("📸 **Image of Order**")
-    upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="arr_radio")
-    if upload_opt == "Upload":
-        arr_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="arr_upload")
-    else:
-        arr_img = st.camera_input("Take Photo", key="arr_cam")
+    arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key="arr_upload")
     if arr_img:
         st.session_state["arr_img"] = arr_img
     elif "arr_img" not in st.session_state:
