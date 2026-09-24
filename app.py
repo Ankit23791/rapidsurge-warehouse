@@ -90,6 +90,40 @@ def time_str():
 def date_str():
     return today_ist().strftime("%Y-%m-%d")
 
+def parse_task_time(s):
+    """Read a task start/end time saved as '07:39:12 PM' (new) or '07:39 PM' (old)"""
+    for fmt in ("%I:%M:%S %p", "%I:%M %p"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt)
+        except Exception:
+            pass
+    return None
+
+def task_secs(row):
+    """Duration of a task in seconds (exact for new records, whole minutes for old ones)"""
+    s = parse_task_time(row.get("start_time",""))
+    e = parse_task_time(row.get("end_time",""))
+    if s and e:
+        diff = (e - s).total_seconds()
+        if diff < 0:
+            diff += 24*3600   # crossed midnight
+        return int(diff)
+    try:
+        return int(float(row.get("duration_mins",0) or 0) * 60)
+    except Exception:
+        return 0
+
+def fmt_secs(secs):
+    """45 -> '45 secs', 125 -> '2 min 5 secs', 3720 -> '1 hr 2 min'"""
+    secs = int(round(secs or 0))
+    if secs < 60:
+        return f"{secs} secs"
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return f"{m} min {s} secs" if s else f"{m} min"
+    h, rem = divmod(secs, 3600)
+    return f"{h} hr {rem//60} min"
+
 # ── SUPABASE ──────────────────────────────────────────────────────────────────
 # Keys stored in Streamlit secrets or environment variables only
 try:
@@ -207,8 +241,8 @@ def calc_actual_duration(df):
         periods = []
         for _, row in df.iterrows():
             try:
-                s = dt.strptime(str(row.get("start_time","")), "%I:%M %p")
-                e = dt.strptime(str(row.get("end_time","")), "%I:%M %p")
+                s = parse_task_time(row.get("start_time",""))
+                e = parse_task_time(row.get("end_time",""))
                 if e > s:
                     periods.append((s, e))
             except:
@@ -399,7 +433,7 @@ def timer_button(key, task_name=None):
                     "team": st.session_state.team,
                     "task_type": task_name or key.replace("_"," ").title(),
                     "status": "In Progress",
-                    "start_time": now_ist().strftime("%I:%M %p"),
+                    "start_time": now_ist().strftime("%I:%M:%S %p"),
                     "details": {}
                 }).execute()
                 if result.data:
@@ -437,7 +471,7 @@ def end_timer(key, start_time, keep_record=False):
             if keep_record:
                 # Form has no row of its own -> turn the In Progress record into the final one
                 supabase.table("daily_tasks").update({
-                    "end_time": end.strftime("%I:%M %p"),
+                    "end_time": end.strftime("%I:%M:%S %p"),
                     "duration_mins": str(duration),
                     "status": "Completed"
                 }).eq("id", task_id).execute()
@@ -449,7 +483,7 @@ def end_timer(key, start_time, keep_record=False):
         except:
             pass
         st.session_state[f"{key}_task_id"] = None
-    return end.strftime("%I:%M %p"), duration
+    return end.strftime("%I:%M:%S %p"), duration
 
 # ── PURCHASE TEAM FORMS ───────────────────────────────────────────────────────
 def form_purchase_order():
@@ -479,7 +513,7 @@ def form_purchase_order():
                     "details": {"distributor": distributor, "order_type": order_type,
                                "no_sku": str(no_sku), "mode": mode, "urgency": urgency,
                                "remarks": remarks},
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time, "duration_mins": str(duration),
                     "status": "Completed"
                 }).execute()
@@ -520,7 +554,7 @@ def form_purchase_return():
                         "details": {"distributor": distributor, "bill_no": bill_no,
                                    "no_items": str(no_items), "reason": reason,
                                    "items": items, "remarks": remarks},
-                        "start_time": start.strftime("%I:%M %p"),
+                        "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time, "duration_mins": str(duration)
                     }).execute()
                     st.success("✅ Purchase Return submitted!")
@@ -551,7 +585,7 @@ def form_pharmarack():
                     "details": {"no_searched": str(no_searched), "no_found": str(no_found),
                                "no_not_found": str(no_not_found), "no_ordered": str(no_ordered),
                                "remarks": remarks},
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time, "duration_mins": str(duration)
                 }).execute()
                 st.success("✅ PharmaRack Search submitted!")
@@ -586,7 +620,7 @@ def form_bounce_medicine():
                     "task_type": "Bounce Medicine Study",
                     "details": {"no_bounced": str(no_bounced), "no_useful": str(no_useful),
                                "image": img_name, "remarks": remarks},
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time, "duration_mins": str(duration)
                 }).execute()
                 st.success("✅ Bounce Medicine Study submitted!")
@@ -745,7 +779,7 @@ def form_bill_upload():
                                    "bill_date": str(bill_date), "delivery_by": delivery_by,
                                    "order_type": order_type, "image": img_name,
                                    "remarks": remarks, "check_status": "Unchecked"},
-                        "start_time": start.strftime("%I:%M %p"), "end_time": end_time
+                        "start_time": start.strftime("%I:%M:%S %p"), "end_time": end_time
                     }).execute()
                     st.success("✅ Bill uploaded successfully!")
                     st.balloons()
@@ -778,7 +812,7 @@ def form_rack_cleaning():
                         "details": {"rack_no": rack_no, "no_racks": str(no_racks),
                                    "expiry_found": expiry_found, "expiry_items": expiry_items,
                                    "remarks": remarks},
-                        "start_time": start.strftime("%I:%M %p"),
+                        "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time, "duration_mins": str(duration)
                     }).execute()
                     st.success("✅ Rack Cleaning submitted!")
@@ -815,7 +849,7 @@ def form_inventory_check():
                                    "no_shortage": str(no_shortage), "no_expiry": str(no_expiry),
                                    "no_wrong": str(no_wrong), "shortage_items": shortage_items,
                                    "remarks": remarks},
-                        "start_time": start.strftime("%I:%M %p"),
+                        "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time, "duration_mins": str(duration)
                     }).execute()
                     st.success("✅ Inventory Check submitted!")
@@ -859,7 +893,7 @@ def form_medicine_search():
                         "avg_per_sku": str(avg_per_sku),
                         "remarks": remarks
                     },
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time,
                     "duration_mins": str(duration),
                     "status": "Completed"
@@ -897,7 +931,7 @@ def form_call_log():
                     "details": {"calls_made": str(calls_made), "calls_picked": str(calls_picked),
                                "calls_not_picked": str(calls_not_picked), "orders_delivered": str(orders_del),
                                "remarks": remarks},
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time,
                     "duration_mins": str(duration)
                 }).execute()
@@ -1181,7 +1215,7 @@ def form_other_task():
                         "person": st.session_state.name, "team": st.session_state.team,
                         "task_type": "Other",
                         "details": {"task_name": task_name, "details": details, "remarks": remarks},
-                        "start_time": start.strftime("%I:%M %p"),
+                        "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time, "duration_mins": str(duration)
                     }).execute()
                     st.success("✅ Task submitted!")
@@ -1379,7 +1413,7 @@ def form_stock_placement():
                         "placement_image": img_name,
                         "remarks": remarks
                     },
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time,
                     "duration_mins": str(duration)
                 }).execute()
@@ -1982,7 +2016,7 @@ def form_bill_crosscheck():
                         "area": bc_area if bc_area != "All Areas" else "",
                         "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor","")
                     },
-                    "start_time": start.strftime("%I:%M %p"),
+                    "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time,
                     "duration_mins": str(duration)
                 }).execute()
@@ -2155,7 +2189,7 @@ def form_bill_upload_arrangement():
                             "bill_image": img_name,
                             "remarks": remarks
                         },
-                        "start_time": start.strftime("%I:%M %p"),
+                        "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time,
                         "duration_mins": str(duration),
                         "status": "Completed"
@@ -2890,11 +2924,11 @@ def show_user_page():
                             from datetime import datetime as dt
                             reg_t   = dt.strptime(r.get("time",""), "%I:%M %p")
                             if place:
-                                end_t = dt.strptime(place.get("end_time",""), "%I:%M %p")
+                                end_t = parse_task_time(place.get("end_time",""))
                             elif upload:
-                                end_t = dt.strptime(upload.get("end_time",""), "%I:%M %p")
+                                end_t = parse_task_time(upload.get("end_time",""))
                             elif cross:
-                                end_t = dt.strptime(cross.get("end_time",""), "%I:%M %p")
+                                end_t = parse_task_time(cross.get("end_time",""))
                             else:
                                 end_t = dt.strptime(time_str(), "%I:%M %p")
                             total_mins = int((end_t - reg_t).total_seconds() / 60)
@@ -4021,10 +4055,8 @@ def show_user_page():
 
             for _, row in df.iterrows():
                 details = row.get("details", {}) or {}
-                try:
-                    duration = int(float(row.get("duration_mins",0) or 0))
-                except:
-                    duration = 0
+                secs = task_secs(row)
+                duration = round(secs/60, 1)
 
                 # Get SKU based on task type
                 if row.get("task_type") == "Purchase Order":
@@ -4032,7 +4064,8 @@ def show_user_page():
                         sku = int(float(details.get("no_sku",0) or 0))
                     except:
                         sku = 0
-                    extra = f"SKUs: {sku}"
+                    po_dist = details.get("distributor","")
+                    extra = f"{po_dist} | SKUs: {sku}" if po_dist else f"SKUs: {sku}"
                 elif row.get("task_type") == "Bill Cross Check":
                     sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku}"
@@ -4066,8 +4099,7 @@ def show_user_page():
 
                 avg = round(duration/sku, 1) if sku > 0 and duration > 0 else 0
                 per_med_types = ["Stock Placement","Arrangement Order","Purchase Order"]
-                if row.get("task_type") in per_med_types:
-                    avg_secs = round(duration*60/sku, 1) if sku > 0 and duration > 0 else 0
+                avg_secs = round(secs/sku, 1) if sku > 0 and secs > 0 else 0
                 total_sku += sku
                 total_duration += duration
 
@@ -4095,13 +4127,14 @@ def show_user_page():
                     "Details": extra,
                     "Start": row.get("start_time",""),
                     "End": row.get("end_time",""),
-                    "Duration": f"{duration} mins",
+                    "Duration": fmt_secs(secs) if row.get("end_time") else "In Progress",
                     count_label: sku if sku > 0 else 0,
                     avg_label: (f"{avg_secs} secs" if avg_secs != 0 else "0 secs") if row.get("task_type") in per_med_types
                                else (f"{avg} mins" if avg != 0 else "0 mins"),
                 })
 
             st.dataframe(pd.DataFrame(display_rows), width='stretch')
+            total_duration = round(total_duration, 1)
 
             # Smart Summary based on team
             overall_avg = round(total_duration/total_sku, 1) if total_sku > 0 else 0
@@ -4109,7 +4142,8 @@ def show_user_page():
 
             c1,c2,c3,c4 = st.columns(4)
             with c1: st.metric("Total Tasks", len(display_rows))
-            with c3: st.metric("Total Time", f"{total_duration} mins")
+            if team != "Purchase":
+                with c3: st.metric("Total Time", f"{total_duration} mins")
 
             if team == "Call":
                 call_rows = [row for _, row in df.iterrows() if row.get("task_type") == "Call Log"]
@@ -4158,27 +4192,50 @@ def show_user_page():
                 pharmarack    = [row for _, row in df.iterrows() if row.get("task_type") == "PharmaRack Search"]
                 returns       = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Return"]
 
-                # SKU metrics
-                total_skus = sum([int(float((row.get("details") or {}).get("no_sku",0) or 0)) for row in normal_orders])
-                # Avg time per order type
-                normal_duration = sum([int(float(row.get("duration_mins",0) or 0)) for row in normal_orders])
-                avg_sku_per_min = round(total_skus/normal_duration, 2) if normal_duration > 0 and total_skus > 0 else 0
-                arr_duration    = sum([int(float(row.get("duration_mins",0) or 0)) for row in arrangements])
-                avg_normal_time = round(normal_duration/len(normal_orders), 1) if normal_orders else 0
-                avg_arr_time    = round(arr_duration/len(arrangements), 1) if arrangements else 0
+                # Only real work: skip empty/unfinished rows
+                normal_orders = [r for r in normal_orders if int(float((r.get("details") or {}).get("no_sku",0) or 0)) > 0]
+                arrangements  = [r for r in arrangements if (r.get("details") or {}).get("arrangement_no")]
 
-                with c2: st.metric("Total SKUs", total_skus)
-                with c4: st.metric("Avg SKU/min", avg_sku_per_min)
+                def _meds(r):
+                    d = r.get("details") or {}
+                    try:
+                        return int(float(arr_meds_lookup.get(str(d.get("arrangement_no","")), d.get("no_medicines",0)) or 0))
+                    except Exception:
+                        return 0
+
+                total_skus  = sum([int(float((r.get("details") or {}).get("no_sku",0) or 0)) for r in normal_orders])
+                total_meds  = sum([_meds(r) for r in arrangements])
+                normal_secs = sum([task_secs(r) for r in normal_orders])
+                arr_secs    = sum([task_secs(r) for r in arrangements])
+                all_secs    = sum([task_secs(r) for _, r in df.iterrows() if r.get("end_time")])
+
+                avg_normal_secs = normal_secs/len(normal_orders) if normal_orders else 0
+                avg_arr_secs    = arr_secs/len(arrangements) if arrangements else 0
+                secs_per_sku    = round(normal_secs/total_skus, 1) if total_skus else 0
+                secs_per_med    = round(arr_secs/total_meds, 1) if total_meds else 0
+
+                with c2: st.metric("📦 Total SKUs", total_skus)
+                with c3: st.metric("💊 Total Medicines", total_meds)
+                with c4: st.metric("⏱️ Total Time", fmt_secs(all_secs))
 
                 st.divider()
-                r1,r2,r3,r4 = st.columns(4)
-                with r1: st.metric("🛒 Normal Orders", len(normal_orders))
-                with r2: st.metric("⏱️ Avg Time/Normal", f"{avg_normal_time} mins")
-                with r3: st.metric("📋 Arrangements", len(arrangements))
-                with r4: st.metric("⏱️ Avg Time/Arr", f"{avg_arr_time} mins")
+                st.markdown("**🛒 Normal Orders**")
+                n1,n2,n3,n4 = st.columns(4)
+                with n1: st.metric("Orders", len(normal_orders))
+                with n2: st.metric("Total Time", fmt_secs(normal_secs))
+                with n3: st.metric("Avg Time/Order", fmt_secs(avg_normal_secs))
+                with n4: st.metric("Avg secs/SKU", f"{secs_per_sku} secs")
 
                 st.divider()
-                r5,r6 = st.columns(2)
+                st.markdown("**📋 Arrangement Orders**")
+                a1,a2,a3,a4 = st.columns(4)
+                with a1: st.metric("Arrangements", len(arrangements))
+                with a2: st.metric("Total Time", fmt_secs(arr_secs))
+                with a3: st.metric("Avg Time/Arr", fmt_secs(avg_arr_secs))
+                with a4: st.metric("Avg secs/Medicine", f"{secs_per_med} secs")
+
+                st.divider()
+                r5,r6,r7,r8 = st.columns(4)
                 with r5: st.metric("💊 PharmaRack", len(pharmarack))
                 with r6: st.metric("↩️ Returns", len(returns))
             elif team == "Stock":
