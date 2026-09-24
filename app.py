@@ -662,6 +662,20 @@ def form_arrangement():
                                     "quantity": qty
                                 }).execute()
                         end_time, duration = end_timer("arrangement_order", start)
+                        # Update task with medicines count
+                        task_id = st.session_state.get("arrangement_order_task_id")
+                        if task_id:
+                            try:
+                                supabase.table("daily_tasks").update({
+                                    "details": {
+                                        "arrangement_no": arr_no,
+                                        "distributor": distributor,
+                                        "no_medicines": str(len(medicines)),
+                                        "area": area
+                                    }
+                                }).eq("id", task_id).execute()
+                            except:
+                                pass
                         st.session_state["arr_img"] = None
                         st.success(f"✅ Arrangement #{arr_no} placed successfully!")
                         st.balloons()
@@ -3950,9 +3964,9 @@ def show_user_page():
                 "status": a.get("status","Pending")
             })
         
-        # Combine all
-        all_data = (resp.data or []) + arr_tasks + inprogress_data
-        if resp.data or arr_tasks:
+        # Combine all - don't add arr_tasks to avoid duplicates
+        all_data = (resp.data or []) + inprogress_data
+        if resp.data:
             df = pd.DataFrame(all_data)
             # Sort by time
             try:
