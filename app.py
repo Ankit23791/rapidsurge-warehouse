@@ -145,7 +145,7 @@ def load_users():
 USERS = load_users()
 
 DISTRIBUTORS = [
-    "Acorns Health Solutions Private Limited","Admire Enterprises",
+    "Acorns Health Solutions Private Limited","Admire Enterprises","Zonne Ventures Pvt Ltd",
     "Amar Drugs Distributors","Amarjeet Medical Hall","Ankit Enterprises",
     "Ar Kay Medicos Private Limited","Bawa Medical Store","Bhakti Enterprises",
     "D. C. Agencies Private Limited","Digipharms","Evara Life Sciences Llp",
