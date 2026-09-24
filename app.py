@@ -415,6 +415,15 @@ def timer_button(key, task_name=None):
         with c2:
             if st.button("❌ Cancel Task", key=f"cancel_{key}", type="secondary"):
                 st.session_state[sk] = None
+                # Remove the unfinished "In Progress" record so it doesn't count as a task
+                cancel_id = st.session_state.get(f"{key}_task_id")
+                if cancel_id:
+                    try:
+                        supabase.table("daily_tasks").delete()\
+                            .eq("id", cancel_id).eq("status", "In Progress").execute()
+                    except:
+                        pass
+                    st.session_state[f"{key}_task_id"] = None
                 st.rerun()
         return st.session_state[sk]
 
@@ -614,7 +623,8 @@ def form_arrangement():
         with c2:
             urgency       = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="arr_urgency")
             pickup_type   = st.selectbox("Pickup Type", ["Self Pick","Porter","Distributor Delivers"], key="arr_pickup")
-            no_medicines  = st.number_input("No of Medicines to Pick", min_value=0, step=1)
+            no_medicines  = st.number_input("No of Medicines to Pick", min_value=0, max_value=200, step=1,
+                                            help="Maximum 200 medicines per arrangement")
             order_time    = st.text_input("Order Time", value=time_str())
 
         medicines = st.text_area("Medicines (one per line) *", placeholder="Medicine 1 - Qty\nMedicine 2 - Qty")
@@ -4044,6 +4054,9 @@ def show_user_page():
                     extra = details.get("distributor","") or details.get("task_name","")
 
                 avg = round(duration/sku, 1) if sku > 0 and duration > 0 else 0
+                per_med_types = ["Stock Placement","Arrangement Order"]
+                if row.get("task_type") in per_med_types:
+                    avg_secs = round(duration*60/sku, 1) if sku > 0 and duration > 0 else 0
                 total_sku += sku
                 total_duration += duration
 
@@ -4059,7 +4072,7 @@ def show_user_page():
                     avg_label   = "Avg mins/Item"
                 elif row.get("task_type") in ["Stock Placement","Arrangement Order"]:
                     count_label = "Medicines"
-                    avg_label   = "Avg mins/Med"
+                    avg_label   = "Avg secs/Med"
                 else:
                     count_label = "Count"
                     avg_label   = "Avg/Item"
@@ -4072,7 +4085,8 @@ def show_user_page():
                     "End": row.get("end_time",""),
                     "Duration": f"{duration} mins",
                     count_label: sku if sku > 0 else 0,
-                    avg_label: f"{avg} mins" if avg != 0 else "0 mins",
+                    avg_label: (f"{avg_secs} secs" if avg_secs != 0 else "0 secs") if row.get("task_type") in per_med_types
+                               else (f"{avg} mins" if avg != 0 else "0 mins"),
                 })
 
             st.dataframe(pd.DataFrame(display_rows), width='stretch')
