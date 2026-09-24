@@ -3641,18 +3641,13 @@ def show_user_page():
                 pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
                 arr_timer        = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
                 # Load arrangements from arrangements table
-                try:
-                    arr_db_resp = supabase.table("arrangements").select("*")\
-                        .eq("order_placed_date", date_str())\
-                        .eq("order_by", st.session_state.name).execute()
-                    arrangements = arr_db_resp.data or []
-                except:
-                    arrangements = arr_timer
+                arr_db_resp = supabase.table("arrangements").select("*")\
+                    .eq("order_placed_date", date_str())\
+                    .eq("order_by", st.session_state.name).execute()
+                arrangements = arr_db_resp.data if arr_db_resp.data else arr_timer
                 total_medicines = sum([int(float(a.get("no_medicines",0) or 0)) for a in arrangements])
                 arr_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in arr_timer])
                 avg_arr = round(arr_duration/len(arr_timer), 1) if arr_timer else 0
-                pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
-
                 total_skus  = sum([int(float((t.get("details") or {}).get("no_sku",0) or 0)) for t in purchase_orders])
                 po_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in purchase_orders])
                 avg_po_sku  = round(po_duration/total_skus, 2) if total_skus > 0 else 0
