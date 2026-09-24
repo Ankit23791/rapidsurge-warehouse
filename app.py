@@ -645,6 +645,8 @@ def form_arrangement():
                                     "medicine_name": med_name,
                                     "quantity": qty
                                 }).execute()
+                        end_time, duration = end_timer("arrangement_order", start)
+                        st.session_state["arr_img"] = None
                         st.success(f"✅ Arrangement #{arr_no} placed successfully!")
                         st.balloons()
                 except Exception as e:
