@@ -3637,25 +3637,25 @@ def show_user_page():
                 tasks = tasks_resp.data or []
 
                 purchase_orders  = [t for t in tasks if t.get("task_type") == "Purchase Order"]
-                arrangements     = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
-                # Also load from arrangements table
+                returns          = [t for t in tasks if t.get("task_type") == "Purchase Return"]
+                pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
+                arr_timer        = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
+                # Load arrangements from arrangements table
                 try:
                     arr_db_resp = supabase.table("arrangements").select("*")\
                         .eq("order_placed_date", date_str())\
                         .eq("order_by", st.session_state.name).execute()
-                    if arr_db_resp.data:
-                        arrangements = arr_db_resp.data
+                    arrangements = arr_db_resp.data or []
                 except:
-                    pass
-                returns          = [t for t in tasks if t.get("task_type") == "Purchase Return"]
+                    arrangements = arr_timer
+                total_medicines = sum([int(float(a.get("no_medicines",0) or 0)) for a in arrangements])
+                arr_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in arr_timer])
+                avg_arr = round(arr_duration/len(arr_timer), 1) if arr_timer else 0
                 pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
 
                 total_skus  = sum([int(float((t.get("details") or {}).get("no_sku",0) or 0)) for t in purchase_orders])
-                total_meds  = sum([int(float((t.get("details") or {}).get("no_medicines",0) or 0)) for t in arrangements])
                 po_duration = sum([int(float(t.get("duration_mins",0) or 0)) for t in purchase_orders])
-                arr_duration= sum([int(float(t.get("duration_mins",0) or 0)) for t in arrangements])
                 avg_po_sku  = round(po_duration/total_skus, 2) if total_skus > 0 else 0
-                avg_arr     = round(arr_duration/len(arrangements), 1) if arrangements else 0
 
                 c1,c2,c3,c4 = st.columns(4)
                 with c1: st.metric("🛒 Purchase Orders", len(purchase_orders))
