@@ -660,6 +660,9 @@ def form_arrangement():
     elif "arr_img" not in st.session_state:
         st.session_state["arr_img"] = None
 
+    # Customer order items to link (optional)
+    link_area, picked_lines = arrangement_line_picker()
+
     with st.form("arrangement_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
@@ -674,10 +677,21 @@ def form_arrangement():
                                             help="Maximum 200 medicines per arrangement")
             order_time    = st.text_input("Order Time", value=time_str())
 
-        medicines = st.text_area("Medicines (one per line) *", placeholder="Medicine 1 - Qty\nMedicine 2 - Qty")
+        medicines = st.text_area("Medicines (one per line)" + ("" if picked_lines else " *"),
+                                 placeholder="Medicine 1 - Qty\nMedicine 2 - Qty" +
+                                 ("\n(optional — ticked customer items are added automatically)" if picked_lines else ""))
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
+            if picked_lines:
+                # Ticked customer items: area comes from them, medicines added automatically
+                area = link_area
+                auto_meds = [f"{p.get('Item','')} {('(' + str(p.get('Pack')) + ')') if p.get('Pack') else ''}".strip()
+                             + f" - {_qty_txt(min(_to_float(p.get('Order Qty'),0), _to_float(p.get('Needed'),0)))}"
+                             for p in picked_lines if _to_float(p.get('Order Qty'),0) > 0]
+                medicines = "\n".join(auto_meds + ([medicines.strip()] if medicines.strip() else []))
+                if not no_medicines:
+                    no_medicines = len([m for m in medicines.split("\n") if m.strip()])
             if not arr_no or not medicines:
                 st.error("Fill Arrangement No and Medicines!")
             elif st.session_state.get("arr_img") is None:
@@ -708,6 +722,8 @@ def form_arrangement():
                             "status": "Pending"
                         }).execute()
                         arr_id = result.data[0]["id"]
+                        if picked_lines:
+                            save_arrangement_links(arr_id, arr_no, distributor, area, picked_lines)
                         for med in medicines.strip().split("\n"):
                             if med.strip():
                                 parts = med.split("-")
@@ -734,7 +750,8 @@ def form_arrangement():
                                         "arrangement_no": arr_no,
                                         "distributor": distributor,
                                         "no_medicines": str(no_medicines),
-                                        "area": area
+                                        "area": area,
+                                        "customer_lines": str(len(picked_lines))
                                     }
                                 }).eq("id", task_resp.data[0]["id"]).execute()
                         except:
@@ -3550,6 +3567,20 @@ def show_user_page():
                 st.session_state.purchase_active_form = "arrangement"
                 st.rerun()
 
+            st.markdown("### 🧾 Customer Orders")
+            if st.button("📥 Import Orders", width='stretch', key="p_import",
+                type="primary" if st.session_state.purchase_active_form=="import" else "secondary"):
+                st.session_state.purchase_active_form = "import"
+                st.rerun()
+            if st.button("🧾 Pending Items", width='stretch', key="p_pending_items",
+                type="primary" if st.session_state.purchase_active_form=="pending_items" else "secondary"):
+                st.session_state.purchase_active_form = "pending_items"
+                st.rerun()
+            if st.button("📊 Order Tracker", width='stretch', key="p_tracker",
+                type="primary" if st.session_state.purchase_active_form=="tracker" else "secondary"):
+                st.session_state.purchase_active_form = "tracker"
+                st.rerun()
+
             st.markdown("### 🔍 Research")
             if st.button("💊 PharmaRack Search", width='stretch', key="p_pharma",
                 type="primary" if st.session_state.purchase_active_form=="pharma" else "secondary"):
@@ -3629,6 +3660,9 @@ def show_user_page():
                 "register":    form_register_entry,
                 "crosscheck":  form_bill_crosscheck,
                 "placement":   form_stock_placement,
+                "import":      form_import_orders,
+                "pending_items": form_pending_items,
+                "tracker":     show_customer_order_tracker,
                 "other":       form_other_task,
             }
             if st.session_state.purchase_active_form in form_map:
@@ -3654,6 +3688,20 @@ def show_user_page():
             with c2:
                 if st.button("💊 PharmaRack", key="mp_pharma", use_container_width=True):
                     st.session_state.purchase_active_form = "pharma"
+                    st.rerun()
+            st.markdown("#### 🧾 Customer Orders")
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                if st.button("📥 Import", key="mp_import", use_container_width=True):
+                    st.session_state.purchase_active_form = "import"
+                    st.rerun()
+            with c2:
+                if st.button("🧾 Pending", key="mp_pending_items", use_container_width=True):
+                    st.session_state.purchase_active_form = "pending_items"
+                    st.rerun()
+            with c3:
+                if st.button("📊 Tracker", key="mp_tracker", use_container_width=True):
+                    st.session_state.purchase_active_form = "tracker"
                     st.rerun()
             st.markdown("#### 🚛 Logistics")
             c1,c2 = st.columns(2)
@@ -3775,6 +3823,10 @@ def show_user_page():
                 type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
                 st.session_state.stock_active_form = "receive"
                 st.rerun()
+            if st.button("✅ Receive Customer Items", width='stretch', key="s_cust_receive",
+                type="primary" if st.session_state.stock_active_form=="cust_receive" else "secondary"):
+                st.session_state.stock_active_form = "cust_receive"
+                st.rerun()
             st.markdown("### ✅ Processing")
             if st.button("✔️ Bill Cross Check", width='stretch', key="s_crosscheck",
                 type="primary" if st.session_state.stock_active_form=="crosscheck" else "secondary"):
@@ -3854,6 +3906,7 @@ def show_user_page():
             form_map = {
                 "register":    form_register_entry,
                 "receive":     form_porter_receive,
+                "cust_receive": form_receive_customer_items,
                 "crosscheck":  form_bill_crosscheck,
                 "upload":      form_bill_upload_arrangement,
                 "placement":   form_stock_placement,
@@ -4093,6 +4146,17 @@ def show_user_page():
                 elif row.get("task_type") == "Register Entry":
                     sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
+                elif row.get("task_type") in ["Order Import","Customer Items Check","Customer Items Received"]:
+                    try:
+                        sku = int(float(details.get("lines",0) or 0))
+                    except:
+                        sku = 0
+                    if row.get("task_type") == "Order Import":
+                        extra = f"{details.get('area','')} | {sku} new items ({details.get('file_lines','')} in file)"
+                    elif row.get("task_type") == "Customer Items Check":
+                        extra = f"{details.get('area','')} | In Store: {details.get('in_store',0)} | Not Available: {details.get('not_available',0)}"
+                    else:
+                        extra = f"{details.get('arrangement_no','')} | Received: {details.get('received',0)} | Short: {details.get('short',0)}"
                 elif row.get("task_type") == "Arrangement Order":
                     arr_no_row = str(details.get("arrangement_no",""))
                     try:
@@ -4295,20 +4359,612 @@ def show_user_page():
     except Exception as e:
         st.error(f"Error: {e}")
 
+# ── CUSTOMER ORDER LINKING ────────────────────────────────────────────────────
+# Backend order-schedule file -> item lines -> Purchase decides (In Store / Not Available / Arrange)
+# -> Stock receives arranged lines -> order is Ready. 3-hour clock starts at upload time.
+
+OPEN_LINE_STATUSES = ["Pending", "Partly Arranged"]
+SELECT_AREA = "— Select Area —"
+
+BACKEND_COLS = {
+    "scheduleddate": "scheduled_date", "date": "scheduled_date",
+    "order": "order_no", "orderno": "order_no", "ordernumber": "order_no", "orderid": "order_no",
+    "customername": "customer_name", "customer": "customer_name",
+    "customerphone": "customer_phone", "phone": "customer_phone", "mobile": "customer_phone",
+    "itemname": "item_name", "medicinename": "item_name", "item": "item_name",
+    "packsize": "pack_size", "pack": "pack_size",
+    "qty": "qty", "quantity": "qty",
+    "rx": "rx", "unitprice": "unit_price", "linetotal": "line_total",
+}
+
+def now_iso():
+    return now_ist().isoformat()
+
+def to_ist(ts):
+    """Supabase timestamp -> IST datetime (or None)"""
+    try:
+        if ts is None or str(ts) in ("", "None", "nan", "NaT"):
+            return None
+        t = pd.to_datetime(ts, utc=True)
+        return t.tz_convert("Asia/Kolkata").to_pydatetime()
+    except Exception:
+        return None
+
+def age_mins(ts, now=None):
+    t = to_ist(ts)
+    if not t:
+        return 0
+    return max(0, int(((now or now_ist()) - t).total_seconds() // 60))
+
+def fmt_age(mins):
+    mins = int(mins or 0)
+    return f"{mins//60}h {mins%60}m" if mins >= 60 else f"{mins}m"
+
+def age_flag(mins):
+    return "🔴" if mins >= 180 else ("🟡" if mins >= 120 else "🟢")
+
+def _norm_col(s):
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+def _clean_str(v):
+    s = str(v if v is not None else "").strip()
+    if s.lower() in ("nan", "none", "nat"):
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+def _to_float(v, default=0.0):
+    try:
+        f = float(str(v).replace(",", "").strip())
+        return default if f != f else f
+    except Exception:
+        return default
+
+def _qty_txt(q):
+    q = float(q or 0)
+    return str(int(q)) if q == int(q) else str(q)
+
+def parse_backend_file(uploaded):
+    """Read the backend order-schedule file (.xlsx / .csv) into clean item lines"""
+    name = uploaded.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(uploaded, dtype=str)
+    else:
+        raw = pd.read_csv(uploaded, dtype=str)
+    rename = {}
+    for c in raw.columns:
+        k = BACKEND_COLS.get(_norm_col(c))
+        if k and k not in rename.values():
+            rename[c] = k
+    df = raw.rename(columns=rename)
+    missing = [c for c in ["order_no", "item_name"] if c not in df.columns]
+    if missing:
+        return [], ("File is missing column(s): " + ", ".join(missing) +
+                    ". Expected headers like: Scheduled Date, Order #, Customer Name, Customer Phone, Item Name, Pack Size, Qty")
+    lines = {}
+    for _, r in df.iterrows():
+        order_no = _clean_str(r.get("order_no"))
+        item = _clean_str(r.get("item_name"))
+        if not order_no or not item:
+            continue
+        pack = _clean_str(r.get("pack_size"))
+        key = f"{order_no}|{item.lower()}|{pack.lower()}"
+        qty = _to_float(r.get("qty"), 1) or 1
+        if key in lines:                       # same item twice in one order -> add qty
+            lines[key]["qty"] += qty
+            continue
+        lines[key] = {
+            "line_key": key,
+            "order_no": order_no,
+            "scheduled_date": _clean_str(r.get("scheduled_date"))[:10],
+            "customer_name": _clean_str(r.get("customer_name")),
+            "customer_phone": _clean_str(r.get("customer_phone")),
+            "item_name": item,
+            "pack_size": pack,
+            "qty": qty,
+            "rx": _clean_str(r.get("rx")),
+            "unit_price": _to_float(r.get("unit_price"), 0),
+            "line_total": _to_float(r.get("line_total"), 0),
+        }
+    return list(lines.values()), None
+
+def _chunks(seq, n):
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+def log_simple_task(task_type, details):
+    """Record an instant task (no timer) so it shows in My Tasks / performance"""
+    try:
+        t = now_ist().strftime("%I:%M:%S %p")
+        supabase.table("daily_tasks").insert({
+            "date": date_str(), "time": time_str(),
+            "person": st.session_state.name, "team": st.session_state.team,
+            "task_type": task_type, "details": details,
+            "start_time": t, "end_time": t, "duration_mins": "0",
+            "status": "Completed"
+        }).execute()
+    except Exception:
+        pass
+
+def import_order_lines(lines, area):
+    """Insert new lines, keep existing ones untouched, flag lines that disappeared"""
+    now = now_iso()
+    keys = [l["line_key"] for l in lines]
+    existing = {}
+    for part in _chunks(keys, 80):
+        resp = supabase.table("customer_order_lines")\
+            .select("id,line_key,area,status,removed,qty").in_("line_key", part).execute()
+        for r in resp.data or []:
+            existing[r["line_key"]] = r
+
+    new_rows, seen_ids, wrong_area = [], [], []
+    restored = qty_changed = 0
+    for l in lines:
+        ex = existing.get(l["line_key"])
+        if not ex:
+            row = dict(l)
+            row.update({"area": area, "status": "Pending", "qty_arranged": 0, "qty_received": 0,
+                        "imported_at": now, "imported_by": st.session_state.name,
+                        "last_seen_at": now, "removed": False})
+            new_rows.append(row)
+            continue
+        if ex.get("area") and ex.get("area") != area:
+            wrong_area.append(f"#{l['order_no']} ({ex.get('area')})")
+            continue
+        if ex.get("removed"):
+            supabase.table("customer_order_lines").update(
+                {"removed": False, "status": "Pending", "last_seen_at": now}).eq("id", ex["id"]).execute()
+            restored += 1
+        elif ex.get("status") == "Pending" and _to_float(ex.get("qty"), 0) != l["qty"]:
+            supabase.table("customer_order_lines").update(
+                {"qty": l["qty"], "last_seen_at": now}).eq("id", ex["id"]).execute()
+            qty_changed += 1
+        else:
+            seen_ids.append(ex["id"])
+
+    for part in _chunks(seen_ids, 100):
+        supabase.table("customer_order_lines").update({"last_seen_at": now}).in_("id", part).execute()
+    for part in _chunks(new_rows, 200):
+        supabase.table("customer_order_lines").insert(part).execute()
+
+    # Lines of the same area + scheduled dates that are no longer in the file -> Removed
+    removed = 0
+    dates = sorted(set(l["scheduled_date"] for l in lines if l["scheduled_date"]))
+    if dates:
+        resp = supabase.table("customer_order_lines").select("id,line_key")\
+            .eq("area", area).eq("status", "Pending").eq("removed", False)\
+            .in_("scheduled_date", dates).execute()
+        file_keys = set(keys)
+        gone = [r["id"] for r in (resp.data or []) if r["line_key"] not in file_keys]
+        for part in _chunks(gone, 100):
+            supabase.table("customer_order_lines").update(
+                {"removed": True, "status": "Removed"}).in_("id", part).execute()
+        removed = len(gone)
+
+    return {"new": len(new_rows), "existing": len(seen_ids), "restored": restored,
+            "qty_changed": qty_changed, "removed": removed, "wrong_area": wrong_area}
+
+def get_open_lines(area=None):
+    q = supabase.table("customer_order_lines").select("*")\
+        .in_("status", OPEN_LINE_STATUSES).eq("removed", False)
+    if area and area not in ("All Areas", SELECT_AREA):
+        q = q.eq("area", area)
+    return q.order("imported_at").order("order_no").execute().data or []
+
+def remaining_qty(line):
+    return max(0.0, _to_float(line.get("qty"), 0) - _to_float(line.get("qty_arranged"), 0))
+
+def refresh_line_status(line_id):
+    """Recalculate a line's status from its arrangement lines"""
+    lr = supabase.table("customer_order_lines").select("*").eq("id", line_id).execute().data
+    if not lr:
+        return
+    line = lr[0]
+    als = supabase.table("arrangement_lines").select("*").eq("line_id", line_id).execute().data or []
+    if not als:
+        return
+    qty = _to_float(line.get("qty"), 0)
+    ordered = sum(_to_float(a.get("qty_ordered"), 0) for a in als)
+    received = sum(_to_float(a.get("qty_received"), 0) for a in als if a.get("status") != "Ordered")
+    waiting = any(a.get("status") == "Ordered" for a in als)
+    upd = {"qty_arranged": ordered, "qty_received": received}
+    if ordered < qty and not line.get("remainder_note"):
+        upd["status"] = "Partly Arranged"
+    elif waiting:
+        upd["status"] = "Arranged"
+    else:
+        upd["status"] = "Received" if received >= ordered else "Short"
+        upd["completed_at"] = now_iso()
+    supabase.table("customer_order_lines").update(upd).eq("id", line_id).execute()
+
+# ── PURCHASE: IMPORT ──────────────────────────────────────────────────────────
+def form_import_orders():
+    st.subheader("📥 Import Customer Orders")
+    st.caption("Upload the order-schedule file from backend — one area at a time. "
+               "Re-uploading the same or a newer file is safe: only new items are added.")
+    area = st.selectbox("Which area / store is this file for? *", [SELECT_AREA] + load_areas(), key="imp_area")
+    up = st.file_uploader("Backend file (.xlsx or .csv)", type=["xlsx", "xls", "csv"],
+                          key=f"imp_file_{st.session_state.get('imp_ver', 0)}")
+    if not up:
+        return
+    try:
+        lines, err = parse_backend_file(up)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        return
+    if err:
+        st.error(err)
+        return
+    if not lines:
+        st.warning("No item lines found in this file.")
+        return
+    n_orders = len(set(l["order_no"] for l in lines))
+    st.info(f"📄 File has **{len(lines)} item lines** in **{n_orders} orders**")
+    prev = pd.DataFrame(lines)[["scheduled_date", "order_no", "customer_name", "item_name", "pack_size", "qty"]]
+    prev.columns = ["Date", "Order #", "Customer", "Item", "Pack", "Qty"]
+    st.dataframe(prev, hide_index=True, width='stretch', height=250)
+
+    if st.button("📥 Import", type="primary", key="imp_go", width='stretch'):
+        if area == SELECT_AREA:
+            st.error("Select the area / store for this file first!")
+            return
+        try:
+            res = import_order_lines(lines, area)
+        except Exception as e:
+            st.error(f"Import failed: {e}")
+            return
+        st.success(f"✅ **{area}**: {res['new']} new items added · {res['existing']} already imported"
+                   + (f" · {res['qty_changed']} qty updated" if res['qty_changed'] else "")
+                   + (f" · {res['restored']} restored" if res['restored'] else ""))
+        if res["removed"]:
+            st.warning(f"🗑️ {res['removed']} pending item(s) are no longer in the backend file — marked **Removed** (cancelled/changed orders).")
+        if res["wrong_area"]:
+            st.error("⚠️ These orders were already imported under a DIFFERENT area and were skipped — "
+                     "check you selected the right area: " + ", ".join(sorted(set(res["wrong_area"]))[:15]))
+        log_simple_task("Order Import", {"area": area, "lines": str(res["new"]),
+                                          "file_lines": str(len(lines)), "orders": str(n_orders)})
+        st.session_state["imp_ver"] = st.session_state.get("imp_ver", 0) + 1
+
+# ── PURCHASE: PENDING ITEMS ───────────────────────────────────────────────────
+def form_pending_items():
+    st.subheader("🧾 Pending Customer Items")
+    st.caption("For each item: 🏪 **In Store** (available, nothing to buy) or ❌ **Not Available** (can't be sourced). "
+               "Items to buy from a distributor → tick them in **📦 Arrangement Order**.")
+    area = st.selectbox("Area", ["All Areas"] + load_areas(), key="pi_area")
+    try:
+        lines = get_open_lines(area)
+    except Exception as e:
+        st.error(f"Could not load items — has the setup SQL been run in Supabase? ({e})")
+        return
+    if not lines:
+        st.success("🎉 No pending customer items!")
+        return
+
+    now = now_ist()
+    rows = []
+    for l in lines:
+        a = age_mins(l.get("imported_at"), now)
+        rows.append({
+            "id": l["id"],
+            "⏰": age_flag(a),
+            "Age": fmt_age(a),
+            "Order #": l.get("order_no", ""),
+            "Customer": l.get("customer_name", ""),
+            "Area": l.get("area", ""),
+            "Item": l.get("item_name", ""),
+            "Pack": l.get("pack_size", ""),
+            "Qty": _qty_txt(remaining_qty(l)),
+            "Status": l.get("status", ""),
+            "Action": "—",
+        })
+    df = pd.DataFrame(rows)
+    late = sum(1 for r in rows if r["⏰"] == "🔴")
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Pending Items", len(rows))
+    with c2: st.metric("Orders", df["Order #"].nunique())
+    with c3: st.metric("🔴 Over 3 hrs", late)
+
+    ver = st.session_state.get("pi_ver", 0)
+    edited = st.data_editor(
+        df, key=f"pi_editor_{ver}", hide_index=True, width='stretch',
+        disabled=[c for c in df.columns if c != "Action"],
+        column_config={
+            "id": None,
+            "Action": st.column_config.SelectboxColumn(
+                "Action", options=["—", "🏪 In Store", "❌ Not Available"], required=True),
+        })
+    chosen = edited[edited["Action"] != "—"]
+    if st.button(f"💾 Save {len(chosen)} decision(s)", type="primary", key="pi_save",
+                 disabled=chosen.empty, width='stretch'):
+        by_id = {l["id"]: l for l in lines}
+        n_store = n_na = 0
+        now_s = now_iso()
+        try:
+            for _, r in chosen.iterrows():
+                line = by_id.get(int(r["id"]))
+                if not line:
+                    continue
+                decision = "In Store" if "In Store" in r["Action"] else "Not Available"
+                if line.get("status") == "Partly Arranged":
+                    # rest of a split line: record what happened to the remainder
+                    supabase.table("customer_order_lines").update({
+                        "remainder_note": decision, "decided_by": st.session_state.name,
+                        "decided_at": now_s}).eq("id", line["id"]).execute()
+                    refresh_line_status(line["id"])
+                else:
+                    supabase.table("customer_order_lines").update({
+                        "status": decision, "decided_by": st.session_state.name,
+                        "decided_at": now_s, "completed_at": now_s}).eq("id", line["id"]).execute()
+                if decision == "In Store":
+                    n_store += 1
+                else:
+                    n_na += 1
+            log_simple_task("Customer Items Check", {"area": area, "lines": str(n_store + n_na),
+                                                     "in_store": str(n_store), "not_available": str(n_na)})
+            st.session_state["pi_ver"] = ver + 1
+            st.success(f"✅ Saved: {n_store} In Store · {n_na} Not Available")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# ── ARRANGEMENT FORM: pick customer lines ────────────────────────────────────
+def arrangement_line_picker():
+    """Shown above the arrangement form. Returns (area, [selected rows])"""
+    ver = st.session_state.get("arr_link_ver", 0)
+    with st.expander("🔗 Customer order items for this distributor", expanded=True):
+        link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
+        if link_area == SELECT_AREA:
+            st.caption("Select an area to see its pending customer items. (You can still type medicines manually below.)")
+            return None, []
+        try:
+            open_lines = get_open_lines(link_area)
+        except Exception as e:
+            st.warning(f"Could not load customer items ({e})")
+            return None, []
+        if not open_lines:
+            st.info("No pending customer items for this area.")
+            return link_area, []
+        now = now_ist()
+        ldf = pd.DataFrame([{
+            "id": l["id"],
+            "Order?": False,
+            "⏰": age_flag(age_mins(l.get("imported_at"), now)),
+            "Order #": l.get("order_no", ""),
+            "Customer": l.get("customer_name", ""),
+            "Item": l.get("item_name", ""),
+            "Pack": l.get("pack_size", ""),
+            "Needed": remaining_qty(l),
+            "Order Qty": remaining_qty(l),
+        } for l in open_lines])
+        ed = st.data_editor(
+            ldf, key=f"arr_link_editor_{ver}", hide_index=True, width='stretch',
+            disabled=["⏰", "Order #", "Customer", "Item", "Pack", "Needed"],
+            column_config={
+                "id": None,
+                "Order?": st.column_config.CheckboxColumn("Order?", help="Tick items you are ordering from this distributor"),
+                "Order Qty": st.column_config.NumberColumn("Order Qty", min_value=0, step=1,
+                                                           help="Change only if this item is split between 2 distributors"),
+            })
+        picked = ed[ed["Order?"] == True].to_dict("records")
+        if picked:
+            st.success(f"✅ {len(picked)} item(s) selected — they will be linked to this arrangement")
+        return link_area, picked
+
+def save_arrangement_links(arr_id, arr_no, distributor, area, picked):
+    now_s = now_iso()
+    for p in picked:
+        qty = min(_to_float(p.get("Order Qty"), 0), _to_float(p.get("Needed"), 0))
+        if qty <= 0:
+            continue
+        supabase.table("arrangement_lines").insert({
+            "arrangement_id": arr_id, "arrangement_no": arr_no, "distributor": distributor,
+            "area": area, "line_id": int(p["id"]), "order_no": str(p.get("Order #", "")),
+            "item_name": p.get("Item", ""), "qty_ordered": qty, "status": "Ordered",
+            "ordered_by": st.session_state.name, "ordered_at": now_s
+        }).execute()
+        refresh_line_status(int(p["id"]))
+    st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
+
+# ── STOCK: RECEIVE CUSTOMER ITEMS ─────────────────────────────────────────────
+def form_receive_customer_items():
+    st.subheader("✅ Receive Customer Items")
+    st.caption("When an arrangement arrives, confirm each customer item: full qty = ✅ Received, less = ⚠️ Short.")
+    area = st.selectbox("Area", ["All Areas"] + load_areas(), key="rc_area")
+    try:
+        q = supabase.table("arrangement_lines").select("*").eq("status", "Ordered")
+        if area != "All Areas":
+            q = q.eq("area", area)
+        als = q.order("ordered_at").execute().data or []
+    except Exception as e:
+        st.error(f"Could not load — has the setup SQL been run in Supabase? ({e})")
+        return
+    if not als:
+        st.success("🎉 Nothing waiting to be received!")
+        return
+    groups = {}
+    for a in als:
+        groups.setdefault(a.get("arrangement_no", ""), []).append(a)
+    labels = {f"#{k} — {v[0].get('distributor','')} — {v[0].get('area','')} — {len(v)} item(s)": k for k, v in groups.items()}
+    sel = st.selectbox("Arrangement", list(labels.keys()), key="rc_arr")
+    items = groups[labels[sel]]
+    ver = st.session_state.get("rc_ver", 0)
+    df = pd.DataFrame([{
+        "id": a["id"], "line_id": a.get("line_id"),
+        "Order #": a.get("order_no", ""), "Item": a.get("item_name", ""),
+        "Ordered": _to_float(a.get("qty_ordered"), 0),
+        "Received": _to_float(a.get("qty_ordered"), 0),
+    } for a in items])
+    ed = st.data_editor(df, key=f"rc_editor_{ver}", hide_index=True, width='stretch',
+                        disabled=["Order #", "Item", "Ordered"],
+                        column_config={"id": None, "line_id": None,
+                                       "Received": st.column_config.NumberColumn("Received", min_value=0, step=1)})
+    if st.button("💾 Save Received", type="primary", key="rc_save", width='stretch'):
+        now_s = now_iso()
+        n_ok = n_short = 0
+        try:
+            for _, r in ed.iterrows():
+                rec = _to_float(r["Received"], 0)
+                status = "Received" if rec >= _to_float(r["Ordered"], 0) else "Short"
+                supabase.table("arrangement_lines").update({
+                    "qty_received": rec, "status": status,
+                    "received_by": st.session_state.name, "received_at": now_s
+                }).eq("id", int(r["id"])).execute()
+                if r.get("line_id") is not None and str(r.get("line_id")) != "nan":
+                    refresh_line_status(int(r["line_id"]))
+                if status == "Received":
+                    n_ok += 1
+                else:
+                    n_short += 1
+            log_simple_task("Customer Items Received", {"arrangement_no": labels[sel], "lines": str(n_ok + n_short),
+                                                        "received": str(n_ok), "short": str(n_short)})
+            st.session_state["rc_ver"] = ver + 1
+            st.success(f"✅ Saved: {n_ok} received · {n_short} short")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# ── ORDER TRACKER ─────────────────────────────────────────────────────────────
+LINE_ICON = {"Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
+             "In Store": "🏪 In Store", "Received": "✅ Received", "Short": "⚠️ Short",
+             "Not Available": "❌ Not Available"}
+
+def order_status(statuses):
+    s = list(statuses)
+    if all(x == "Pending" for x in s):
+        return "⚪ Not Started"
+    if any(x in ("Pending", "Partly Arranged", "Arranged") for x in s):
+        return "🔄 In Progress"
+    if any(x in ("Not Available", "Short") for x in s):
+        return "⚠️ Done – Partial"
+    return "✅ Ready"
+
+def show_customer_order_tracker(kp="trk", show_phone=False):
+    st.subheader("📦 Customer Order Tracker")
+    c1, c2 = st.columns(2)
+    with c1:
+        day = st.date_input("Imported on", value=today_ist(), key=f"{kp}_day")
+    with c2:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    start = IST.localize(datetime(day.year, day.month, day.day))
+    from datetime import timedelta
+    end = start + timedelta(days=1)
+    try:
+        q = supabase.table("customer_order_lines").select("*").eq("removed", False)\
+            .gte("imported_at", start.isoformat()).lt("imported_at", end.isoformat())
+        if area != "All Areas":
+            q = q.eq("area", area)
+        lines = q.execute().data or []
+    except Exception as e:
+        st.error(f"Could not load — has the setup SQL been run in Supabase? ({e})")
+        return
+    if not lines:
+        st.info("No customer orders imported for this day / area.")
+        return
+
+    # arrangement links for distributor names
+    links = {}
+    for part in _chunks([l["id"] for l in lines], 100):
+        for a in supabase.table("arrangement_lines").select("line_id,arrangement_no,distributor")\
+                .in_("line_id", part).execute().data or []:
+            links.setdefault(a["line_id"], []).append(a)
+
+    now = now_ist()
+    orders = {}
+    for l in lines:
+        orders.setdefault(l["order_no"], []).append(l)
+
+    order_rows = []
+    for ono, ls in orders.items():
+        statuses = [l.get("status", "Pending") for l in ls]
+        stt = order_status(statuses)
+        t0 = min([to_ist(l.get("imported_at")) for l in ls if to_ist(l.get("imported_at"))] or [now])
+        done = stt in ("✅ Ready", "⚠️ Done – Partial")
+        t_end = max([to_ist(l.get("completed_at")) for l in ls if to_ist(l.get("completed_at"))] or [now]) if done else now
+        mins = max(0, int((t_end - t0).total_seconds() // 60))
+        row = {
+            "⏰": "🔴" if mins >= 180 else ("🟢" if done else age_flag(mins)),
+            "Order #": ono,
+            "Customer": ls[0].get("customer_name", ""),
+        }
+        if show_phone:
+            row["Phone"] = ls[0].get("customer_phone", "")
+        row.update({
+            "Area": ls[0].get("area", ""),
+            "Items": len(ls),
+            "🏪 Store": statuses.count("In Store"),
+            "📦 Arranged": sum(1 for s in statuses if s in ("Arranged", "Partly Arranged")),
+            "✅ Received": statuses.count("Received"),
+            "⏳ Pending": statuses.count("Pending"),
+            "❌ N/A": statuses.count("Not Available") + statuses.count("Short"),
+            "Status": stt,
+            "Imported": t0.strftime("%I:%M %p"),
+            "Time": fmt_age(mins) + ("" if done else " (running)"),
+            "_mins": mins, "_done": done,
+        })
+        order_rows.append(row)
+
+    odf = pd.DataFrame(order_rows).sort_values(["_done", "_mins"], ascending=[True, False])
+    done_df = odf[odf["_done"]]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1: st.metric("Orders", len(odf))
+    with m2: st.metric("✅ Ready", int((odf["Status"] == "✅ Ready").sum()))
+    with m3: st.metric("🔄 Open", int((~odf["_done"]).sum()))
+    with m4: st.metric("🔴 Over 3 hrs", int((odf["_mins"] >= 180).sum()))
+    with m5: st.metric("Avg Time to Ready", fmt_age(done_df["_mins"].mean()) if not done_df.empty else "—")
+
+    status_filter = st.multiselect("Show status", sorted(odf["Status"].unique()), default=[], key=f"{kp}_st",
+                                   placeholder="All statuses")
+    view = odf if not status_filter else odf[odf["Status"].isin(status_filter)]
+    st.dataframe(view.drop(columns=["_mins", "_done"]), hide_index=True, width='stretch')
+
+    # line level + export
+    line_rows = []
+    for l in sorted(lines, key=lambda x: (x.get("order_no", ""), x.get("item_name", ""))):
+        ls = links.get(l["id"], [])
+        line_rows.append({
+            "Scheduled Date": l.get("scheduled_date", ""),
+            "Order #": l.get("order_no", ""),
+            "Customer Name": l.get("customer_name", ""),
+            "Customer Phone": l.get("customer_phone", "") if show_phone else "",
+            "Item Name": l.get("item_name", ""),
+            "Pack Size": l.get("pack_size", ""),
+            "Qty": _qty_txt(l.get("qty")),
+            "Distributor Name": ", ".join(sorted(set(a.get("distributor", "") for a in ls))),
+            "ARR No": ", ".join(sorted(set(a.get("arrangement_no", "") for a in ls))),
+            "Area": l.get("area", ""),
+            "Status": LINE_ICON.get(l.get("status", ""), l.get("status", "")),
+            "Checked By": l.get("decided_by", "") or "",
+        })
+    ldf = pd.DataFrame(line_rows)
+    if not show_phone:
+        ldf = ldf.drop(columns=["Customer Phone"])
+    with st.expander("🔍 Item-level detail"):
+        st.dataframe(ldf, hide_index=True, width='stretch')
+    st.download_button("⬇️ Download (with Distributor Name filled)", ldf.to_csv(index=False).encode("utf-8"),
+                       file_name=f"customer-orders-{day}-{area.replace(' ', '_')}.csv", mime="text/csv",
+                       key=f"{kp}_dl")
+
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Dashboard",
         "🔄 Pipeline",
         "📈 Performance",
         "📝 Submit Entry",
         "👥 Settings",
-        "📥 Reports"
+        "📥 Reports",
+        "📦 Customer Orders"
     ])
+
+    with tab7:
+        show_customer_order_tracker("adm", show_phone=True)
 
     with tab1:
         try:
