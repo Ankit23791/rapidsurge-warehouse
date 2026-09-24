@@ -427,19 +427,25 @@ def timer_button(key, task_name=None):
                 st.rerun()
         return st.session_state[sk]
 
-def end_timer(key, start_time):
+def end_timer(key, start_time, keep_record=False):
     end = now_ist()
     duration = int((end - start_time).total_seconds() / 60)
     st.session_state[f"{key}_start"] = None
-    # Update In Progress record to Completed
     task_id = st.session_state.get(f"{key}_task_id")
     if task_id:
         try:
-            supabase.table("daily_tasks").update({
-                "end_time": end.strftime("%I:%M %p"),
-                "duration_mins": str(duration),
-                "status": "Completed"
-            }).eq("id", task_id).execute()
+            if keep_record:
+                # Form has no row of its own -> turn the In Progress record into the final one
+                supabase.table("daily_tasks").update({
+                    "end_time": end.strftime("%I:%M %p"),
+                    "duration_mins": str(duration),
+                    "status": "Completed"
+                }).eq("id", task_id).execute()
+            else:
+                # Form saves its own full row -> remove the empty In Progress placeholder
+                # (this was creating a duplicate empty entry for every task)
+                supabase.table("daily_tasks").delete()\
+                    .eq("id", task_id).eq("status", "In Progress").execute()
         except:
             pass
         st.session_state[f"{key}_task_id"] = None
@@ -461,6 +467,9 @@ def form_purchase_order():
             urgency     = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="po_urgency")
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
+            if no_sku < 1:
+                st.error("Enter No of SKUs (at least 1)!")
+                return
             end_time, duration = end_timer("purchase_order", start)
             try:
                 supabase.table("daily_tasks").insert({
@@ -671,7 +680,7 @@ def form_arrangement():
                                     "medicine_name": med_name,
                                     "quantity": qty
                                 }).execute()
-                        end_time, duration = end_timer("arrangement_order", start)
+                        end_time, duration = end_timer("arrangement_order", start, keep_record=True)
                         # Update task with medicines count - find by person and date
                         try:
                             task_resp = supabase.table("daily_tasks").select("id")\
@@ -725,16 +734,18 @@ def form_bill_upload():
                 st.error("Fill Bill Number!")
             else:
                 img_name = upload_image(img, "bill") if img else ""
+                end_time, duration = end_timer("bill_upload_normal", start)
                 try:
                     supabase.table("daily_tasks").insert({
                         "date": date_str(), "time": time_str(),
                         "person": st.session_state.name, "team": "Stock",
                         "task_type": "Bill Upload",
+                        "duration_mins": str(duration), "status": "Completed",
                         "details": {"distributor": distributor, "bill_no": bill_no,
                                    "bill_date": str(bill_date), "delivery_by": delivery_by,
                                    "order_type": order_type, "image": img_name,
                                    "remarks": remarks, "check_status": "Unchecked"},
-                        "start_time": time_str(), "end_time": time_str()
+                        "start_time": start.strftime("%I:%M %p"), "end_time": end_time
                     }).execute()
                     st.success("✅ Bill uploaded successfully!")
                     st.balloons()
@@ -4054,7 +4065,7 @@ def show_user_page():
                     extra = details.get("distributor","") or details.get("task_name","")
 
                 avg = round(duration/sku, 1) if sku > 0 and duration > 0 else 0
-                per_med_types = ["Stock Placement","Arrangement Order"]
+                per_med_types = ["Stock Placement","Arrangement Order","Purchase Order"]
                 if row.get("task_type") in per_med_types:
                     avg_secs = round(duration*60/sku, 1) if sku > 0 and duration > 0 else 0
                 total_sku += sku
@@ -4064,13 +4075,14 @@ def show_user_page():
                 if row.get("task_type") == "Call Log":
                     count_label = "Calls Made"
                     avg_label   = "Avg mins/Call"
-                elif row.get("task_type") == "Purchase Order":
-                    count_label = "SKUs Ordered"
-                    avg_label   = "Avg mins/SKU"
+                elif row.get("task_type") in ["Purchase Order","Arrangement Order"]:
+                    # Same columns for normal orders (SKUs) and arrangements (medicines)
+                    count_label = "SKUs / Medicines"
+                    avg_label   = "Avg secs/Item"
                 elif row.get("task_type") in ["Bill Cross Check","Register Entry"]:
                     count_label = "Items"
                     avg_label   = "Avg mins/Item"
-                elif row.get("task_type") in ["Stock Placement","Arrangement Order"]:
+                elif row.get("task_type") == "Stock Placement":
                     count_label = "Medicines"
                     avg_label   = "Avg secs/Med"
                 else:
