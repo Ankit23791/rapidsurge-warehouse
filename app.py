@@ -145,7 +145,7 @@ def load_users():
 USERS = load_users()
 
 DISTRIBUTORS = [
-    "Acorns Health Solutions Private Limited","Admire Enterprises","Zonne Ventures Pvt Ltd"
+    "Acorns Health Solutions Private Limited","Admire Enterprises","Zone Ventures Put Ltd",
     "Amar Drugs Distributors","Amarjeet Medical Hall","Ankit Enterprises",
     "Ar Kay Medicos Private Limited","Bawa Medical Store","Bhakti Enterprises",
     "D. C. Agencies Private Limited","Digipharms","Evara Life Sciences Llp",
@@ -3638,6 +3638,15 @@ def show_user_page():
 
                 purchase_orders  = [t for t in tasks if t.get("task_type") == "Purchase Order"]
                 arrangements     = [t for t in tasks if t.get("task_type") == "Arrangement Order"]
+                # Also load from arrangements table
+                try:
+                    arr_db_resp = supabase.table("arrangements").select("*")\
+                        .eq("order_placed_date", date_str())\
+                        .eq("order_by", st.session_state.name).execute()
+                    if arr_db_resp.data:
+                        arrangements = arr_db_resp.data
+                except:
+                    pass
                 returns          = [t for t in tasks if t.get("task_type") == "Purchase Return"]
                 pharmarack       = [t for t in tasks if t.get("task_type") == "PharmaRack Search"]
 
