@@ -494,6 +494,7 @@ def form_purchase_order():
         c1,c2 = st.columns(2)
         with c1:
             distributor = st.selectbox("Distributor *", DISTRIBUTORS, key="po_dist")
+            po_area     = st.selectbox("Area / Store *", ["— Select Area —"] + load_areas(), key="po_area")
             order_type  = st.selectbox("Order Type", ["Regular","Arrangement"], key="po_type")
             no_sku      = st.number_input("No of SKUs", min_value=0, step=1)
         with c2:
@@ -501,6 +502,9 @@ def form_purchase_order():
             urgency     = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="po_urgency")
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
+            if po_area == "— Select Area —":
+                st.error("Select the Area / Store for this order!")
+                return
             if no_sku < 1:
                 st.error("Enter No of SKUs (at least 1)!")
                 return
@@ -510,7 +514,7 @@ def form_purchase_order():
                     "date": date_str(), "time": time_str(),
                     "person": st.session_state.name, "team": "Purchase",
                     "task_type": "Purchase Order",
-                    "details": {"distributor": distributor, "order_type": order_type,
+                    "details": {"distributor": distributor, "area": po_area, "order_type": order_type,
                                "no_sku": str(no_sku), "mode": mode, "urgency": urgency,
                                "remarks": remarks},
                     "start_time": start.strftime("%I:%M:%S %p"),
@@ -4065,7 +4069,9 @@ def show_user_page():
                     except:
                         sku = 0
                     po_dist = details.get("distributor","")
-                    extra = f"{po_dist} | SKUs: {sku}" if po_dist else f"SKUs: {sku}"
+                    po_area_txt = details.get("area","")
+                    parts = [p for p in [po_dist, po_area_txt] if p]
+                    extra = " | ".join(parts + [f"SKUs: {sku}"])
                 elif row.get("task_type") == "Bill Cross Check":
                     sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku}"
@@ -5371,6 +5377,7 @@ def show_admin_page():
                         if area_name:
                             try:
                                 supabase.table("areas").insert({"name": area_name}).execute()
+                                load_areas.clear()
                                 st.success(f"✅ {area_name} added!")
                                 st.rerun()
                             except Exception as e:
@@ -5385,6 +5392,7 @@ def show_admin_page():
                             with c2:
                                 if st.button("Remove", key=f"rm_area_{area['id']}"):
                                     supabase.table("areas").update({"active": False}).eq("id", area["id"]).execute()
+                                    load_areas.clear()
                                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
