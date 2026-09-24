@@ -676,7 +676,7 @@ def form_arrangement():
                                     "details": {
                                         "arrangement_no": arr_no,
                                         "distributor": distributor,
-                                        "no_medicines": str(len(medicines)),
+                                        "no_medicines": str(no_medicines),
                                         "area": area
                                     }
                                 }).eq("id", task_resp.data[0]["id"]).execute()
@@ -3982,6 +3982,8 @@ def show_user_page():
                 "status": a.get("status","Pending")
             })
         
+        arr_meds_lookup = {str(a.get("arrangement_no","")): a.get("no_medicines","0") for a in (arr_resp.data or [])}
+
         # Combine all - don't add arr_tasks to avoid duplicates
         all_data = (resp.data or []) + inprogress_data
         if resp.data:
@@ -4030,6 +4032,13 @@ def show_user_page():
                 elif row.get("task_type") == "Register Entry":
                     sku = int(float(details.get("no_items",0) or 0))
                     extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
+                elif row.get("task_type") == "Arrangement Order":
+                    arr_no_row = str(details.get("arrangement_no",""))
+                    try:
+                        sku = int(float(arr_meds_lookup.get(arr_no_row, details.get("no_medicines",0)) or 0))
+                    except:
+                        sku = 0
+                    extra = f"#{arr_no_row} | {details.get('distributor','')}" if arr_no_row else details.get("distributor","")
                 else:
                     sku = 0
                     extra = details.get("distributor","") or details.get("task_name","")
@@ -4048,7 +4057,7 @@ def show_user_page():
                 elif row.get("task_type") in ["Bill Cross Check","Register Entry"]:
                     count_label = "Items"
                     avg_label   = "Avg mins/Item"
-                elif row.get("task_type") == "Stock Placement":
+                elif row.get("task_type") in ["Stock Placement","Arrangement Order"]:
                     count_label = "Medicines"
                     avg_label   = "Avg mins/Med"
                 else:
@@ -4119,17 +4128,16 @@ def show_user_page():
             elif team == "Purchase":
                 # Calculate purchase metrics
                 normal_orders = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Order"]
-                arrangements  = [row for _, row in df.iterrows() if row.get("task_type") == "Arrangement"]
+                arrangements  = [row for _, row in df.iterrows() if row.get("task_type") == "Arrangement Order" and row.get("status") != "In Progress"]
                 pharmarack    = [row for _, row in df.iterrows() if row.get("task_type") == "PharmaRack Search"]
                 returns       = [row for _, row in df.iterrows() if row.get("task_type") == "Purchase Return"]
 
                 # SKU metrics
-                total_skus = sum([int((row.get("details") or {}).get("no_sku",0) or 0) for row in normal_orders])
-                avg_sku_per_min = round(total_skus/total_duration, 2) if total_duration > 0 and total_skus > 0 else 0
-
+                total_skus = sum([int(float((row.get("details") or {}).get("no_sku",0) or 0)) for row in normal_orders])
                 # Avg time per order type
-                normal_duration = sum([int(row.get("duration_mins",0) or 0) for row in normal_orders])
-                arr_duration    = sum([int(row.get("duration_mins",0) or 0) for row in arrangements])
+                normal_duration = sum([int(float(row.get("duration_mins",0) or 0)) for row in normal_orders])
+                avg_sku_per_min = round(total_skus/normal_duration, 2) if normal_duration > 0 and total_skus > 0 else 0
+                arr_duration    = sum([int(float(row.get("duration_mins",0) or 0)) for row in arrangements])
                 avg_normal_time = round(normal_duration/len(normal_orders), 1) if normal_orders else 0
                 avg_arr_time    = round(arr_duration/len(arrangements), 1) if arrangements else 0
 
