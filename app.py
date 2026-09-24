@@ -390,6 +390,22 @@ def timer_button(key, task_name=None):
         st.info("👆 Click START when you begin this task")
         if st.button("▶️ Start", key=f"btn_{key}", type="primary"):
             st.session_state[sk] = now_ist()
+            # Save In Progress record to daily_tasks
+            try:
+                result = supabase.table("daily_tasks").insert({
+                    "date": date_str(),
+                    "time": time_str(),
+                    "person": st.session_state.name,
+                    "team": st.session_state.team,
+                    "task_type": task_name or key.replace("_"," ").title(),
+                    "status": "In Progress",
+                    "start_time": now_ist().strftime("%I:%M %p"),
+                    "details": {}
+                }).execute()
+                if result.data:
+                    st.session_state[f"{key}_task_id"] = result.data[0]["id"]
+            except:
+                pass
             st.rerun()
         return None
     else:
