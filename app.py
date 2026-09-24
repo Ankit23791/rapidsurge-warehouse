@@ -581,6 +581,17 @@ def form_arrangement():
 
     st.info(f"🔢 Auto Arrangement No: **{auto_arr_no}**")
 
+    st.markdown("📸 **Image of Order**")
+    upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="arr_radio")
+    if upload_opt == "Upload":
+        arr_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="arr_upload")
+    else:
+        arr_img = st.camera_input("Take Photo", key="arr_cam")
+    if arr_img:
+        st.session_state["arr_img"] = arr_img
+    elif "arr_img" not in st.session_state:
+        st.session_state["arr_img"] = None
+
     with st.form("arrangement_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
@@ -595,18 +606,12 @@ def form_arrangement():
             order_time    = st.text_input("Order Time", value=time_str())
 
         medicines = st.text_area("Medicines (one per line) *", placeholder="Medicine 1 - Qty\nMedicine 2 - Qty")
-        st.markdown("📸 **Image of Order**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="arr_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="arr_upload")
-        else:
-            img = st.camera_input("Take Photo", key="arr_cam")
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not arr_no or not medicines:
                 st.error("Fill Arrangement No and Medicines!")
-            elif img is None:
+            elif st.session_state.get("arr_img") is None:
                 st.error("⚠️ Image of order is mandatory! Please upload or take photo.")
             else:
                 # Check duplicate arrangement number
@@ -618,7 +623,7 @@ def form_arrangement():
                     if check.data:
                         st.error(f"❌ Arrangement No #{arr_no} already exists! Please use a different number.")
                     else:
-                        img_name = upload_image(img, "arr") if img else ""
+                        img_name = upload_image(st.session_state.get("arr_img"), "arr") if st.session_state.get("arr_img") else ""
                         result = supabase.table("arrangements").insert({
                             "arrangement_no": arr_no,
                             "distributor": distributor,
