@@ -4042,6 +4042,7 @@ def show_user_page():
             })
         
         arr_meds_lookup = {str(a.get("arrangement_no","")): a.get("no_medicines","0") for a in (arr_resp.data or [])}
+        arr_area_lookup = {str(a.get("arrangement_no","")): a.get("area","") for a in (arr_resp.data or [])}
 
         # Combine all - don't add arr_tasks to avoid duplicates
         all_data = (resp.data or []) + inprogress_data
@@ -4098,7 +4099,9 @@ def show_user_page():
                         sku = int(float(arr_meds_lookup.get(arr_no_row, details.get("no_medicines",0)) or 0))
                     except:
                         sku = 0
-                    extra = f"#{arr_no_row} | {details.get('distributor','')}" if arr_no_row else details.get("distributor","")
+                    arr_area_txt = arr_area_lookup.get(arr_no_row) or details.get("area","")
+                    parts = [f"#{arr_no_row}" if arr_no_row else "", details.get("distributor",""), arr_area_txt]
+                    extra = " | ".join([p for p in parts if p])
                 else:
                     sku = 0
                     extra = details.get("distributor","") or details.get("task_name","")
