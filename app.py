@@ -1658,11 +1658,39 @@ def form_register_entry():
     st.subheader("📒 Register Entry")
     st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
 
+    # Order type + arrangement picker OUTSIDE the form so the ARR list appears immediately
+    order_type = st.radio("Order Type *", ["Normal Order","Arrangement"], horizontal=True, key="re_type")
+    arr_no, arr_dist, arr_area = "", None, None
+    if order_type == "Arrangement":
+        try:
+            from datetime import timedelta
+            two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+            resp = supabase.table("arrangements").select("*")\
+                .eq("status", "Reached Warehouse")\
+                .gte("order_placed_date", two_days_ago)\
+                .execute()
+            reg_done = supabase.table("daily_tasks").select("details")\
+                .eq("task_type", "Register Entry").gte("date", two_days_ago).execute()
+            registered = set(str((t.get("details") or {}).get("arrangement_no","")) for t in (reg_done.data or []))
+            arr_list = [a for a in (resp.data or []) if str(a.get("arrangement_no","")) not in registered]
+            if arr_list:
+                arr_map = {f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a for a in arr_list}
+                arr_select = st.selectbox("Arrangement No *", ["— Select Arrangement —"] + list(arr_map.keys()), key="re_arr")
+                if arr_select in arr_map:
+                    arr_no   = str(arr_map[arr_select].get("arrangement_no",""))
+                    arr_dist = arr_map[arr_select].get("distributor")
+                    arr_area = arr_map[arr_select].get("area")
+            else:
+                st.warning("No arrangements waiting for register entry. The ARR must first be marked "
+                           "'Reached Warehouse' in 📦 Receive Porter.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
     with st.form("register_entry_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
-            order_type  = st.selectbox("Order Type *", ["Normal Order","Arrangement"], key="re_type")
-            distributor = st.selectbox("Distributor *", DISTRIBUTORS, key="re_dist")
+            dist_idx    = DISTRIBUTORS.index(arr_dist) if arr_dist in DISTRIBUTORS else 0
+            distributor = st.selectbox("Distributor *", DISTRIBUTORS, index=dist_idx, key=f"re_dist_{arr_no}")
             bill_no     = st.text_input("Bill Number *")
         with c2:
             no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
@@ -1673,9 +1701,11 @@ def form_register_entry():
             except:
                 area_options = ["Gaur City","Sector 78","Indirapuram"]
             default_re_area = 0
-            if st.session_state.get("work_area") and st.session_state.work_area in area_options:
+            if arr_area and arr_area in area_options:
+                default_re_area = area_options.index(arr_area)
+            elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
                 default_re_area = area_options.index(st.session_state.work_area)
-            re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key="re_area")
+            re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}")
 
         st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
         st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
@@ -1685,33 +1715,14 @@ def form_register_entry():
         else:
             invoice_img = st.camera_input("Take Photo of Packet", key="re_cam")
 
-        # Show arrangement dropdown if arrangement selected
-        arr_no = ""
-        if order_type == "Arrangement":
-            try:
-                from datetime import timedelta
-                two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-                resp = supabase.table("arrangements").select("*")\
-                    .eq("status", "Reached Warehouse")\
-                    .gte("order_placed_date", two_days_ago)\
-                    .execute()
-                arr_list = resp.data if resp.data else []
-                if arr_list:
-                    arr_options = ["—"] + [f"#{a.get('arrangement_no')} — {a.get('distributor','')}" for a in arr_list]
-                    arr_select = st.selectbox("Arrangement No", arr_options, key="re_arr")
-                    if arr_select != "—":
-                        arr_no = arr_select.split("—")[0].replace("#","").strip()
-                else:
-                    st.info("No arrangements found!")
-            except Exception as e:
-                st.error(f"Error: {e}")
-
         bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
         remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
 
         if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
             if not bill_no or no_items == 0:
                 st.error("Fill Bill Number and No of Items!")
+            elif order_type == "Arrangement" and not arr_no:
+                st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
             elif not invoice_img:
                 st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
             else:
@@ -1799,12 +1810,14 @@ def form_bill_crosscheck():
         # Cross checked bills
         crossed = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Bill Cross Check")\
+            .gte("date", two_days_ago)\
             .execute()
         crossed_bills = [t.get("details",{}).get("bill_no","") for t in (crossed.data or [])]
 
         # Normal orders pending cross check
         normal_pending = [t for t in (reg_pending.data or [])
             if not t.get("details",{}).get("cross_checked")
+            and not t.get("details",{}).get("arrangement_no")      # arrangement bills are checked via their ARR
             and t.get("details",{}).get("bill_no","") not in crossed_bills]
 
         # Apply work area filter from session state
@@ -1911,8 +1924,9 @@ def form_bill_crosscheck():
             .execute()
         normal_orders = normal_resp.data if normal_resp.data else []
         # Filter out already cross checked
-        normal_orders = [n for n in normal_orders 
-                        if not n.get("details",{}).get("cross_checked")]
+        normal_orders = [n for n in normal_orders
+                        if not n.get("details",{}).get("cross_checked")
+                        and not n.get("details",{}).get("arrangement_no")]   # arrangement bills are checked via their ARR
         # Apply area filter
         if bc_area != "All Areas":
             normal_orders = [n for n in normal_orders 
@@ -1940,19 +1954,37 @@ def form_bill_crosscheck():
         d = n.get("details",{})
         arr_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
-    with st.form("bill_crosscheck_form", clear_on_submit=True):
-        selected_label = st.selectbox("Select Item *", list(arr_options.keys()), key="bc_arr")
-        selected_item  = arr_options[selected_label]
-        item_type      = selected_item["type"]
-        selected_data  = selected_item["data"]
+    # Selection OUTSIDE the form so details + bill number update when a different bill is picked
+    selected_label = st.selectbox("Select Item *", list(arr_options.keys()), key="bc_arr")
+    selected_item  = arr_options[selected_label]
+    item_type      = selected_item["type"]
+    selected_data  = selected_item["data"]
 
-        if item_type == "arrangement":
-            st.info(f"📋 Distributor: **{selected_data.get('distributor','')}** | Area: **{selected_data.get('area','')}** | Arrangement: **{selected_data.get('arrangement_no','')}**")
-            bill_no = st.text_input("Bill Number", value=selected_data.get("bill_order_id",""))
-        else:
-            d = selected_data.get("details",{})
-            st.info(f"📋 Distributor: **{d.get('distributor','')}** | Bill: **{d.get('bill_no','')}** | Items: **{d.get('no_items','')}** | Amount: ₹**{d.get('bill_amount','')}**")
-            bill_no = st.text_input("Bill Number", value=d.get("bill_no",""))
+    if item_type == "arrangement":
+        st.info(f"📋 Distributor: **{selected_data.get('distributor','')}** | Area: **{selected_data.get('area','')}** | Arrangement: **{selected_data.get('arrangement_no','')}**")
+        # Bill number from Register Entry of this ARR (fallback: bill/order id typed at ARR creation)
+        default_bill = selected_data.get("bill_order_id","") or ""
+        try:
+            re_rows = supabase.table("daily_tasks").select("details")\
+                .eq("task_type", "Register Entry")\
+                .gte("date", (bc_date - timedelta(days=3)).strftime("%Y-%m-%d")).execute().data or []
+            for t in re_rows:
+                dd = t.get("details") or {}
+                if str(dd.get("arrangement_no","")) == str(selected_data.get("arrangement_no","")) and dd.get("bill_no"):
+                    default_bill = dd.get("bill_no")
+                    break
+        except Exception:
+            pass
+    else:
+        d = selected_data.get("details",{})
+        st.info(f"📋 Distributor: **{d.get('distributor','')}** | Bill: **{d.get('bill_no','')}** | Items: **{d.get('no_items','')}** | Amount: ₹**{d.get('bill_amount','')}**")
+        default_bill = d.get("bill_no","")
+
+    # Customer order items linked to this arrangement -> confirm received qty here
+    cust_items = customer_items_editor(selected_data) if item_type == "arrangement" else None
+
+    with st.form("bill_crosscheck_form", clear_on_submit=True):
+        bill_no = st.text_input("Bill Number", value=default_bill, key=f"bc_billno_{item_type}_{selected_data.get('id','')}")
 
         c1,c2,c3 = st.columns(3)
         with c1:
@@ -2002,6 +2034,9 @@ def form_bill_crosscheck():
                     }).eq("id", selected_data["id"]).execute()
                     dist = selected_data.get("distributor","")
                     arr_no = selected_data.get("arrangement_no","")
+                    if cust_items is not None and not cust_items.empty:
+                        n_ok, n_short = save_customer_receipts(cust_items)
+                        st.info(f"🧾 Customer items: {n_ok} received · {n_short} short")
                 else:
                     # Mark normal order as cross checked
                     d = selected_data.get("details",{})
@@ -3020,12 +3055,12 @@ def show_user_page():
                             with c4: st.markdown(f"🚚 **Pickup:** {arr.get('pickup_type','')}")
                             st.divider()
                             try:
-                                pickup_resp = supabase.table("daily_tasks").select("*").eq("task_type","Pickup").execute()
+                                pickup_resp = supabase.table("daily_tasks").select("*").eq("task_type","Pickup").order("id", desc=True).limit(1000).execute()
                                 pickup_data = next((p for p in (pickup_resp.data or []) if p.get("details",{}).get("arrangement_no","") == arr.get("arrangement_no","")), None)
                             except:
                                 pickup_data = None
                             try:
-                                porter_resp = supabase.table("porter_bookings").select("*").execute()
+                                porter_resp = supabase.table("porter_bookings").select("*").order("id", desc=True).limit(1000).execute()
                                 porter_data = next((p for p in (porter_resp.data or []) if arr.get("arrangement_no","") in str(p.get("arrangement_nos",""))), None)
                             except:
                                 porter_data = None
@@ -3580,6 +3615,10 @@ def show_user_page():
                 type="primary" if st.session_state.purchase_active_form=="tracker" else "secondary"):
                 st.session_state.purchase_active_form = "tracker"
                 st.rerun()
+            if st.button("🧾 Bills Register", width='stretch', key="p_bills",
+                type="primary" if st.session_state.purchase_active_form=="bills" else "secondary"):
+                st.session_state.purchase_active_form = "bills"
+                st.rerun()
 
             st.markdown("### 🔍 Research")
             if st.button("💊 PharmaRack Search", width='stretch', key="p_pharma",
@@ -3663,6 +3702,7 @@ def show_user_page():
                 "import":      form_import_orders,
                 "pending_items": form_pending_items,
                 "tracker":     show_customer_order_tracker,
+                "bills":       show_bills_register,
                 "other":       form_other_task,
             }
             if st.session_state.purchase_active_form in form_map:
@@ -3703,6 +3743,9 @@ def show_user_page():
                 if st.button("📊 Tracker", key="mp_tracker", use_container_width=True):
                     st.session_state.purchase_active_form = "tracker"
                     st.rerun()
+            if st.button("🧾 Bills Register", key="mp_bills", use_container_width=True):
+                st.session_state.purchase_active_form = "bills"
+                st.rerun()
             st.markdown("#### 🚛 Logistics")
             c1,c2 = st.columns(2)
             with c1:
@@ -3823,10 +3866,6 @@ def show_user_page():
                 type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
                 st.session_state.stock_active_form = "receive"
                 st.rerun()
-            if st.button("✅ Receive Customer Items", width='stretch', key="s_cust_receive",
-                type="primary" if st.session_state.stock_active_form=="cust_receive" else "secondary"):
-                st.session_state.stock_active_form = "cust_receive"
-                st.rerun()
             st.markdown("### ✅ Processing")
             if st.button("✔️ Bill Cross Check", width='stretch', key="s_crosscheck",
                 type="primary" if st.session_state.stock_active_form=="crosscheck" else "secondary"):
@@ -3906,7 +3945,6 @@ def show_user_page():
             form_map = {
                 "register":    form_register_entry,
                 "receive":     form_porter_receive,
-                "cust_receive": form_receive_customer_items,
                 "crosscheck":  form_bill_crosscheck,
                 "upload":      form_bill_upload_arrangement,
                 "placement":   form_stock_placement,
@@ -4767,63 +4805,46 @@ def save_arrangement_links(arr_id, arr_no, distributor, area, picked):
         refresh_line_status(int(p["id"]))
     st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
 
-# ── STOCK: RECEIVE CUSTOMER ITEMS ─────────────────────────────────────────────
-def form_receive_customer_items():
-    st.subheader("✅ Receive Customer Items")
-    st.caption("When an arrangement arrives, confirm each customer item: full qty = ✅ Received, less = ⚠️ Short.")
-    area = st.selectbox("Area", ["All Areas"] + load_areas(), key="rc_area")
+# ── STOCK: CONFIRM CUSTOMER ITEMS (inside Bill Cross Check) ───────────────────
+def customer_items_editor(arr):
+    """Show customer items linked to this ARR; returns the edited table (or None)"""
     try:
-        q = supabase.table("arrangement_lines").select("*").eq("status", "Ordered")
-        if area != "All Areas":
-            q = q.eq("area", area)
-        als = q.order("ordered_at").execute().data or []
-    except Exception as e:
-        st.error(f"Could not load — has the setup SQL been run in Supabase? ({e})")
-        return
+        als = supabase.table("arrangement_lines").select("*")\
+            .eq("arrangement_no", str(arr.get("arrangement_no",""))).eq("status", "Ordered").execute().data or []
+    except Exception:
+        return None
     if not als:
-        st.success("🎉 Nothing waiting to be received!")
-        return
-    groups = {}
-    for a in als:
-        groups.setdefault(a.get("arrangement_no", ""), []).append(a)
-    labels = {f"#{k} — {v[0].get('distributor','')} — {v[0].get('area','')} — {len(v)} item(s)": k for k, v in groups.items()}
-    sel = st.selectbox("Arrangement", list(labels.keys()), key="rc_arr")
-    items = groups[labels[sel]]
-    ver = st.session_state.get("rc_ver", 0)
+        return None
+    st.markdown(f"🧾 **Customer order items in this arrangement ({len(als)})** — change *Received* only if less arrived")
     df = pd.DataFrame([{
         "id": a["id"], "line_id": a.get("line_id"),
         "Order #": a.get("order_no", ""), "Item": a.get("item_name", ""),
         "Ordered": _to_float(a.get("qty_ordered"), 0),
         "Received": _to_float(a.get("qty_ordered"), 0),
-    } for a in items])
-    ed = st.data_editor(df, key=f"rc_editor_{ver}", hide_index=True, width='stretch',
-                        disabled=["Order #", "Item", "Ordered"],
-                        column_config={"id": None, "line_id": None,
-                                       "Received": st.column_config.NumberColumn("Received", min_value=0, step=1)})
-    if st.button("💾 Save Received", type="primary", key="rc_save", width='stretch'):
-        now_s = now_iso()
-        n_ok = n_short = 0
-        try:
-            for _, r in ed.iterrows():
-                rec = _to_float(r["Received"], 0)
-                status = "Received" if rec >= _to_float(r["Ordered"], 0) else "Short"
-                supabase.table("arrangement_lines").update({
-                    "qty_received": rec, "status": status,
-                    "received_by": st.session_state.name, "received_at": now_s
-                }).eq("id", int(r["id"])).execute()
-                if r.get("line_id") is not None and str(r.get("line_id")) != "nan":
-                    refresh_line_status(int(r["line_id"]))
-                if status == "Received":
-                    n_ok += 1
-                else:
-                    n_short += 1
-            log_simple_task("Customer Items Received", {"arrangement_no": labels[sel], "lines": str(n_ok + n_short),
-                                                        "received": str(n_ok), "short": str(n_short)})
-            st.session_state["rc_ver"] = ver + 1
-            st.success(f"✅ Saved: {n_ok} received · {n_short} short")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error: {e}")
+    } for a in als])
+    return st.data_editor(df, key=f"bc_cust_{arr.get('id','')}", hide_index=True, width='stretch',
+                          disabled=["Order #", "Item", "Ordered"],
+                          column_config={"id": None, "line_id": None,
+                                         "Received": st.column_config.NumberColumn("Received", min_value=0, step=1)})
+
+def save_customer_receipts(ed):
+    """Save received qty for each customer item: full = Received, less = Short"""
+    now_s = now_iso()
+    n_ok = n_short = 0
+    for _, r in ed.iterrows():
+        rec = _to_float(r["Received"], 0)
+        status = "Received" if rec >= _to_float(r["Ordered"], 0) else "Short"
+        supabase.table("arrangement_lines").update({
+            "qty_received": rec, "status": status,
+            "received_by": st.session_state.name, "received_at": now_s
+        }).eq("id", int(r["id"])).execute()
+        if r.get("line_id") is not None and str(r.get("line_id")) != "nan":
+            refresh_line_status(int(r["line_id"]))
+        if status == "Received":
+            n_ok += 1
+        else:
+            n_short += 1
+    return n_ok, n_short
 
 # ── ORDER TRACKER ─────────────────────────────────────────────────────────────
 LINE_ICON = {"Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
@@ -4947,24 +4968,180 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
                        key=f"{kp}_dl")
 
 
+# ── LOAD ALL ROWS (Supabase returns max 1000 per request) ─────────────────────
+def fetch_all(table, build=None, page=1000, max_rows=50000):
+    """Fetch every matching row in pages. build(query) adds filters."""
+    rows, start = [], 0
+    while start < max_rows:
+        q = supabase.table(table).select("*")
+        if build:
+            q = build(q)
+        data = q.range(start, start + page - 1).execute().data or []
+        rows += data
+        if len(data) < page:
+            break
+        start += page
+    return rows
+
+# ── BILLS REGISTER ────────────────────────────────────────────────────────────
+ISSUE_FIELDS = [("near_expiry", "Near expiry"), ("damaged", "Damaged"), ("contra", "Wrong medicine"),
+                ("wrong_batch", "Wrong batch"), ("wrong_discount", "Wrong discount"),
+                ("wrong_calculation", "Wrong calc"), ("shortage", "Shortage")]
+
+def _bill_key(d):
+    """Match tasks of the same bill: arrangement bills by ARR no, normal bills by bill no + distributor"""
+    arr = str((d or {}).get("arrangement_no", "") or "").strip()
+    if arr:
+        return ("ARR", arr)
+    return ("BILL", str((d or {}).get("bill_no", "")).strip().lower(),
+            str((d or {}).get("distributor", "")).strip().lower())
+
+def _task_dt(task, field="end_time"):
+    """date + time of a task as a datetime (None if unreadable)"""
+    try:
+        t = parse_task_time(task.get(field) or task.get("time", ""))
+        d = datetime.strptime(str(task.get("date", ""))[:10], "%Y-%m-%d")
+        return d.replace(hour=t.hour, minute=t.minute, second=t.second) if t else None
+    except Exception:
+        return None
+
+def show_bills_register(kp="bills"):
+    st.subheader("🧾 Bills Register")
+    st.caption("Every bill entered in 📒 Register Entry, with what happened to it afterwards.")
+    from datetime import timedelta
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: d_from = st.date_input("From", value=today_ist(), key=f"{kp}_from")
+    with c2: d_to   = st.date_input("To", value=today_ist(), key=f"{kp}_to")
+    with c3: area   = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    with c4: otype  = st.selectbox("Type", ["All", "Normal Order", "Arrangement"], key=f"{kp}_type")
+    with c5: dist   = st.selectbox("Distributor", ["All"] + DISTRIBUTORS, key=f"{kp}_dist")
+    if d_to < d_from:
+        st.error("'To' date is before 'From' date")
+        return
+    f, t = d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d")
+    t_plus = (d_to + timedelta(days=3)).strftime("%Y-%m-%d")
+    try:
+        regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", f).lte("date", t))
+        later = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Bill Cross Check", "Bill Upload (Software)", "Stock Placement"])
+                          .gte("date", f).lte("date", t_plus))
+    except Exception as e:
+        st.error(f"Could not load bills: {e}")
+        return
+
+    # earliest task of each type per bill
+    idx = {"Bill Cross Check": {}, "Bill Upload (Software)": {}, "Stock Placement": {}}
+    for task in sorted(later, key=lambda x: (str(x.get("date", "")), str(_task_dt(x) or ""))):
+        k = _bill_key(task.get("details"))
+        idx.setdefault(task.get("task_type"), {}).setdefault(k, task)
+
+    now_naive = now_ist().replace(tzinfo=None)
+    rows = []
+    for r in regs:
+        d = r.get("details") or {}
+        typ = d.get("order_type", "") or "Normal Order"
+        if area != "All Areas" and d.get("area", "") != area:
+            continue
+        if otype != "All" and typ != otype:
+            continue
+        if dist != "All" and d.get("distributor", "") != dist:
+            continue
+        k = _bill_key(d)
+        cc = idx["Bill Cross Check"].get(k)
+        up = idx["Bill Upload (Software)"].get(k)
+        pl = idx["Stock Placement"].get(k)
+        ccd = (cc or {}).get("details") or {}
+        issues = []
+        for fld, label in ISSUE_FIELDS:
+            n = _to_float(ccd.get(fld), 0)
+            if n > 0:
+                issues.append(f"{label} {int(n)}")
+        if pl:
+            stage = "✅ Placed"
+        elif up:
+            stage = "📍 Waiting Placement"
+        elif cc:
+            stage = "📤 Waiting Upload"
+        else:
+            stage = "✔️ Waiting Cross Check"
+        arrived = _task_dt(r, "time")
+        placed = _task_dt(pl) if pl else None
+        mins = int(((placed or now_naive) - arrived).total_seconds() // 60) if arrived else None
+        rows.append({
+            "Date": r.get("date", ""),
+            "Arrived": r.get("time", ""),
+            "Area": d.get("area", ""),
+            "Distributor": d.get("distributor", ""),
+            "Bill No": d.get("bill_no", ""),
+            "Amount ₹": _to_float(d.get("bill_amount"), 0),
+            "Items": int(_to_float(d.get("no_items"), 0)),
+            "Type": typ,
+            "ARR No": d.get("arrangement_no", "") or "",
+            "Delivered By": d.get("delivery_by", ""),
+            "Entered By": r.get("person", ""),
+            "Status": stage,
+            "Cross Check": f"{cc.get('person','')} {cc.get('end_time','')}".strip() if cc else "",
+            "Issues": ", ".join(issues),
+            "Upload": f"{up.get('person','')} {up.get('end_time','')}".strip() if up else "",
+            "Placement": f"{pl.get('person','')} {pl.get('end_time','')}".strip() if pl else "",
+            "Arrival → Placed": (fmt_age(mins) + ("" if placed else " (running)")) if mins is not None and mins >= 0 else "",
+            "_mins": mins if placed else None,
+        })
+
+    if not rows:
+        st.info("No bills entered for this period / filter.")
+        return
+    df = pd.DataFrame(rows).sort_values(["Date", "Arrived"], ascending=False)
+    placed_mins = df["_mins"].dropna()
+    m = st.columns(4)
+    with m[0]: st.metric("🧾 Bills Arrived", len(df))
+    with m[1]: st.metric("💰 Total Amount", f"₹{df['Amount ₹'].sum():,.0f}")
+    with m[2]: st.metric("📦 Total Items", int(df["Items"].sum()))
+    with m[3]: st.metric("⏱️ Avg Arrival → Placed", fmt_age(placed_mins.mean()) if not placed_mins.empty else "—")
+    m = st.columns(4)
+    with m[0]: st.metric("✔️ Waiting Cross Check", int((df["Status"] == "✔️ Waiting Cross Check").sum()))
+    with m[1]: st.metric("📤 Waiting Upload", int((df["Status"] == "📤 Waiting Upload").sum()))
+    with m[2]: st.metric("📍 Waiting Placement", int((df["Status"] == "📍 Waiting Placement").sum()))
+    with m[3]: st.metric("⚠️ Bills with Issues", int((df["Issues"] != "").sum()))
+
+    show = df.drop(columns=["_mins"])
+    st.dataframe(show, hide_index=True, width='stretch')
+
+    with st.expander("📊 By distributor"):
+        by_d = show.groupby("Distributor").agg(Bills=("Bill No", "count"), Amount=("Amount ₹", "sum"),
+                                                Items=("Items", "sum"),
+                                                With_Issues=("Issues", lambda s: int((s != "").sum())))\
+                   .sort_values("Amount", ascending=False).reset_index()
+        by_d["Amount"] = by_d["Amount"].map(lambda v: f"₹{v:,.0f}")
+        st.dataframe(by_d.rename(columns={"With_Issues": "Bills with Issues"}), hide_index=True, width='stretch')
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        show.to_excel(w, index=False, sheet_name="Bills")
+    st.download_button("⬇️ Download Excel", buf.getvalue(), f"bills-register-{f}-to-{t}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Dashboard",
         "🔄 Pipeline",
         "📈 Performance",
         "📝 Submit Entry",
         "👥 Settings",
         "📥 Reports",
-        "📦 Customer Orders"
+        "📦 Customer Orders",
+        "🧾 Bills Register"
     ])
 
     with tab7:
         show_customer_order_tracker("adm", show_phone=True)
+
+    with tab8:
+        show_bills_register("adm_bills")
 
     with tab1:
         try:
@@ -6064,8 +6241,19 @@ def show_admin_page():
         with c3: sel_person = st.text_input("Person Name", placeholder="Leave blank for all", key="r_person")
 
         try:
-            all_tasks = supabase.table("daily_tasks").select("*").execute()
-            filtered  = pd.DataFrame(all_tasks.data) if all_tasks.data else pd.DataFrame()
+            from datetime import timedelta
+            _today = today_ist()
+            _from = {"Today": _today, "Yesterday": _today - timedelta(days=1),
+                     "Last 7 Days": _today - timedelta(days=7), "Last 30 Days": _today - timedelta(days=30)}.get(date_f)
+            _to = _today - timedelta(days=1) if date_f == "Yesterday" else _today
+            def _rep_filter(q):
+                if _from:
+                    q = q.gte("date", _from.strftime("%Y-%m-%d")).lte("date", _to.strftime("%Y-%m-%d"))
+                if sel_team != "All":
+                    q = q.eq("team", sel_team)
+                return q
+            all_rows  = fetch_all("daily_tasks", _rep_filter)   # all rows, not just the first 1000
+            filtered  = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
             if not filtered.empty:
                 filtered["date"] = pd.to_datetime(filtered["date"])
                 if sel_team != "All": filtered = filtered[filtered["team"]==sel_team]
