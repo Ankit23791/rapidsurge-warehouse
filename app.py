@@ -170,7 +170,8 @@ def load_users():
                 "password": u["password"],
                 "name": u["name"],
                 "team": u["team"],
-                "role": u["role"]
+                "role": u["role"],
+                "phone": u.get("phone") or ""
             }
         return users
     except:
@@ -5281,7 +5282,10 @@ def show_attendance_admin(kp="att"):
     except Exception as e:
         st.error(f"Could not load — has the attendance SQL been run in Supabase? ({e})")
         return
+    running = set(t.get("person") for t in tasks if t.get("status") == "In Progress")
     tasks = [t for t in tasks if t.get("status") != "In Progress"]
+    phones = {u.get("name"): u.get("phone", "") for u in (load_users() or {}).values()}
+    reminders = []
 
     # everyone (non-admin) + anyone with activity that day
     people = {}
@@ -5339,6 +5343,25 @@ def show_attendance_admin(kp="att"):
             status = "🟢 Working"
         else:
             status = "🔴 Out (auto)"
+        # reminder candidates (today only, friendly wording)
+        if is_today:
+            now_ist_naive = now_naive
+            if status in ("⚪ Not seen", "⚠️ No clock-in"):
+                reminders.append((person, "Not clocked in",
+                    f"Hi {person}, you haven't clocked in on the RapidSurge app today. Please tap Clock In and log your tasks. Thank you 🙏"))
+            elif status == "☕ On break":
+                b_mins = int((now_ist_naive - s["on_break"][0].replace(tzinfo=None)).total_seconds() // 60)
+                if b_mins >= 45:
+                    reminders.append((person, f"{s['on_break'][1]} break {fmt_age(b_mins)}",
+                        f"Hi {person}, your {s['on_break'][1].lower()} break has been running for {fmt_age(b_mins)} on the RapidSurge app. If you're back, please tap End Break. Thank you 🙏"))
+            elif status == "🟢 Working" and person not in running:
+                acts = [cin] + ([last_task] if last_task else [])
+                acts += [to_ist(e.get("at")).replace(tzinfo=None) for e in evs
+                         if e.get("event") == "break_end" and to_ist(e.get("at"))]
+                idle = int((now_ist_naive - max(acts)).total_seconds() // 60)
+                if idle >= 60:
+                    reminders.append((person, f"No task for {fmt_age(idle)}",
+                        f"Hi {person}, no task has been logged on the RapidSurge app for the last {fmt_age(idle)}. If you're working on something, please start its task timer. Thank you 🙏"))
         rows.append({
             "Person": person, "Team": team, "Status": status,
             "App Opened": login.strftime("%I:%M %p") if login else "",
@@ -5364,6 +5387,31 @@ def show_attendance_admin(kp="att"):
     act = [int(x[:-1]) for x in df["Active %"] if x]
     with m[3]: st.metric("📊 Avg Active %", f"{round(sum(act)/len(act))}%" if act else "—")
     st.dataframe(df, hide_index=True, width='stretch')
+
+    # ── WhatsApp reminders (opens WhatsApp with the message typed; you press Send) ──
+    if is_today:
+        st.markdown("#### 📲 Reminders")
+        if not reminders:
+            st.success("✅ Everyone is clocked in and active — no reminders needed.")
+        else:
+            from urllib.parse import quote
+            st.caption("Tap to open WhatsApp with the message ready — it is sent from the WhatsApp open on this device.")
+            for person, reason, msg in reminders:
+                c1, c2, c3 = st.columns([2, 2, 2])
+                with c1: st.markdown(f"**{person}**")
+                with c2: st.markdown(reason)
+                with c3:
+                    digits = "".join(ch for ch in str(phones.get(person, "")) if ch.isdigit())
+                    if len(digits) == 10:
+                        digits = "91" + digits
+                    if len(digits) >= 11:
+                        st.link_button("📲 WhatsApp", f"https://wa.me/{digits}?text={quote(msg)}", width='stretch')
+                    else:
+                        st.caption("Add mobile in Settings → Manage Users")
+            not_in = [p for p, r, _ in reminders if r == "Not clocked in"]
+            if not_in:
+                with st.expander("📋 Message for team group"):
+                    st.code("Good morning team 🙏 Please clock in on the RapidSurge app: " + ", ".join(not_in), language=None)
 
     with st.expander("🔍 Timeline of one person"):
         who = st.selectbox("Person", [r["Person"] for r in rows], key=f"{kp}_who")
@@ -6400,6 +6448,7 @@ def show_admin_page():
                 with c2:
                     new_team = st.selectbox("Team", ["Purchase","Stock","Call","Delivery","Admin"], key="nu_team")
                     new_role = st.selectbox("Role", ["user","admin"], key="nu_role")
+                    new_phone = st.text_input("Mobile (for WhatsApp reminders)", placeholder="98XXXXXXXX")
                 if st.form_submit_button("Add User ✅", type="primary", width='stretch'):
                     if not new_username or not new_name or not new_password:
                         st.error("Fill all fields!")
@@ -6412,7 +6461,8 @@ def show_admin_page():
                                 supabase.table("app_users").insert({
                                     "username": new_username, "password": new_password,
                                     "name": new_name, "team": new_team,
-                                    "role": new_role, "active": True
+                                    "role": new_role, "active": True,
+                                    **({"phone": new_phone.strip()} if new_phone.strip() else {})
                                 }).execute()
                                 load_users.clear()
                                 st.success(f"✅ {new_name} added!")
@@ -6422,6 +6472,25 @@ def show_admin_page():
         with tab_u2:
             try:
                 users_resp = supabase.table("app_users").select("*").order("team").execute()
+                with st.expander("📱 Mobile numbers for WhatsApp reminders", expanded=False):
+                    act_users = [u for u in (users_resp.data or []) if u.get("active") and u.get("role") != "admin"]
+                    if act_users and "phone" not in act_users[0]:
+                        st.warning("Run the new line in attendance_setup.sql in Supabase first (adds the phone column).")
+                    elif act_users:
+                        ph_df = pd.DataFrame([{"id": u["id"], "Name": u["name"], "Team": u.get("team",""),
+                                               "Mobile": u.get("phone") or ""} for u in act_users])
+                        ph_ed = st.data_editor(ph_df, key="phone_editor", hide_index=True, width='stretch',
+                                               disabled=["Name","Team"], column_config={"id": None})
+                        if st.button("💾 Save mobile numbers", key="save_phones", type="primary"):
+                            old = {u["id"]: (u.get("phone") or "") for u in act_users}
+                            n = 0
+                            for _, r in ph_ed.iterrows():
+                                new = str(r["Mobile"] or "").strip()
+                                if new != old.get(int(r["id"]), ""):
+                                    supabase.table("app_users").update({"phone": new}).eq("id", int(r["id"])).execute()
+                                    n += 1
+                            load_users.clear()
+                            st.success(f"✅ {n} number(s) saved")
                 if users_resp.data:
                     for u in users_resp.data:
                         c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
