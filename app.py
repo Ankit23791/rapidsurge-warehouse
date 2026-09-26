@@ -1988,7 +1988,7 @@ def form_bill_crosscheck():
 
         c1,c2,c3 = st.columns(3)
         with c1:
-            no_items     = st.number_input("No of Items Checked", min_value=0, step=1)
+            no_items     = st.number_input("No of Items Checked *", min_value=0, step=1)
             near_expiry  = st.number_input("Near Expiry Items", min_value=0, step=1)
             damaged      = st.number_input("Damaged Items", min_value=0, step=1)
         with c2:
@@ -2929,6 +2929,10 @@ def show_user_page():
             st.query_params.clear()
             st.rerun()
     st.divider()
+
+    # ── ATTENDANCE: clock in first; no tasks while on a break ────────────────
+    if not attendance_gate():
+        return
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
     if team == "Stock" and st.session_state.get("show_pipeline"):
@@ -4331,26 +4335,30 @@ def show_user_page():
                 with c3: st.metric("💊 Total Medicines", total_meds)
                 with c4: st.metric("⏱️ Total Time", fmt_secs(all_secs))
 
-                st.divider()
-                st.markdown("**🛒 Normal Orders**")
-                n1,n2,n3,n4 = st.columns(4)
-                with n1: st.metric("Orders", len(normal_orders))
-                with n2: st.metric("Total Time", fmt_secs(normal_secs))
-                with n3: st.metric("Avg Time/Order", fmt_secs(avg_normal_secs))
-                with n4: st.metric("Avg secs/SKU", f"{secs_per_sku} secs")
+                # Show only sections with activity today
+                if normal_orders:
+                    st.divider()
+                    st.markdown("**🛒 Normal Orders**")
+                    n1,n2,n3,n4 = st.columns(4)
+                    with n1: st.metric("Orders", len(normal_orders))
+                    with n2: st.metric("Total Time", fmt_secs(normal_secs))
+                    with n3: st.metric("Avg Time/Order", fmt_secs(avg_normal_secs))
+                    with n4: st.metric("Avg secs/SKU", f"{secs_per_sku} secs")
 
-                st.divider()
-                st.markdown("**📋 Arrangement Orders**")
-                a1,a2,a3,a4 = st.columns(4)
-                with a1: st.metric("Arrangements", len(arrangements))
-                with a2: st.metric("Total Time", fmt_secs(arr_secs))
-                with a3: st.metric("Avg Time/Arr", fmt_secs(avg_arr_secs))
-                with a4: st.metric("Avg secs/Medicine", f"{secs_per_med} secs")
+                if arrangements:
+                    st.divider()
+                    st.markdown("**📋 Arrangement Orders**")
+                    a1,a2,a3,a4 = st.columns(4)
+                    with a1: st.metric("Arrangements", len(arrangements))
+                    with a2: st.metric("Total Time", fmt_secs(arr_secs))
+                    with a3: st.metric("Avg Time/Arr", fmt_secs(avg_arr_secs))
+                    with a4: st.metric("Avg secs/Medicine", f"{secs_per_med} secs")
 
-                st.divider()
-                r5,r6,r7,r8 = st.columns(4)
-                with r5: st.metric("💊 PharmaRack", len(pharmarack))
-                with r6: st.metric("↩️ Returns", len(returns))
+                if pharmarack or returns:
+                    st.divider()
+                    r5,r6,r7,r8 = st.columns(4)
+                    with r5: st.metric("💊 PharmaRack", len(pharmarack))
+                    with r6: st.metric("↩️ Returns", len(returns))
 
                 # Stock work done by Purchase people
                 reg_rows   = [r for _, r in df.iterrows() if r.get("task_type") == "Register Entry"]
@@ -5139,13 +5147,249 @@ def show_bills_register(kp="bills"):
     st.download_button("⬇️ Download Excel", buf.getvalue(), f"bills-register-{f}-to-{t}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
 
+# ── ATTENDANCE (clock in / breaks / clock out) ────────────────────────────────
+BREAK_TYPES = [("🍱 Lunch", "Lunch"), ("☕ Tea", "Tea"), ("🚶 Personal", "Personal")]
+
+def att_log(event, break_type=None):
+    supabase.table("attendance_log").insert({
+        "person": st.session_state.name, "team": st.session_state.team,
+        "area": st.session_state.get("work_area", "") or "",
+        "date": date_str(), "event": event, "break_type": break_type, "at": now_iso()
+    }).execute()
+
+def att_state(events):
+    """From a person's events of one day (sorted): current state + totals"""
+    st_ = {"login": None, "clock_in": None, "clock_out": None, "on_break": None,
+           "break_secs": 0, "breaks": 0, "working": False}
+    brk_start = None
+    for e in events:
+        t = to_ist(e.get("at"))
+        ev = e.get("event")
+        if ev == "login" and not st_["login"]:
+            st_["login"] = t
+        elif ev == "clock_in":
+            if not st_["clock_in"]:
+                st_["clock_in"] = t
+            st_["clock_out"] = None
+            st_["working"] = True
+        elif ev == "break_start":
+            brk_start = (t, e.get("break_type") or "Break")
+            st_["breaks"] += 1
+        elif ev == "break_end" and brk_start:
+            st_["break_secs"] += max(0, (t - brk_start[0]).total_seconds())
+            brk_start = None
+        elif ev == "clock_out":
+            if brk_start:                       # clocked out during a break -> close it
+                st_["break_secs"] += max(0, (t - brk_start[0]).total_seconds())
+                brk_start = None
+            st_["clock_out"] = t
+            st_["working"] = False
+    st_["on_break"] = brk_start
+    return st_
+
+def attendance_gate():
+    """Top-of-page attendance bar. Returns True when the person may work on tasks."""
+    try:
+        events = supabase.table("attendance_log").select("*")\
+            .eq("person", st.session_state.name).eq("date", date_str()).order("at").execute().data or []
+    except Exception:
+        return True          # table not created yet -> never block work
+    if not any(e.get("event") == "login" for e in events):
+        try:
+            att_log("login")
+        except Exception:
+            pass
+    s = att_state(events)
+    now = now_ist()
+
+    if not s["clock_in"] or (s["clock_out"] and not s["working"]):
+        if s["clock_out"]:
+            st.info(f"🔴 You clocked out at **{s['clock_out'].strftime('%I:%M %p')}**. Came back? Clock in again to continue.")
+        else:
+            st.markdown(f"### 👋 Good to see you, {st.session_state.name}!")
+            st.caption("Please clock in to start your day.")
+        if st.button("🟢 Clock In", type="primary", width='stretch', key="att_in"):
+            att_log("clock_in")
+            st.rerun()
+        return False
+
+    if s["on_break"]:
+        b_start, b_type = s["on_break"]
+        mins = int((now - b_start).total_seconds() // 60)
+        st.warning(f"☕ On **{b_type}** break since {b_start.strftime('%I:%M %p')} — {fmt_age(mins)}")
+        if st.button("▶️ End Break — back to work", type="primary", width='stretch', key="att_break_end"):
+            att_log("break_end", b_type)
+            st.rerun()
+        return False
+
+    # Working: compact bar
+    worked = int((now - s["clock_in"]).total_seconds() // 60)
+    c0, c1, c2, c3, c4 = st.columns([3, 1, 1, 1, 1])
+    with c0:
+        st.caption(f"🟢 In since **{s['clock_in'].strftime('%I:%M %p')}** · {fmt_age(worked)} · "
+                   f"Breaks: {s['breaks']} ({fmt_age(int(s['break_secs'] // 60))})")
+    active_key, _ = get_active_timer()
+    for col, (label, btype) in zip([c1, c2, c3], BREAK_TYPES):
+        with col:
+            if st.button(label, key=f"att_brk_{btype}", width='stretch'):
+                if active_key:
+                    st.error("Finish or cancel your running task first.")
+                else:
+                    att_log("break_start", btype)
+                    st.rerun()
+    with c4:
+        if st.session_state.get("att_confirm_out"):
+            if st.button("✅ Confirm Out", key="att_out_yes", type="primary", width='stretch'):
+                if active_key:
+                    st.error("Finish or cancel your running task first.")
+                else:
+                    att_log("clock_out")
+                    st.session_state["att_confirm_out"] = False
+                    st.rerun()
+        elif st.button("🔴 Clock Out", key="att_out", width='stretch'):
+            st.session_state["att_confirm_out"] = True
+            st.rerun()
+    return True
+
+def _merged_secs(periods):
+    """Total seconds covered by (start, end) periods, overlaps counted once"""
+    periods = sorted(p for p in periods if p[0] and p[1] and p[1] > p[0])
+    total, cur_s, cur_e = 0, None, None
+    for s, e in periods:
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                total += (cur_e - cur_s).total_seconds()
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        total += (cur_e - cur_s).total_seconds()
+    return total
+
+def show_attendance_admin(kp="att"):
+    st.subheader("🕐 Attendance & Active Time")
+    st.caption("For efficiency only (not salary). Active % = task time ÷ (time present − breaks). "
+               "Task time only counts work done with task timers, so 70–80% is a good score.")
+    c1, c2 = st.columns(2)
+    with c1: day = st.date_input("Date", value=today_ist(), key=f"{kp}_day")
+    with c2: team_f = st.selectbox("Team", ["All", "Purchase", "Stock", "Call", "Delivery"], key=f"{kp}_team")
+    d = day.strftime("%Y-%m-%d")
+    is_today = d == date_str()
+    try:
+        events = fetch_all("attendance_log", lambda q: q.eq("date", d).order("at"))
+        tasks  = fetch_all("daily_tasks", lambda q: q.eq("date", d))
+    except Exception as e:
+        st.error(f"Could not load — has the attendance SQL been run in Supabase? ({e})")
+        return
+    tasks = [t for t in tasks if t.get("status") != "In Progress"]
+
+    # everyone (non-admin) + anyone with activity that day
+    people = {}
+    for u in (load_users() or {}).values():
+        if u.get("role") != "admin":
+            people[u["name"]] = u.get("team", "")
+    for e in events:
+        people.setdefault(e.get("person"), e.get("team", ""))
+    for t in tasks:
+        people.setdefault(t.get("person"), t.get("team", ""))
+
+    day_dt = datetime.strptime(d, "%Y-%m-%d")
+    def on_day(tstr):
+        tt = parse_task_time(tstr)
+        return day_dt.replace(hour=tt.hour, minute=tt.minute, second=tt.second) if tt else None
+
+    rows = []
+    now_naive = now_ist().replace(tzinfo=None)
+    for person, team in sorted(people.items(), key=lambda x: (str(x[1]), str(x[0]))):
+        if not person or (team_f != "All" and team != team_f):
+            continue
+        evs = [e for e in events if e.get("person") == person]
+        tks = [t for t in tasks if t.get("person") == person]
+        s = att_state(evs)
+        periods = [(on_day(t.get("start_time")), on_day(t.get("end_time"))) for t in tks]
+        periods = [p for p in periods if p[0] and p[1]]
+        task_secs_total = _merged_secs(periods)
+        first_task = min([p[0] for p in periods]) if periods else None
+        last_task  = max([p[1] for p in periods]) if periods else None
+        cin = s["clock_in"].replace(tzinfo=None) if s["clock_in"] else None
+        cout = s["clock_out"].replace(tzinfo=None) if s["clock_out"] else None
+        auto_out = False
+        if cin and not cout:
+            if is_today:
+                cout_calc = now_naive          # still in
+            else:
+                last_ev = max([to_ist(e.get("at")).replace(tzinfo=None) for e in evs if to_ist(e.get("at"))] + ([last_task] if last_task else []))
+                cout_calc, auto_out = last_ev, True
+        else:
+            cout_calc = cout
+        present = (cout_calc - cin).total_seconds() if cin and cout_calc and cout_calc > cin else 0
+        work_base = max(0, present - s["break_secs"])
+        active = round(task_secs_total / work_base * 100) if work_base > 0 else None
+        gap = int((first_task - cin).total_seconds() // 60) if cin and first_task and first_task > cin else None
+        login = s["login"].replace(tzinfo=None) if s["login"] else None
+        if not evs and not tks:
+            status = "⚪ Not seen"
+        elif not cin:
+            status = "⚠️ No clock-in"
+        elif s["on_break"]:
+            status = "☕ On break"
+        elif cout:
+            status = "🔴 Out"
+        elif is_today:
+            status = "🟢 Working"
+        else:
+            status = "🔴 Out (auto)"
+        rows.append({
+            "Person": person, "Team": team, "Status": status,
+            "App Opened": login.strftime("%I:%M %p") if login else "",
+            "Clock In": cin.strftime("%I:%M %p") if cin else "",
+            "First Task": first_task.strftime("%I:%M %p") if first_task else "",
+            "Gap to 1st Task": fmt_age(gap) if gap is not None else "",
+            "Breaks": f"{s['breaks']} · {fmt_age(int(s['break_secs'] // 60))}" if s["breaks"] else "",
+            "Task Time": fmt_secs(task_secs_total) if task_secs_total else "",
+            "Tasks": len(tks),
+            "Last Task": last_task.strftime("%I:%M %p") if last_task else "",
+            "Clock Out": (cout_calc.strftime("%I:%M %p") + (" (auto)" if auto_out else "")) if cin and cout_calc and not (is_today and not cout) else "",
+            "Present": fmt_age(int(present // 60)) if present else "",
+            "Active %": f"{active}%" if active is not None else "",
+        })
+    if not rows:
+        st.info("No team members found.")
+        return
+    df = pd.DataFrame(rows)
+    m = st.columns(4)
+    with m[0]: st.metric("🟢 Clocked in", int(df["Clock In"].ne("").sum()))
+    with m[1]: st.metric("⚪ Not seen", int((df["Status"] == "⚪ Not seen").sum()))
+    with m[2]: st.metric("⚠️ Worked without clock-in", int((df["Status"] == "⚠️ No clock-in").sum()))
+    act = [int(x[:-1]) for x in df["Active %"] if x]
+    with m[3]: st.metric("📊 Avg Active %", f"{round(sum(act)/len(act))}%" if act else "—")
+    st.dataframe(df, hide_index=True, width='stretch')
+
+    with st.expander("🔍 Timeline of one person"):
+        who = st.selectbox("Person", [r["Person"] for r in rows], key=f"{kp}_who")
+        tl = []
+        for e in [e for e in events if e.get("person") == who]:
+            t = to_ist(e.get("at"))
+            label = {"login": "📱 Opened app", "clock_in": "🟢 Clock In", "clock_out": "🔴 Clock Out",
+                     "break_start": f"☕ {e.get('break_type','')} break start", "break_end": "▶️ Break end"}.get(e.get("event"), e.get("event"))
+            tl.append({"Time": t.strftime("%I:%M:%S %p") if t else "", "What": label, "_t": t.replace(tzinfo=None) if t else None})
+        for t in [t for t in tasks if t.get("person") == who]:
+            s_ = on_day(t.get("start_time"))
+            tl.append({"Time": s_.strftime("%I:%M:%S %p") if s_ else t.get("time", ""),
+                       "What": f"🧾 {t.get('task_type','')} ({fmt_secs(task_secs(t))})", "_t": s_})
+        tl = sorted(tl, key=lambda x: x["_t"] or datetime.min)
+        if tl:
+            st.dataframe(pd.DataFrame(tl).drop(columns=["_t"]), hide_index=True, width='stretch')
+        else:
+            st.caption("No activity.")
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📊 Dashboard",
         "🔄 Pipeline",
         "📈 Performance",
@@ -5153,8 +5397,12 @@ def show_admin_page():
         "👥 Settings",
         "📥 Reports",
         "📦 Customer Orders",
-        "🧾 Bills Register"
+        "🧾 Bills Register",
+        "🕐 Attendance"
     ])
+
+    with tab9:
+        show_attendance_admin("adm_att")
 
     with tab7:
         show_customer_order_tracker("adm", show_phone=True)
