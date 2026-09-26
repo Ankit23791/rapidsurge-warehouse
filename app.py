@@ -342,14 +342,14 @@ def show_sidebar():
         try:
             from datetime import timedelta
             yesterday = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
-            yest_resp = supabase.table("daily_tasks").select("id")\
+            yest_resp = supabase.table("daily_tasks").select("id,status")\
                 .eq("person", st.session_state.name)\
                 .eq("date", yesterday).execute()
-            yest_count = len(yest_resp.data) if yest_resp.data else 0
-            today_resp = supabase.table("daily_tasks").select("id")\
+            yest_count = len([t for t in (yest_resp.data or []) if t.get("status") != "In Progress"])
+            today_resp = supabase.table("daily_tasks").select("id,status")\
                 .eq("person", st.session_state.name)\
                 .eq("date", date_str()).execute()
-            today_count = len(today_resp.data) if today_resp.data else 0
+            today_count = len([t for t in (today_resp.data or []) if t.get("status") != "In Progress"])
             st.markdown("**📊 Your Performance:**")
             c1,c2 = st.columns(2)
             with c1: st.metric("Yesterday", yest_count)
@@ -2020,6 +2020,9 @@ def form_bill_crosscheck():
         remarks = st.text_input("Remarks")
 
         if st.form_submit_button("Submit Cross Check ✅", type="primary", width='stretch'):
+            if no_items < 1:
+                st.error("Enter No of Items Checked (at least 1)!")
+                return
             end_time, duration = end_timer("bill_crosscheck", start)
             # Calculate avg time per item
             avg_time = round(duration / no_items, 2) if no_items > 0 else 0
@@ -3498,7 +3501,8 @@ def show_user_page():
             perf_resp = supabase.table("daily_tasks").select("*")\
                 .eq("person", st.session_state.name)\
                 .eq("date", date_str()).execute()
-            perf_data = perf_resp.data if perf_resp.data else []
+            # finished tasks only (unfinished timers are not counted)
+            perf_data = [r for r in (perf_resp.data or []) if r.get("status") != "In Progress"]
 
             if not perf_data:
                 st.info("No tasks completed today yet!")
@@ -3508,11 +3512,11 @@ def show_user_page():
                 # Summary metrics
                 total_tasks    = len(perf_df)
                 total_duration = sum([int(float(r.get("duration_mins",0) or 0)) for r in perf_data])
-                completed      = len([r for r in perf_data if r.get("status") == "Completed"])
+                completed      = len(perf_data)
 
                 c1,c2,c3 = st.columns(3)
                 with c1: st.metric("✅ Tasks Completed", completed)
-                with c2: st.metric("⏱️ Total Time", f"{total_duration} mins")
+                with c2: st.metric("⏱️ Total Time", fmt_secs(sum(task_secs(r) for r in perf_data)))
                 with c3: st.metric("📋 Total Tasks", total_tasks)
 
                 st.divider()
@@ -3782,7 +3786,7 @@ def show_user_page():
                 tasks_resp = supabase.table("daily_tasks").select("*")\
                     .eq("person", st.session_state.name)\
                     .eq("date", date_str()).execute()
-                tasks = tasks_resp.data or []
+                tasks = [t for t in (tasks_resp.data or []) if t.get("status") != "In Progress"]
 
                 purchase_orders  = [t for t in tasks if t.get("task_type") == "Purchase Order"]
                 returns          = [t for t in tasks if t.get("task_type") == "Purchase Return"]
@@ -3794,12 +3798,6 @@ def show_user_page():
                         .eq("order_placed_date", date_str())\
                         .eq("order_by", st.session_state.name).execute()
                     arrangements = arr_db_resp.data if arr_db_resp.data else arr_timer
-                    if not arr_db_resp.data:
-                        # TEMP DEBUG: shows why the count is 0 (remove once fixed)
-                        all_today = supabase.table("arrangements").select("order_by")\
-                            .eq("order_placed_date", date_str()).execute().data or []
-                        names = sorted(set(str(a.get("order_by","")) for a in all_today))
-                        st.caption(f"🔍 Debug: {len(all_today)} arrangement(s) saved today ({date_str()}) by {names} — you are logged in as '{st.session_state.name}'")
                 except Exception as arr_err:
                     st.warning(f"Arr load error: {arr_err}")
                     arrangements = arr_timer
@@ -4077,8 +4075,15 @@ def show_user_page():
         timer_keys = {
             "other_task": "Other Task",
         }
+    timer_keys.update({"bill_crosscheck": "Bill Cross Check", "bill_upload": "Bill Upload",
+                       "bill_upload_normal": "Bill Upload", "stock_placement": "Stock Placement",
+                       "purchase_order": "Purchase Order", "arrangement_order": "Arrangement Order",
+                       "purchase_return": "Purchase Return", "other_task": "Other Task"})
+    active_task_ids = set()
     for key, task_name in timer_keys.items():
         start_time = st.session_state.get(f"{key}_start")
+        if start_time and st.session_state.get(f"{key}_task_id"):
+            active_task_ids.add(st.session_state.get(f"{key}_task_id"))
         if start_time:
             elapsed = int((now_ist() - start_time).total_seconds() / 60)
             in_progress.append({
@@ -4088,8 +4093,6 @@ def show_user_page():
                 "Start": start_time.strftime("%I:%M %p"),
                 "End": "In Progress",
                 "Duration": f"{elapsed} mins",
-                "Count": 0,
-                "Avg/Item": "0 mins",
             })
 
     if in_progress:
@@ -4105,8 +4108,25 @@ def show_user_page():
             .eq("person", st.session_state.name)\
             .eq("status", "In Progress")\
             .execute()
-        inprogress_data = [t for t in (inprogress_resp.data or []) 
-                          if t.get("date") != date_str()]
+        # Unfinished = started but never submitted (any day), except timers running right now
+        unfinished = [t for t in (inprogress_resp.data or []) if t.get("id") not in active_task_ids]
+        inprogress_data = []
+        if unfinished:
+            with st.expander(f"⚠️ {len(unfinished)} unfinished task(s) — started but never submitted (not counted)"):
+                st.caption("These timers were started but the form was never submitted (page closed, logged out, etc.). "
+                           "Discard them to clean up — they are not counted in your totals.")
+                st.dataframe(pd.DataFrame([{"Date": t.get("date",""), "Started": t.get("start_time",""),
+                                            "Task": t.get("task_type","")} for t in unfinished]),
+                             hide_index=True, width='stretch')
+                if st.button("🗑️ Discard all unfinished", key="discard_unfinished"):
+                    try:
+                        for part in _chunks([t["id"] for t in unfinished], 100):
+                            supabase.table("daily_tasks").delete().in_("id", part)\
+                                .eq("status", "In Progress").execute()
+                        st.success("✅ Discarded")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
         # Also load arrangement orders placed by this person
         arr_resp = supabase.table("arrangements").select("*")\
@@ -4135,9 +4155,9 @@ def show_user_page():
         arr_meds_lookup = {str(a.get("arrangement_no","")): a.get("no_medicines","0") for a in (arr_resp.data or [])}
         arr_area_lookup = {str(a.get("arrangement_no","")): a.get("area","") for a in (arr_resp.data or [])}
 
-        # Combine all - don't add arr_tasks to avoid duplicates
-        all_data = (resp.data or []) + inprogress_data
-        if resp.data:
+        # Only finished tasks are shown and counted
+        all_data = [t for t in (resp.data or []) if t.get("status") != "In Progress"] + inprogress_data
+        if all_data:
             df = pd.DataFrame(all_data)
             # Sort by time
             try:
@@ -4214,24 +4234,6 @@ def show_user_page():
                 total_sku += sku
                 total_duration += duration
 
-                # Customize column names per task type
-                if row.get("task_type") == "Call Log":
-                    count_label = "Calls Made"
-                    avg_label   = "Avg mins/Call"
-                elif row.get("task_type") in ["Purchase Order","Arrangement Order"]:
-                    # Same columns for normal orders (SKUs) and arrangements (medicines)
-                    count_label = "SKUs / Medicines"
-                    avg_label   = "Avg secs/Item"
-                elif row.get("task_type") in ["Bill Cross Check","Register Entry"]:
-                    count_label = "Items"
-                    avg_label   = "Avg mins/Item"
-                elif row.get("task_type") == "Stock Placement":
-                    count_label = "Medicines"
-                    avg_label   = "Avg secs/Med"
-                else:
-                    count_label = "Count"
-                    avg_label   = "Avg/Item"
-
                 display_rows.append({
                     "Time": row.get("time",""),
                     "Task": row.get("task_type",""),
@@ -4239,12 +4241,12 @@ def show_user_page():
                     "Start": row.get("start_time",""),
                     "End": row.get("end_time",""),
                     "Duration": fmt_secs(secs) if row.get("end_time") else "In Progress",
-                    count_label: sku if sku > 0 else 0,
-                    avg_label: (f"{avg_secs} secs" if avg_secs != 0 else "0 secs") if row.get("task_type") in per_med_types
-                               else (f"{avg} mins" if avg != 0 else "0 mins"),
+                    "Qty": str(sku) if sku > 0 else "",
+                    "Avg secs/unit": f"{avg_secs} secs" if avg_secs else "",
                 })
 
-            st.dataframe(pd.DataFrame(display_rows), width='stretch')
+            st.dataframe(pd.DataFrame(display_rows), width='stretch', hide_index=True)
+            st.caption("Qty = SKUs (Purchase Order) · medicines (Arrangement / Placement) · items (Register / Cross Check) · calls (Call Log)")
             total_duration = round(total_duration, 1)
 
             # Smart Summary based on team
@@ -4349,6 +4351,23 @@ def show_user_page():
                 r5,r6,r7,r8 = st.columns(4)
                 with r5: st.metric("💊 PharmaRack", len(pharmarack))
                 with r6: st.metric("↩️ Returns", len(returns))
+
+                # Stock work done by Purchase people
+                reg_rows   = [r for _, r in df.iterrows() if r.get("task_type") == "Register Entry"]
+                cc_rows    = [r for _, r in df.iterrows() if r.get("task_type") == "Bill Cross Check"]
+                up_rows    = [r for _, r in df.iterrows() if r.get("task_type") in ["Bill Upload (Software)","Bill Upload"]]
+                place_rows = [r for _, r in df.iterrows() if r.get("task_type") == "Stock Placement"]
+                if reg_rows or cc_rows or up_rows or place_rows:
+                    reg_items = sum([int(_to_float((r.get("details") or {}).get("no_items"), 0)) for r in reg_rows])
+                    cc_items  = sum([int(_to_float((r.get("details") or {}).get("no_items"), 0)) for r in cc_rows])
+                    cc_secs   = sum([task_secs(r) for r in cc_rows])
+                    st.divider()
+                    st.markdown("**📦 Stock Work**")
+                    s1,s2,s3,s4 = st.columns(4)
+                    with s1: st.metric("📒 Register Entries", f"{len(reg_rows)} | {reg_items} items")
+                    with s2: st.metric("✔️ Bills Cross Checked", f"{len(cc_rows)} | {cc_items} items")
+                    with s3: st.metric("📤 Uploads | 📍 Placements", f"{len(up_rows)} | {len(place_rows)}")
+                    with s4: st.metric("⏱️ Avg secs/item (check)", f"{round(cc_secs/cc_items,1) if cc_items else 0} secs")
             elif team == "Stock":
                 # Calculate stock metrics
                 reg_entries   = [row for _, row in df.iterrows() if row.get("task_type") == "Register Entry"]
