@@ -2982,6 +2982,7 @@ def show_user_page():
             st.rerun()
     st.divider()
 
+    show_my_shift()
     done_secs = st.session_state.pop("mission_done", None)
     if done_secs is not None:
         st.toast(f"🎖️ Mission complete — {fmt_secs(done_secs)}", icon="✅")
@@ -3935,6 +3936,10 @@ def show_user_page():
                 type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
                 st.session_state.stock_active_form = "receive"
                 st.rerun()
+            if st.button("🧾 Bills Register", width='stretch', key="s_bills",
+                type="primary" if st.session_state.stock_active_form=="bills" else "secondary"):
+                st.session_state.stock_active_form = "bills"
+                st.rerun()
             st.markdown("### ✅ Processing")
             if st.button("✔️ Bill Cross Check", width='stretch', key="s_crosscheck",
                 type="primary" if st.session_state.stock_active_form=="crosscheck" else "secondary"):
@@ -4014,6 +4019,7 @@ def show_user_page():
             form_map = {
                 "register":    form_register_entry,
                 "receive":     form_porter_receive,
+                "bills":       lambda: show_bills_register("stk_bills", default_area=st.session_state.get("work_area")),
                 "crosscheck":  form_bill_crosscheck,
                 "upload":      form_bill_upload_arrangement,
                 "placement":   form_stock_placement,
@@ -4032,6 +4038,9 @@ def show_user_page():
         else:
             # Dashboard
             work_area = st.session_state.get("work_area","All Areas")
+            show_live_pending_bills(work_area, f"#### ⏳ Pending bills — {work_area}")
+            st.caption("Full journey of every bill (pending and placed): 🧾 Bills Register in the menu.")
+            st.divider()
             st.markdown(f"### 📊 Today's Summary — {work_area}")
             try:
                 reg_resp = supabase.table("daily_tasks").select("*")\
@@ -5166,19 +5175,18 @@ def _issues(task):
             out.append(f"{label} {int(n)}")
     return ", ".join(out)
 
-def show_bills_register(kp="bills"):
+def show_live_pending_bills(area="All Areas", title="#### ⏳ Live — bills not yet placed"):
+    """Bills of the last 7 days that are not placed yet, oldest first, for one area or all"""
     from datetime import timedelta
-    st.subheader("🧾 Bills Register")
     now_n = now_ist().replace(tzinfo=None)
-
-    # ── LIVE: every bill not yet placed (last 7 days, incl. yesterday's late arrivals) ──
     try:
         live = build_bill_journeys((today_ist() - timedelta(days=7)).strftime("%Y-%m-%d"), date_str(), date_str())
     except Exception as e:
         st.error(f"Could not load bills: {e}")
         return
-    pend = [b for b in live if b["next"]]
-    st.markdown("#### ⏳ Live — bills not yet placed")
+
+    pend = [b for b in live if b["next"] and (area in ("All Areas", None) or b["d"].get("area", "") == area)]
+    st.markdown(title)
     if not pend:
         st.success("✅ No pending bills — everything that arrived is checked, uploaded and placed.")
     else:
@@ -5204,13 +5212,23 @@ def show_bills_register(kp="bills"):
                    "Stage time: how long it has waited for this step — 🟢 under 1h · 🟡 1–2h · 🔴 over 2h")
         st.dataframe(pd.DataFrame(lrows), hide_index=True, width='stretch')
 
+
+def show_bills_register(kp="bills", default_area=None):
+    from datetime import timedelta
+    st.subheader("🧾 Bills Register")
+    now_n = now_ist().replace(tzinfo=None)
+
+    areas_all = ["All Areas"] + load_areas()
+    area = st.selectbox("Area", areas_all, key=f"{kp}_area",
+                        index=areas_all.index(default_area) if default_area in areas_all else 0)
+    show_live_pending_bills(area)
+
     st.divider()
     # ── HISTORY: bills that arrived in a date range ──
     st.markdown("#### 📜 Bills by arrival date")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c4, c5 = st.columns(4)
     with c1: d_from = st.date_input("From", value=today_ist(), key=f"{kp}_from")
     with c2: d_to   = st.date_input("To", value=today_ist(), key=f"{kp}_to")
-    with c3: area   = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
     with c4: otype  = st.selectbox("Type", ["All", "Normal Order", "Arrangement"], key=f"{kp}_type")
     with c5: dist   = st.selectbox("Distributor", ["All"] + DISTRIBUTORS, key=f"{kp}_dist")
     if d_to < d_from:
@@ -5325,6 +5343,121 @@ def show_bills_register(kp="bills"):
         full.to_excel(w, index=False, sheet_name="Bills")
     st.download_button("⬇️ Download Excel (all stage columns)", buf.getvalue(), f"bills-register-{f}-to-{t}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
+
+# ── SHIFT PLANNER ─────────────────────────────────────────────────────────────
+SHIFT_TIMES = [""] + [datetime(2000, 1, 1, h, m).strftime("%I:%M %p") for h in range(6, 24) for m in (0, 30)]
+SHIFT_STATUS = ["Working", "Off", "Leave"]
+SHIFT_ICON = {"Off": "🏖️ Off", "Leave": "🤒 Leave"}
+
+def load_roster(date_s, person=None):
+    try:
+        q = supabase.table("shift_roster").select("*").eq("date", date_s)
+        if person:
+            q = q.eq("person", person)
+        return {r["person"]: r for r in (q.execute().data or [])}
+    except Exception:
+        return {}
+
+def shift_text(r):
+    if not r:
+        return ""
+    if r.get("status") in SHIFT_ICON:
+        return SHIFT_ICON[r["status"]] + (f" ({r['note']})" if r.get("note") else "")
+    t = f"{r.get('start_time') or '?'} – {r.get('end_time') or '?'}"
+    return t + (f" · {r['area']}" if r.get("area") else "")
+
+def show_my_shift():
+    """Staff: today's and tomorrow's planned shift, one line"""
+    from datetime import timedelta
+    t, tm = date_str(), (today_ist() + timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        rows = supabase.table("shift_roster").select("*").eq("person", st.session_state.name)\
+            .in_("date", [t, tm]).execute().data or []
+    except Exception:
+        return
+    by = {r["date"]: r for r in rows}
+    parts = []
+    if t in by:
+        parts.append(f"📅 **Today:** {shift_text(by[t])}")
+    if tm in by:
+        parts.append(f"📅 **Tomorrow:** {shift_text(by[tm])}")
+    if parts:
+        st.markdown("  ·  ".join(parts))
+
+def show_shift_planner(kp="shift"):
+    from datetime import timedelta
+    st.subheader("📅 Shift Planner")
+    users = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
+    team_of = {u["name"]: u.get("team", "") for u in users}
+    phones = {u["name"]: u.get("phone", "") for u in users}
+    c1, c2 = st.columns(2)
+    with c1: day = st.date_input("Shift date", value=today_ist() + timedelta(days=1), key=f"{kp}_day")
+    with c2: team_f = st.selectbox("Team", ["All"] + sorted(set(team_of.values()) - {""}), key=f"{kp}_team")
+    d = day.strftime("%Y-%m-%d")
+    prev = (day - timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        supabase.table("shift_roster").select("id").limit(1).execute()
+    except Exception as e:
+        st.error(f"Run shift_setup.sql in Supabase first ({e})")
+        return
+    current = load_roster(d)
+    src_key = f"{kp}_src_{d}"
+    if st.button(f"📋 Copy from {(day - timedelta(days=1)).strftime('%d %b')}", key=f"{kp}_copy"):
+        st.session_state[src_key] = "prev"
+        st.session_state[f"{kp}_ver"] = st.session_state.get(f"{kp}_ver", 0) + 1
+    base = load_roster(prev) if st.session_state.get(src_key) == "prev" else current
+    people = sorted([p for p in team_of if team_f == "All" or team_of[p] == team_f],
+                    key=lambda p: (team_of[p], p))
+    areas = [""] + load_areas()
+    rows = []
+    for p in people:
+        r = base.get(p, {})
+        rows.append({"Person": p, "Team": team_of.get(p, ""),
+                     "Status": r.get("status") or "Working",
+                     "Start": r.get("start_time") or "", "End": r.get("end_time") or "",
+                     "Area": r.get("area") or "", "Note": r.get("note") or ""})
+    if not rows:
+        st.info("No team members.")
+        return
+    if st.session_state.get(src_key) == "prev":
+        st.info(f"Filled from {prev} — change what's different, then Save.")
+    elif not current:
+        st.caption("Nothing saved for this date yet.")
+    ed = st.data_editor(pd.DataFrame(rows), key=f"{kp}_ed_{d}_{st.session_state.get(f'{kp}_ver', 0)}",
+                        hide_index=True, width='stretch', disabled=["Person", "Team"],
+                        column_config={
+                            "Status": st.column_config.SelectboxColumn("Status", options=SHIFT_STATUS, required=True),
+                            "Start": st.column_config.SelectboxColumn("Start", options=SHIFT_TIMES),
+                            "End": st.column_config.SelectboxColumn("End", options=SHIFT_TIMES),
+                            "Area": st.column_config.SelectboxColumn("Area", options=areas),
+                        })
+    if st.button("💾 Save shifts", type="primary", key=f"{kp}_save", width='stretch'):
+        payload = [{"date": d, "person": r["Person"], "team": r["Team"], "status": r["Status"] or "Working",
+                    "start_time": (r["Start"] or None) if r["Status"] == "Working" else None,
+                    "end_time": (r["End"] or None) if r["Status"] == "Working" else None,
+                    "area": (r["Area"] or None) if r["Status"] == "Working" else None,
+                    "note": str(r["Note"] or "").strip() or None,
+                    "set_by": st.session_state.name, "updated_at": now_iso()} for _, r in ed.iterrows()]
+        try:
+            supabase.table("shift_roster").upsert(payload, on_conflict="date,person").execute()
+            st.session_state.pop(src_key, None)
+            st.success(f"✅ Shifts saved for {day.strftime('%d %b')} ({len(payload)} people)")
+            current = load_roster(d)
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+
+    if current:
+        lines = [f"{p}: {shift_text(current[p])}" for p in people if p in current]
+        with st.expander("📋 WhatsApp message for team group"):
+            st.code(f"Shifts for {day.strftime('%a %d %b')}:\n" + "\n".join(lines), language=None)
+        with st.expander("📲 Send to one person"):
+            for p in [p for p in people if p in current]:
+                c1, c2 = st.columns([3, 2])
+                with c1: st.markdown(f"**{p}** — {shift_text(current[p])}")
+                with c2:
+                    msg = f"Hi {p}, your shift on {day.strftime('%a %d %b')}: {shift_text(current[p])}. Thank you."
+                    if not wa_buttons(phones.get(p), msg, f"{kp}_wa_{p}"):
+                        st.caption("No mobile saved")
 
 # ── ATTENDANCE (clock in / breaks / clock out) ────────────────────────────────
 BREAK_TYPES = [("🍱 Lunch", "Lunch"), ("☕ Tea", "Tea"), ("🚶 Personal", "Personal")]
@@ -5445,6 +5578,17 @@ def _merged_secs(periods):
         total += (cur_e - cur_s).total_seconds()
     return total
 
+def _vs_plan(cin, rr, day_dt):
+    """' (+20m)' / ' (-10m)' / ' (on time)' vs planned start; '' if no plan"""
+    try:
+        tt = datetime.strptime((rr or {}).get("start_time") or "", "%I:%M %p")
+    except Exception:
+        return ""
+    diff = int((cin - day_dt.replace(hour=tt.hour, minute=tt.minute)).total_seconds() // 60)
+    if abs(diff) <= 5:
+        return " (on time)"
+    return f" ({'+' if diff > 0 else '-'}{fmt_age(abs(diff))})"
+
 def show_attendance_admin(kp="att"):
     st.subheader("🕐 Attendance & Active Time")
     st.caption("For efficiency only (not salary). Active % = task time ÷ (time present − breaks). "
@@ -5464,6 +5608,7 @@ def show_attendance_admin(kp="att"):
     tasks = [t for t in tasks if t.get("status") != "In Progress"]
     phones = {u.get("name"): u.get("phone", "") for u in (load_users() or {}).values()}
     reminders = []
+    roster = load_roster(d)
 
     # everyone (non-admin) + anyone with activity that day
     people = {}
@@ -5509,8 +5654,10 @@ def show_attendance_admin(kp="att"):
         active = round(task_secs_total / work_base * 100) if work_base > 0 else None
         gap = int((first_task - cin).total_seconds() // 60) if cin and first_task and first_task > cin else None
         login = s["login"].replace(tzinfo=None) if s["login"] else None
+        rr = roster.get(person) or {}
+        off_today = rr.get("status") in ("Off", "Leave")
         if not evs and not tks:
-            status = "⚪ Not seen"
+            status = SHIFT_ICON[rr["status"]] if off_today else "⚪ Not seen"
         elif not cin:
             status = "⚠️ No clock-in"
         elif s["on_break"]:
@@ -5524,8 +5671,16 @@ def show_attendance_admin(kp="att"):
         # reminder candidates (today only, friendly wording)
         if is_today:
             now_ist_naive = now_naive
-            if status in ("⚪ Not seen", "⚠️ No clock-in"):
-                reminders.append((person, "Not clocked in",
+            plan_start = None
+            if rr.get("start_time"):
+                try:
+                    tt = datetime.strptime(rr["start_time"], "%I:%M %p")
+                    plan_start = day_dt.replace(hour=tt.hour, minute=tt.minute)
+                except Exception:
+                    plan_start = None
+            not_due_yet = plan_start is not None and now_ist_naive < plan_start
+            if status in ("⚪ Not seen", "⚠️ No clock-in") and not off_today and not not_due_yet:
+                reminders.append((person, "Not clocked in" + (f" (shift {rr['start_time']})" if rr.get("start_time") else ""),
                     f"Hi {person}, you haven't clocked in on the RapidSurge app today. Please tap Clock In and log your tasks. Thank you."))
             elif status == "☕ On break":
                 b_mins = int((now_ist_naive - s["on_break"][0].replace(tzinfo=None)).total_seconds() // 60)
@@ -5543,7 +5698,8 @@ def show_attendance_admin(kp="att"):
         rows.append({
             "Person": person, "Team": team, "Status": status,
             "App Opened": login.strftime("%I:%M %p") if login else "",
-            "Clock In": cin.strftime("%I:%M %p") if cin else "",
+            "Planned": shift_text(rr),
+            "Clock In": (cin.strftime("%I:%M %p") + _vs_plan(cin, rr, day_dt)) if cin else "",
             "First Task": first_task.strftime("%I:%M %p") if first_task else "",
             "Gap to 1st Task": fmt_age(gap) if gap is not None else "",
             "Breaks": f"{s['breaks']} · {fmt_age(int(s['break_secs'] // 60))}" if s["breaks"] else "",
@@ -5560,7 +5716,8 @@ def show_attendance_admin(kp="att"):
     df = pd.DataFrame(rows)
     m = st.columns(4)
     with m[0]: st.metric("🟢 Clocked in", int(df["Clock In"].ne("").sum()))
-    with m[1]: st.metric("⚪ Not seen", int((df["Status"] == "⚪ Not seen").sum()))
+    with m[1]: st.metric("⚪ Not seen", int((df["Status"] == "⚪ Not seen").sum()),
+                         help="Off / on leave (from Shift Planner) are not counted here")
     with m[2]: st.metric("⚠️ Worked without clock-in", int((df["Status"] == "⚠️ No clock-in").sum()))
     act = [int(x[:-1]) for x in df["Active %"] if x]
     with m[3]: st.metric("📊 Avg Active %", f"{round(sum(act)/len(act))}%" if act else "—")
@@ -5976,12 +6133,13 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t1, t2, t3, t4, t5 = st.tabs(["🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "🧾 Bills Register", "📦 Customer Orders"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(["🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders"])
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
     with t3: show_assign_tasks_admin("mgr_asg")
-    with t4: show_bills_register("mgr_bills")
-    with t5: show_customer_order_tracker("mgr_trk", show_phone=True)
+    with t4: show_shift_planner("mgr_shift")
+    with t5: show_bills_register("mgr_bills")
+    with t6: show_customer_order_tracker("mgr_trk", show_phone=True)
 
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
@@ -5989,7 +6147,7 @@ def show_admin_page():
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 Dashboard",
         "🔄 Pipeline",
         "📈 Performance",
@@ -5999,8 +6157,12 @@ def show_admin_page():
         "📦 Customer Orders",
         "🧾 Bills Register",
         "🕐 Attendance",
-        "📌 Assign Tasks"
+        "📌 Assign Tasks",
+        "📅 Shift Planner"
     ])
+
+    with tab11:
+        show_shift_planner("adm_shift")
 
     with tab10:
         show_assign_tasks_admin("adm_asg")
