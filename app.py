@@ -1407,7 +1407,8 @@ def form_stock_placement():
                     "qty_placed": qty_placed
                 }
         else:
-            st.warning("No medicines found for this arrangement — they may not have been entered during order placement!")
+            if item_type == "arrangement":
+                st.warning("No medicines found for this arrangement — they may not have been entered during order placement!")
             total_items = st.number_input("Total Items Placed", min_value=0, step=1)
 
         st.divider()
@@ -1480,7 +1481,7 @@ def form_stock_placement():
                         "arrangement_no": selected_data.get("arrangement_no","") if item_type=="arrangement" else "",
                         "bill_no": "" if item_type=="arrangement" else selected_data.get("details",{}).get("bill_no",""),
                         "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor",""),
-                        "no_medicines": str(len(medicines)),
+                        "no_medicines": str(len(medicines)) if medicines else str(total_items),
                         "placement_image": img_name,
                         "remarks": remarks
                     },
@@ -2121,6 +2122,7 @@ def form_bill_crosscheck():
                         "avg_time_per_item": str(avg_time),
                         "remarks": remarks,
                         "bill_comments": bill_comments,
+                        "video_link": video_link,
                         "bill_check_image": upload_image(bill_check_img, "bill_check") if bill_check_img else "",
                         "area": bc_area if bc_area != "All Areas" else "",
                         "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor","")
@@ -5097,10 +5099,114 @@ def _task_dt(task, field="end_time"):
     except Exception:
         return None
 
+def build_bill_journeys(reg_from, reg_to, later_to):
+    """One record per bill (Register Entry) with every stage: who / start / end / took / waited"""
+    regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", reg_from).lte("date", reg_to))
+    later = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Bill Cross Check", "Bill Upload (Software)", "Stock Placement"])
+                      .gte("date", reg_from).lte("date", later_to))
+    idx = {"Bill Cross Check": {}, "Bill Upload (Software)": {}, "Stock Placement": {}}
+    for task in sorted(later, key=lambda x: (str(x.get("date", "")), str(_task_dt(x) or ""))):
+        if task.get("status") == "In Progress":
+            continue
+        idx.setdefault(task.get("task_type"), {}).setdefault(_bill_key(task.get("details")), task)
+    out = []
+    for r in regs:
+        d = r.get("details") or {}
+        k = _bill_key(d)
+        arrived = _task_dt(r, "time")
+        rec = {"reg": r, "d": d, "arrived": arrived, "stages": []}
+        prev_end = arrived
+        for label, ttype in [("✔️ Cross Check", "Bill Cross Check"), ("📤 Upload", "Bill Upload (Software)"),
+                             ("📍 Placement", "Stock Placement")]:
+            t = idx[ttype].get(k)
+            if not t:
+                rec["stages"].append({"label": label, "task": None})
+                continue
+            s_, e_ = _task_dt(t, "start_time"), _task_dt(t, "end_time")
+            if s_ and e_ and e_ < s_:
+                e_ = e_ + (datetime(2000, 1, 2) - datetime(2000, 1, 1))
+            rec["stages"].append({"label": label, "task": t, "by": t.get("person", ""), "start": s_, "end": e_,
+                                  "took": (e_ - s_).total_seconds() if s_ and e_ else None,
+                                  "waited": (s_ - prev_end).total_seconds() if s_ and prev_end else None})
+            prev_end = e_ or prev_end
+        done = [s for s in rec["stages"] if s["task"]]
+        rec["next"] = next((s["label"] for s in rec["stages"] if not s["task"]), None)
+        rec["checked"], rec["uploaded"], rec["placed"] = [s.get("end") if s["task"] else None for s in rec["stages"]]
+        out.append(rec)
+    return out
+
+def _fmt_when(dt_, ref):
+    """'11:45 AM', or '28 Sep 10:05 AM' when it is on a later day than ref"""
+    if not dt_:
+        return ""
+    if ref and dt_.date() != ref.date():
+        return dt_.strftime("%d %b %I:%M %p")
+    return dt_.strftime("%I:%M %p")
+
+def _mins(secs):
+    return fmt_age(int(secs // 60)) if secs is not None and secs >= 0 else ""
+
+def _stage_wait_mins(b, now_n):
+    """Minutes the bill has been waiting in its current stage (since the previous step finished)"""
+    last = b["arrived"]
+    for s in b["stages"]:
+        if s["task"] and s.get("end"):
+            last = s["end"]
+    return int((now_n - last).total_seconds() // 60) if last else 0
+
+def _wait_flag(mins):
+    return "🔴" if mins >= 120 else ("🟡" if mins >= 60 else "🟢")
+
+def _issues(task):
+    ccd = (task or {}).get("details") or {}
+    out = []
+    for fld, label in ISSUE_FIELDS:
+        n = _to_float(ccd.get(fld), 0)
+        if n > 0:
+            out.append(f"{label} {int(n)}")
+    return ", ".join(out)
+
 def show_bills_register(kp="bills"):
-    st.subheader("🧾 Bills Register")
-    st.caption("Every bill entered in 📒 Register Entry, with what happened to it afterwards.")
     from datetime import timedelta
+    st.subheader("🧾 Bills Register")
+    now_n = now_ist().replace(tzinfo=None)
+
+    # ── LIVE: every bill not yet placed (last 7 days, incl. yesterday's late arrivals) ──
+    try:
+        live = build_bill_journeys((today_ist() - timedelta(days=7)).strftime("%Y-%m-%d"), date_str(), date_str())
+    except Exception as e:
+        st.error(f"Could not load bills: {e}")
+        return
+    pend = [b for b in live if b["next"]]
+    st.markdown("#### ⏳ Live — bills not yet placed")
+    if not pend:
+        st.success("✅ No pending bills — everything that arrived is checked, uploaded and placed.")
+    else:
+        stage_of = {"✔️ Cross Check": "✔️ Waiting Check", "📤 Upload": "📤 Waiting Upload", "📍 Placement": "📍 Waiting Placement"}
+        m = st.columns(4)
+        with m[0]: st.metric("✔️ Waiting Check", sum(1 for b in pend if b["next"] == "✔️ Cross Check"))
+        with m[1]: st.metric("📤 Waiting Upload", sum(1 for b in pend if b["next"] == "📤 Upload"))
+        with m[2]: st.metric("📍 Waiting Placement", sum(1 for b in pend if b["next"] == "📍 Placement"))
+        with m[3]: st.metric("📅 From previous days", sum(1 for b in pend if b["arrived"] and b["arrived"].date() < now_n.date()))
+        lrows = []
+        for b in sorted(pend, key=lambda x: x["arrived"] or now_n):
+            age = int((now_n - b["arrived"]).total_seconds() // 60) if b["arrived"] else 0
+            flag = "🔴" if age >= 360 or (b["arrived"] and b["arrived"].date() < now_n.date()) else ("🟡" if age >= 120 else "🟢")
+            sw = _stage_wait_mins(b, now_n)
+            lrows.append({"⏰": flag, "Arrived": _fmt_when(b["arrived"], now_n), "Since arrival": fmt_age(age),
+                          "Stage": f"{_wait_flag(sw)} {stage_of.get(b['next'], b['next'])} — {fmt_age(sw)}",
+                          "Area": b["d"].get("area", ""),
+                          "Distributor": b["d"].get("distributor", ""), "Bill No": b["d"].get("bill_no", ""),
+                          "Items": int(_to_float(b["d"].get("no_items"), 0)),
+                          "Type": (b["d"].get("order_type") or "Normal Order") + (f" · {b['d'].get('arrangement_no')}" if b["d"].get("arrangement_no") else ""),
+                          "Entered By": b["reg"].get("person", "")})
+        st.caption("⏰ since arrival: 🟢 under 2h · 🟡 2–6h · 🔴 over 6h or arrived on an earlier day  |  "
+                   "Stage time: how long it has waited for this step — 🟢 under 1h · 🟡 1–2h · 🔴 over 2h")
+        st.dataframe(pd.DataFrame(lrows), hide_index=True, width='stretch')
+
+    st.divider()
+    # ── HISTORY: bills that arrived in a date range ──
+    st.markdown("#### 📜 Bills by arrival date")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: d_from = st.date_input("From", value=today_ist(), key=f"{kp}_from")
     with c2: d_to   = st.date_input("To", value=today_ist(), key=f"{kp}_to")
@@ -5111,105 +5217,113 @@ def show_bills_register(kp="bills"):
         st.error("'To' date is before 'From' date")
         return
     f, t = d_from.strftime("%Y-%m-%d"), d_to.strftime("%Y-%m-%d")
-    t_plus = (d_to + timedelta(days=3)).strftime("%Y-%m-%d")
     try:
-        regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", f).lte("date", t))
-        later = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Bill Cross Check", "Bill Upload (Software)", "Stock Placement"])
-                          .gte("date", f).lte("date", t_plus))
+        bills = build_bill_journeys(f, t, (d_to + timedelta(days=7)).strftime("%Y-%m-%d"))
     except Exception as e:
         st.error(f"Could not load bills: {e}")
         return
-
-    # earliest task of each type per bill
-    idx = {"Bill Cross Check": {}, "Bill Upload (Software)": {}, "Stock Placement": {}}
-    for task in sorted(later, key=lambda x: (str(x.get("date", "")), str(_task_dt(x) or ""))):
-        k = _bill_key(task.get("details"))
-        idx.setdefault(task.get("task_type"), {}).setdefault(k, task)
-
-    now_naive = now_ist().replace(tzinfo=None)
-    rows = []
-    for r in regs:
-        d = r.get("details") or {}
+    sel = []
+    for b in bills:
+        d = b["d"]
         typ = d.get("order_type", "") or "Normal Order"
-        if area != "All Areas" and d.get("area", "") != area:
+        if (area != "All Areas" and d.get("area", "") != area) or (otype != "All" and typ != otype) \
+                or (dist != "All" and d.get("distributor", "") != dist):
             continue
-        if otype != "All" and typ != otype:
-            continue
-        if dist != "All" and d.get("distributor", "") != dist:
-            continue
-        k = _bill_key(d)
-        cc = idx["Bill Cross Check"].get(k)
-        up = idx["Bill Upload (Software)"].get(k)
-        pl = idx["Stock Placement"].get(k)
-        ccd = (cc or {}).get("details") or {}
-        issues = []
-        for fld, label in ISSUE_FIELDS:
-            n = _to_float(ccd.get(fld), 0)
-            if n > 0:
-                issues.append(f"{label} {int(n)}")
-        if pl:
-            stage = "✅ Placed"
-        elif up:
-            stage = "📍 Waiting Placement"
-        elif cc:
-            stage = "📤 Waiting Upload"
-        else:
-            stage = "✔️ Waiting Cross Check"
-        arrived = _task_dt(r, "time")
-        placed = _task_dt(pl) if pl else None
-        mins = int(((placed or now_naive) - arrived).total_seconds() // 60) if arrived else None
-        rows.append({
-            "Date": r.get("date", ""),
-            "Arrived": r.get("time", ""),
-            "Area": d.get("area", ""),
-            "Distributor": d.get("distributor", ""),
-            "Bill No": d.get("bill_no", ""),
-            "Amount ₹": _to_float(d.get("bill_amount"), 0),
-            "Items": int(_to_float(d.get("no_items"), 0)),
-            "Type": typ,
-            "ARR No": d.get("arrangement_no", "") or "",
-            "Delivered By": d.get("delivery_by", ""),
-            "Entered By": r.get("person", ""),
-            "Status": stage,
-            "Cross Check": f"{cc.get('person','')} {cc.get('end_time','')}".strip() if cc else "",
-            "Issues": ", ".join(issues),
-            "Upload": f"{up.get('person','')} {up.get('end_time','')}".strip() if up else "",
-            "Placement": f"{pl.get('person','')} {pl.get('end_time','')}".strip() if pl else "",
-            "Arrival → Placed": (fmt_age(mins) + ("" if placed else " (running)")) if mins is not None and mins >= 0 else "",
-            "_mins": mins if placed else None,
-        })
-
-    if not rows:
+        sel.append(b)
+    if not sel:
         st.info("No bills entered for this period / filter.")
         return
-    df = pd.DataFrame(rows).sort_values(["Date", "Arrived"], ascending=False)
-    placed_mins = df["_mins"].dropna()
+
+    rows = []
+    for b in sorted(sel, key=lambda x: x["arrived"] or now_n, reverse=True):
+        d, a = b["d"], b["arrived"]
+        cc, up, pl = b["stages"]
+        if not b["next"]:
+            status = "✅ Placed"
+        else:
+            sw = _stage_wait_mins(b, now_n)
+            status = f"{_wait_flag(sw)} " + {"✔️ Cross Check": "Waiting Check", "📤 Upload": "Waiting Upload",
+                                              "📍 Placement": "Waiting Placement"}[b["next"]] + f" — {fmt_age(sw)}"
+        typ = "Arrangement" if (d.get("order_type") == "Arrangement" or d.get("arrangement_no")) else "Normal"
+        row = {"Arrival Date": a.strftime("%d %b") if a else b["reg"].get("date", ""),
+               "Arrival Time": a.strftime("%I:%M %p") if a else "",
+               "Bill No": d.get("bill_no", ""), "No of SKU": int(_to_float(d.get("no_items"), 0)),
+               "Bill Type": typ, "Distributor": d.get("distributor", ""), "Area": d.get("area", ""),
+               "Cross Check Time": _fmt_when(cc.get("end"), a) if cc["task"] else "",
+               "Checked By": cc.get("by", "") if cc["task"] else "",
+               "Upload Time": _fmt_when(up.get("end"), a) if up["task"] else "",
+               "Uploaded By": up.get("by", "") if up["task"] else "",
+               "Placement Time": _fmt_when(pl.get("end"), a) if pl["task"] else "",
+               "Placed By": pl.get("by", "") if pl["task"] else "",
+               "Current Status": status,
+               "Total Time Taken": (_mins((b["placed"] - a).total_seconds()) if b["placed"] and a
+                                    else (f"⏳ {fmt_age(int((now_n - a).total_seconds() // 60))} (running)" if a else "")),
+               "Amount ₹": _to_float(d.get("bill_amount"), 0), "ARR No": d.get("arrangement_no", "") or "",
+               "Entered By": b["reg"].get("person", "")}
+        for s, short in [(cc, "Check"), (up, "Upload"), (pl, "Place")]:
+            row[f"{short} By"] = s.get("by", "") if s["task"] else ""
+            row[f"{short} Start"] = _fmt_when(s.get("start"), a) if s["task"] else ""
+            row[f"{short} End"] = _fmt_when(s.get("end"), a) if s["task"] else ""
+            row[f"{short} Took"] = _mins(s.get("took")) if s["task"] else ""
+            row[f"Wait → {short}"] = _mins(s.get("waited")) if s["task"] else ""
+        row["Arrival → Upload"] = _mins((b["uploaded"] - a).total_seconds()) if b["uploaded"] and a else ""
+        row["Arrival → Placed"] = _mins((b["placed"] - a).total_seconds()) if b["placed"] and a else ""
+        row["Issues"] = _issues(cc["task"])
+        row["_up_m"] = (b["uploaded"] - a).total_seconds() / 60 if b["uploaded"] and a else None
+        row["_pl_m"] = (b["placed"] - a).total_seconds() / 60 if b["placed"] and a else None
+        row["_nextday"] = bool(b["uploaded"] and a and b["uploaded"].date() > a.date())
+        rows.append(row)
+    df = pd.DataFrame(rows)
+
+    up_m, pl_m = df["_up_m"].dropna(), df["_pl_m"].dropna()
     m = st.columns(4)
     with m[0]: st.metric("🧾 Bills Arrived", len(df))
     with m[1]: st.metric("💰 Total Amount", f"₹{df['Amount ₹'].sum():,.0f}")
-    with m[2]: st.metric("📦 Total Items", int(df["Items"].sum()))
-    with m[3]: st.metric("⏱️ Avg Arrival → Placed", fmt_age(placed_mins.mean()) if not placed_mins.empty else "—")
+    with m[2]: st.metric("⏱️ Avg Arrival → Upload", fmt_age(up_m.mean()) if not up_m.empty else "—")
+    with m[3]: st.metric("⏱️ Avg Arrival → Placed", fmt_age(pl_m.mean()) if not pl_m.empty else "—")
     m = st.columns(4)
-    with m[0]: st.metric("✔️ Waiting Cross Check", int((df["Status"] == "✔️ Waiting Cross Check").sum()))
-    with m[1]: st.metric("📤 Waiting Upload", int((df["Status"] == "📤 Waiting Upload").sum()))
-    with m[2]: st.metric("📍 Waiting Placement", int((df["Status"] == "📍 Waiting Placement").sum()))
-    with m[3]: st.metric("⚠️ Bills with Issues", int((df["Issues"] != "").sum()))
+    with m[0]: st.metric("📦 Total SKUs", int(df["No of SKU"].sum()))
+    with m[1]: st.metric("📅 Uploaded next day or later", int(df["_nextday"].sum()))
+    with m[2]: st.metric("✅ Fully placed", int((df["Current Status"] == "✅ Placed").sum()))
+    with m[3]: st.metric("⚠️ Bills with issues", int((df["Issues"] != "").sum()))
 
-    show = df.drop(columns=["_mins"])
-    st.dataframe(show, hide_index=True, width='stretch')
+    show_all = st.toggle("Show extra columns (amount, entered by, start / took / wait of every stage, issues)", key=f"{kp}_all")
+    base_cols = ["Arrival Date", "Arrival Time", "Bill No", "No of SKU", "Bill Type", "Distributor", "Area",
+                 "Cross Check Time", "Checked By", "Upload Time", "Uploaded By", "Placement Time", "Placed By",
+                 "Current Status", "Total Time Taken"]
+    full = df.drop(columns=["_up_m", "_pl_m", "_nextday"])
+    st.dataframe(full if show_all else full[base_cols], hide_index=True, width='stretch')
+    st.caption("Times on a later day than arrival show the date, e.g. '28 Sep 10:05 AM'. "
+               "Waiting time in Current Status: 🟢 under 1h · 🟡 1–2h · 🔴 over 2h.")
 
-    with st.expander("📊 By distributor"):
-        by_d = show.groupby("Distributor").agg(Bills=("Bill No", "count"), Amount=("Amount ₹", "sum"),
-                                                Items=("Items", "sum"),
-                                                With_Issues=("Issues", lambda s: int((s != "").sum())))\
-                   .sort_values("Amount", ascending=False).reset_index()
-        by_d["Amount"] = by_d["Amount"].map(lambda v: f"₹{v:,.0f}")
-        st.dataframe(by_d.rename(columns={"With_Issues": "Bills with Issues"}), hide_index=True, width='stretch')
+    # ── ONE BILL'S JOURNEY ──
+    with st.expander("🔍 Journey of one bill"):
+        labels = {f"{r['Bill No'] or '(no bill no)'} — {r['Distributor']} — {r['Arrival Date']} {r['Arrival Time']}": i
+                  for i, r in enumerate(rows)}
+        pick = st.selectbox("Bill", list(labels.keys()), key=f"{kp}_pick")
+        b = sorted(sel, key=lambda x: x["arrived"] or now_n, reverse=True)[labels[pick]]
+        a = b["arrived"]
+        jr = [{"Stage": "📒 Arrived (Register Entry)", "By": b["reg"].get("person", ""), "Start": _fmt_when(a, a),
+               "End": _fmt_when(a, a), "Took": "", "Waited before": "",
+               "Details": f"{b['d'].get('distributor','')} · Bill {b['d'].get('bill_no','')} · {int(_to_float(b['d'].get('no_items'),0))} items · ₹{_to_float(b['d'].get('bill_amount'),0):,.0f}"}]
+        for s in b["stages"]:
+            if s["task"]:
+                jr.append({"Stage": s["label"], "By": s["by"], "Start": _fmt_when(s["start"], a), "End": _fmt_when(s["end"], a),
+                           "Took": _mins(s["took"]), "Waited before": _mins(s["waited"]),
+                           "Details": _issues(s["task"]) if s["label"].startswith("✔️") else ""})
+            else:
+                jr.append({"Stage": s["label"], "By": "", "Start": "", "End": "", "Took": "",
+                           "Waited before": "", "Details": "⏳ not done yet"})
+        st.dataframe(pd.DataFrame(jr), hide_index=True, width='stretch')
+        if b["placed"] and a:
+            st.markdown(f"**Total: arrival → placed {_mins((b['placed'] - a).total_seconds())}**")
+        elif a:
+            st.markdown(f"**⏳ Open for {fmt_age(int((now_n - a).total_seconds() // 60))} — next step: {b['next']}**")
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        show.to_excel(w, index=False, sheet_name="Bills")
-    st.download_button("⬇️ Download Excel", buf.getvalue(), f"bills-register-{f}-to-{t}.xlsx",
+        full.to_excel(w, index=False, sheet_name="Bills")
+    st.download_button("⬇️ Download Excel (all stage columns)", buf.getvalue(), f"bills-register-{f}-to-{t}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
 
 # ── ATTENDANCE (clock in / breaks / clock out) ────────────────────────────────
