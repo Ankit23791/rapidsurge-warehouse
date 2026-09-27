@@ -2935,6 +2935,9 @@ def show_user_page():
     if not attendance_gate():
         return
 
+    # ── TASKS FROM ADMIN ──────────────────────────────────────────────────────
+    show_my_assigned_tasks()
+
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
     if team == "Stock" and st.session_state.get("show_pipeline"):
         work_area = st.session_state.get("work_area","All Areas")
@@ -5348,12 +5351,12 @@ def show_attendance_admin(kp="att"):
             now_ist_naive = now_naive
             if status in ("⚪ Not seen", "⚠️ No clock-in"):
                 reminders.append((person, "Not clocked in",
-                    f"Hi {person}, you haven't clocked in on the RapidSurge app today. Please tap Clock In and log your tasks. Thank you 🙏"))
+                    f"Hi {person}, you haven't clocked in on the RapidSurge app today. Please tap Clock In and log your tasks. Thank you."))
             elif status == "☕ On break":
                 b_mins = int((now_ist_naive - s["on_break"][0].replace(tzinfo=None)).total_seconds() // 60)
                 if b_mins >= 45:
                     reminders.append((person, f"{s['on_break'][1]} break {fmt_age(b_mins)}",
-                        f"Hi {person}, your {s['on_break'][1].lower()} break has been running for {fmt_age(b_mins)} on the RapidSurge app. If you're back, please tap End Break. Thank you 🙏"))
+                        f"Hi {person}, your {s['on_break'][1].lower()} break has been running for {fmt_age(b_mins)} on the RapidSurge app. If you're back, please tap End Break. Thank you."))
             elif status == "🟢 Working" and person not in running:
                 acts = [cin] + ([last_task] if last_task else [])
                 acts += [to_ist(e.get("at")).replace(tzinfo=None) for e in evs
@@ -5361,7 +5364,7 @@ def show_attendance_admin(kp="att"):
                 idle = int((now_ist_naive - max(acts)).total_seconds() // 60)
                 if idle >= 60:
                     reminders.append((person, f"No task for {fmt_age(idle)}",
-                        f"Hi {person}, no task has been logged on the RapidSurge app for the last {fmt_age(idle)}. If you're working on something, please start its task timer. Thank you 🙏"))
+                        f"Hi {person}, no task has been logged on the RapidSurge app for the last {fmt_age(idle)}. If you're working on something, please start its task timer. Thank you."))
         rows.append({
             "Person": person, "Team": team, "Status": status,
             "App Opened": login.strftime("%I:%M %p") if login else "",
@@ -5394,24 +5397,18 @@ def show_attendance_admin(kp="att"):
         if not reminders:
             st.success("✅ Everyone is clocked in and active — no reminders needed.")
         else:
-            from urllib.parse import quote
-            st.caption("Tap to open WhatsApp with the message ready — it is sent from the WhatsApp open on this device.")
+            st.caption("📱 App = WhatsApp app (phone) · 💻 Web = WhatsApp Web (computer). The message opens ready — you press Send.")
             for person, reason, msg in reminders:
                 c1, c2, c3 = st.columns([2, 2, 2])
                 with c1: st.markdown(f"**{person}**")
                 with c2: st.markdown(reason)
                 with c3:
-                    digits = "".join(ch for ch in str(phones.get(person, "")) if ch.isdigit())
-                    if len(digits) == 10:
-                        digits = "91" + digits
-                    if len(digits) >= 11:
-                        st.link_button("📲 WhatsApp", f"https://wa.me/{digits}?text={quote(msg)}", width='stretch')
-                    else:
+                    if not wa_buttons(phones.get(person, ""), msg, f"rem_{person}"):
                         st.caption("Add mobile in Settings → Manage Users")
             not_in = [p for p, r, _ in reminders if r == "Not clocked in"]
             if not_in:
                 with st.expander("📋 Message for team group"):
-                    st.code("Good morning team 🙏 Please clock in on the RapidSurge app: " + ", ".join(not_in), language=None)
+                    st.code("Good morning team. Please clock in on the RapidSurge app: " + ", ".join(not_in), language=None)
 
     with st.expander("🔍 Timeline of one person"):
         who = st.selectbox("Person", [r["Person"] for r in rows], key=f"{kp}_who")
@@ -5431,13 +5428,232 @@ def show_attendance_admin(kp="att"):
         else:
             st.caption("No activity.")
 
+# ── TASKS ASSIGNED BY ADMIN ───────────────────────────────────────────────────
+PRIORITY_ICON = {"Urgent": "🔴", "High": "🟡", "Normal": "🟢"}
+
+def wa_buttons(phone, msg, key):
+    """Two WhatsApp buttons: phone app / WhatsApp Web. Returns False if no valid number."""
+    from urllib.parse import quote
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) == 10:
+        digits = "91" + digits
+    if len(digits) < 11:
+        return False
+    b1, b2 = st.columns(2)
+    with b1: st.link_button("📱 App", f"https://api.whatsapp.com/send?phone={digits}&text={quote(msg)}", width='stretch')
+    with b2: st.link_button("💻 Web", f"https://web.whatsapp.com/send?phone={digits}&text={quote(msg)}", width='stretch')
+    return True
+
+def ensure_daily_copies(person=None):
+    """Create today's copy of every 'repeat daily' task (once per person per day)"""
+    try:
+        q = supabase.table("assigned_tasks").select("*").eq("is_template", True).eq("active", True)
+        if person:
+            q = q.eq("assigned_to", person)
+        temps = q.execute().data or []
+        if not temps:
+            return
+        have = supabase.table("assigned_tasks").select("template_id")\
+            .eq("due_date", date_str()).in_("template_id", [t["id"] for t in temps]).execute().data or []
+        have_ids = set(h.get("template_id") for h in have)
+        new = [{"title": t["title"], "details": t.get("details"), "assigned_to": t["assigned_to"], "team": t.get("team"),
+                "due_date": date_str(), "priority": t.get("priority", "Normal"), "status": "Pending",
+                "is_template": False, "template_id": t["id"], "active": True,
+                "assigned_by": t.get("assigned_by"), "assigned_at": now_iso()}
+               for t in temps if t["id"] not in have_ids and str(t.get("due_date", "")) <= date_str()]
+        if new:
+            supabase.table("assigned_tasks").insert(new).execute()
+    except Exception:
+        pass
+
+def show_my_assigned_tasks():
+    """Staff: tasks from admin, shown at the top of their page"""
+    try:
+        ensure_daily_copies(st.session_state.name)
+        rows = supabase.table("assigned_tasks").select("*")\
+            .eq("assigned_to", st.session_state.name).eq("is_template", False).eq("active", True)\
+            .lte("due_date", date_str()).in_("status", ["Pending", "In Progress"]).execute().data or []
+    except Exception:
+        return          # table not created yet
+    if not rows:
+        return
+    order = {"Urgent": 0, "High": 1, "Normal": 2}
+    rows.sort(key=lambda r: (order.get(r.get("priority"), 3), str(r.get("due_date")), r["id"]))
+    overdue = sum(1 for r in rows if str(r.get("due_date")) < date_str())
+    title = f"📌 Tasks from Admin ({len(rows)})" + (f" · ⚠️ {overdue} overdue" if overdue else "")
+    with st.expander(title, expanded=True):
+        for r in rows:
+            icon = PRIORITY_ICON.get(r.get("priority"), "🟢")
+            due = "Today" if r.get("due_date") == date_str() else f"⚠️ Due {r.get('due_date')}"
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                st.markdown(f"{icon} **{r.get('title','')}**  \n<small>{due} · from {r.get('assigned_by','')}</small>", unsafe_allow_html=True)
+                if r.get("details"):
+                    st.caption(r["details"])
+            with c2:
+                if r.get("status") == "Pending":
+                    if st.button("▶️ Start", key=f"at_start_{r['id']}", width='stretch'):
+                        supabase.table("assigned_tasks").update({"status": "In Progress", "started_at": now_iso()}).eq("id", r["id"]).execute()
+                        st.rerun()
+                else:
+                    t0 = to_ist(r.get("started_at"))
+                    if t0:
+                        st.caption(f"🔄 Started {t0.strftime('%I:%M %p')}")
+                note = st.text_input("Note (optional)", key=f"at_note_{r['id']}", label_visibility="collapsed",
+                                     placeholder="Note / reason (optional)")
+                d1, d2 = st.columns(2)
+                with d1:
+                    if st.button("✅ Done", key=f"at_done_{r['id']}", type="primary", width='stretch'):
+                        finish_assigned_task(r, "Done", note)
+                with d2:
+                    if st.button("❌ Can't", key=f"at_cant_{r['id']}", width='stretch'):
+                        if not note.strip():
+                            st.error("Write the reason in the note box")
+                        else:
+                            finish_assigned_task(r, "Cannot Do", note)
+            st.divider()
+
+def finish_assigned_task(r, status, note):
+    now = now_ist()
+    supabase.table("assigned_tasks").update({"status": status, "done_at": now.isoformat(),
+                                             "note": note.strip() or None}).eq("id", r["id"]).execute()
+    if status == "Done":
+        # count the work in My Tasks / Active % (from Start, if started today)
+        t0 = to_ist(r.get("started_at"))
+        start = t0 if t0 and t0.date() == now.date() else now
+        try:
+            supabase.table("daily_tasks").insert({
+                "date": date_str(), "time": time_str(),
+                "person": st.session_state.name, "team": st.session_state.team,
+                "task_type": "Assigned Task",
+                "details": {"task_name": r.get("title", ""), "assigned_by": r.get("assigned_by", ""),
+                            "note": note.strip()},
+                "start_time": start.strftime("%I:%M:%S %p"), "end_time": now.strftime("%I:%M:%S %p"),
+                "duration_mins": str(int((now - start).total_seconds() // 60)), "status": "Completed"
+            }).execute()
+        except Exception:
+            pass
+    st.rerun()
+
+def show_assign_tasks_admin(kp="asg"):
+    st.subheader("📌 Assign Tasks")
+    users = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
+    people = sorted(u["name"] for u in users)
+    team_of = {u["name"]: u.get("team", "") for u in users}
+    phones = {u["name"]: u.get("phone", "") for u in users}
+    teams = sorted(set(team_of.values()) - {""})
+
+    with st.expander("➕ New task", expanded=True):
+        who_mode = st.radio("Assign to", ["People", "Whole team"], horizontal=True, key=f"{kp}_mode")
+        if who_mode == "People":
+            who = st.multiselect("Person / people *", people, key=f"{kp}_who")
+        else:
+            tsel = st.multiselect("Team(s) *", teams, key=f"{kp}_teams")
+            who = [p for p in people if team_of.get(p) in tsel]
+            if who:
+                st.caption("Will be assigned to: " + ", ".join(who))
+        with st.form(f"{kp}_form", clear_on_submit=True):
+            title = st.text_input("Task *", placeholder="e.g. Clean rack A1–A5, check expiry of cough syrups")
+            details = st.text_area("Details (optional)", height=70)
+            c1, c2, c3 = st.columns(3)
+            with c1: due = st.date_input("Due date", value=today_ist(), key=f"{kp}_due")
+            with c2: pri = st.selectbox("Priority", ["Normal", "High", "Urgent"], key=f"{kp}_pri")
+            with c3: rep = st.checkbox("🔁 Repeat daily", key=f"{kp}_rep", help="A fresh copy appears every day until you stop it")
+            if st.form_submit_button("📌 Assign", type="primary", width='stretch'):
+                if not who or not title.strip():
+                    st.error("Choose who and write the task!")
+                else:
+                    base = {"title": title.strip(), "details": details.strip() or None, "priority": pri,
+                            "due_date": due.strftime("%Y-%m-%d"), "active": True,
+                            "assigned_by": st.session_state.name, "assigned_at": now_iso()}
+                    try:
+                        if rep:
+                            temps = supabase.table("assigned_tasks").insert(
+                                [{**base, "assigned_to": p, "team": team_of.get(p, ""), "is_template": True,
+                                  "status": "Template"} for p in who]).execute().data or []
+                            ensure_daily_copies()
+                        else:
+                            supabase.table("assigned_tasks").insert(
+                                [{**base, "assigned_to": p, "team": team_of.get(p, ""), "is_template": False,
+                                  "status": "Pending"} for p in who]).execute()
+                        st.success(f"✅ Assigned to {len(who)} person(s)" + (" — repeats daily" if rep else ""))
+                    except Exception as e:
+                        st.error(f"Could not save — has assigned_tasks_setup.sql been run in Supabase? ({e})")
+
+    # ── Status board ──
+    ensure_daily_copies()
+    c1, c2, c3 = st.columns(3)
+    with c1: day = st.date_input("Tasks due on", value=today_ist(), key=f"{kp}_day")
+    with c2: pf = st.selectbox("Person", ["All"] + people, key=f"{kp}_pf")
+    with c3: sf = st.selectbox("Status", ["All", "Pending", "In Progress", "Done", "Cannot Do"], key=f"{kp}_sf")
+    try:
+        d = day.strftime("%Y-%m-%d")
+        rows = supabase.table("assigned_tasks").select("*").eq("is_template", False).eq("active", True)\
+            .eq("due_date", d).execute().data or []
+        # also carry forward unfinished older tasks when looking at today
+        if d == date_str():
+            rows += supabase.table("assigned_tasks").select("*").eq("is_template", False).eq("active", True)\
+                .lt("due_date", d).in_("status", ["Pending", "In Progress"]).execute().data or []
+    except Exception as e:
+        st.error(f"Could not load — has assigned_tasks_setup.sql been run in Supabase? ({e})")
+        return
+    if pf != "All":
+        rows = [r for r in rows if r.get("assigned_to") == pf]
+    if sf != "All":
+        rows = [r for r in rows if r.get("status") == sf]
+
+    m = st.columns(4)
+    with m[0]: st.metric("📌 Tasks", len(rows))
+    with m[1]: st.metric("✅ Done", sum(1 for r in rows if r.get("status") == "Done"))
+    with m[2]: st.metric("⏳ Open", sum(1 for r in rows if r.get("status") in ("Pending", "In Progress")))
+    with m[3]: st.metric("❌ Can't do", sum(1 for r in rows if r.get("status") == "Cannot Do"))
+
+    status_icon = {"Pending": "⏳ Pending", "In Progress": "🔄 In Progress", "Done": "✅ Done", "Cannot Do": "❌ Can't do"}
+    order = {"Urgent": 0, "High": 1, "Normal": 2}
+    for r in sorted(rows, key=lambda x: (x.get("status") == "Done", order.get(x.get("priority"), 3), str(x.get("assigned_to")))):
+        c1, c2, c3 = st.columns([3, 2, 2])
+        with c1:
+            late = " · ⚠️ overdue" if str(r.get("due_date")) < date_str() and r.get("status") in ("Pending", "In Progress") else ""
+            rep = " · 🔁" if r.get("template_id") else ""
+            st.markdown(f"{PRIORITY_ICON.get(r.get('priority'),'🟢')} **{r.get('title','')}**{rep}  \n"
+                        f"<small>👤 {r.get('assigned_to','')} · due {r.get('due_date','')}{late}</small>", unsafe_allow_html=True)
+            if r.get("note"):
+                st.caption(f"📝 {r['note']}")
+        with c2:
+            txt = status_icon.get(r.get("status"), r.get("status"))
+            t = to_ist(r.get("done_at")) or to_ist(r.get("started_at"))
+            st.markdown(txt + (f"  \n<small>{t.strftime('%I:%M %p')}</small>" if t else ""), unsafe_allow_html=True)
+        with c3:
+            if r.get("status") in ("Pending", "In Progress"):
+                msg = f"Hi {r.get('assigned_to','')}, new task from {r.get('assigned_by','')} on the RapidSurge app: {r.get('title','')}. Please check your dashboard. Thank you."
+                if not wa_buttons(phones.get(r.get("assigned_to")), msg, f"{kp}_wa_{r['id']}"):
+                    st.caption("No mobile saved")
+                if st.button("🗑️ Cancel task", key=f"{kp}_del_{r['id']}", width='stretch'):
+                    supabase.table("assigned_tasks").update({"active": False}).eq("id", r["id"]).execute()
+                    st.rerun()
+
+    # ── Repeating tasks ──
+    try:
+        temps = supabase.table("assigned_tasks").select("*").eq("is_template", True).eq("active", True).execute().data or []
+    except Exception:
+        temps = []
+    if temps:
+        with st.expander(f"🔁 Repeating daily tasks ({len(temps)})"):
+            for t in sorted(temps, key=lambda x: (str(x.get("assigned_to")), str(x.get("title")))):
+                c1, c2 = st.columns([4, 1])
+                with c1: st.markdown(f"**{t.get('title','')}** — {t.get('assigned_to','')} · since {t.get('due_date','')}")
+                with c2:
+                    if st.button("⏹️ Stop", key=f"{kp}_stop_{t['id']}", width='stretch'):
+                        supabase.table("assigned_tasks").update({"active": False}).eq("id", t["id"]).execute()
+                        st.rerun()
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 Dashboard",
         "🔄 Pipeline",
         "📈 Performance",
@@ -5446,8 +5662,12 @@ def show_admin_page():
         "📥 Reports",
         "📦 Customer Orders",
         "🧾 Bills Register",
-        "🕐 Attendance"
+        "🕐 Attendance",
+        "📌 Assign Tasks"
     ])
+
+    with tab10:
+        show_assign_tasks_admin("adm_asg")
 
     with tab9:
         show_attendance_admin("adm_att")
