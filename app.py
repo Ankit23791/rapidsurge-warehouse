@@ -4264,12 +4264,8 @@ def show_user_page():
                     po_area_txt = details.get("area","")
                     parts = [p for p in [po_dist, po_area_txt] if p]
                     extra = " | ".join(parts + [f"SKUs: {sku}"])
-                elif row.get("task_type") == "Bill Cross Check":
-                    sku = int(float(details.get("no_items",0) or 0))
-                    extra = f"Items: {sku}"
-                elif row.get("task_type") == "Stock Placement":
-                    sku = int(float(details.get("no_medicines",0) or 0))
-                    extra = f"Medicines: {sku}"
+                elif row.get("task_type") in ("Bill Cross Check", "Stock Placement", "Bill Upload (Software)"):
+                    sku, extra = task_qty_detail(row)
                 elif row.get("task_type") == "Call Log":
                     sku = int(float(details.get("calls_made",0) or 0))
                     picked = int(details.get("calls_picked",0) or 0)
@@ -4282,8 +4278,7 @@ def show_user_page():
                     not_found = details.get("no_not_found",0)
                     extra = f"Searched:{sku} | Found:{found} | Not Found:{not_found}"
                 elif row.get("task_type") == "Register Entry":
-                    sku = int(float(details.get("no_items",0) or 0))
-                    extra = f"Items: {sku} | Bill: {details.get('bill_no','')}"
+                    sku, extra = task_qty_detail(row)
                 elif row.get("task_type") in ["Order Import","Customer Items Check","Customer Items Received"]:
                     try:
                         sku = int(float(details.get("lines",0) or 0))
@@ -6121,6 +6116,87 @@ def show_person_day(person, day):
     st.download_button("⬇️ Download this day (Excel)", buf.getvalue(), f"{person}-{d}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"day_dl_{person}_{d}")
 
+# ── ALL STAFF WORK (admin / manager) ──────────────────────────────────────────
+def show_all_staff_work(kp="asw"):
+    st.subheader("👥 All Staff Work")
+    users = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
+    team_of = {u["name"]: u.get("team", "") for u in users}
+    c1, c2, c3 = st.columns(3)
+    with c1: day = st.date_input("Date", value=today_ist(), key=f"{kp}_day")
+    with c2: team_f = st.selectbox("Team", ["All"] + sorted(set(team_of.values()) - {""}), key=f"{kp}_team")
+    d = day.strftime("%Y-%m-%d")
+    try:
+        tasks = [t for t in fetch_all("daily_tasks", lambda q: q.eq("date", d)) if t.get("status") != "In Progress"]
+    except Exception as e:
+        st.error(f"Could not load tasks: {e}")
+        return
+    for t in tasks:
+        team_of.setdefault(t.get("person"), t.get("team", ""))
+    tasks = [t for t in tasks if team_f == "All" or team_of.get(t.get("person")) == team_f]
+    people = sorted(set(t.get("person") for t in tasks if t.get("person")))
+    types = sorted(set(t.get("task_type", "") for t in tasks))
+    with c3: who = st.multiselect("Person", people, key=f"{kp}_who", placeholder="All people")
+    ttype = st.multiselect("Task type", types, key=f"{kp}_tt", placeholder="All task types")
+    if who:
+        tasks = [t for t in tasks if t.get("person") in who]
+    if ttype:
+        tasks = [t for t in tasks if t.get("task_type") in ttype]
+    if not tasks:
+        st.info("No finished tasks for this selection.")
+        return
+
+    rows = []
+    for t in tasks:
+        secs = task_secs(t)
+        q, det = task_qty_detail(t)
+        rows.append({"Person": t.get("person", ""), "Team": team_of.get(t.get("person"), ""),
+                     "Task": t.get("task_type", ""), "Details": det,
+                     "Start": t.get("start_time", "") or t.get("time", ""), "End": t.get("end_time", ""),
+                     "Duration": fmt_secs(secs), "Qty": q or "", "_secs": secs,
+                     "_spu": (secs / q) if q and secs else None,
+                     "_sort": parse_task_time(t.get("start_time") or t.get("time")) or datetime.min})
+    df = pd.DataFrame(rows)
+
+    # speed vs the day's typical (median) for the same task type
+    med = df.dropna(subset=["_spu"]).groupby("Task")["_spu"].median().to_dict()
+    def speed(r):
+        if r["_spu"] is None or pd.isna(r["_spu"]):
+            return ""
+        m = med.get(r["Task"])
+        flag = " 🐢" if m and r["_spu"] > 2 * m else (" ⚡" if m and r["_spu"] < 0.5 * m else "")
+        return f"{round(r['_spu'], 1)} secs{flag}"
+    df["Avg secs/unit"] = df.apply(speed, axis=1)
+
+    # per-person summary
+    summ = df.groupby(["Person", "Team"]).agg(Tasks=("Task", "count"), Secs=("_secs", "sum"),
+                                              First=("_sort", "min"), Last=("_sort", "max")).reset_index()
+    summ["Task Time"] = summ["Secs"].map(fmt_secs)
+    summ["First Task"] = summ["First"].map(lambda x: x.strftime("%I:%M %p") if x and x != datetime.min else "")
+    summ["Last Task"] = summ["Last"].map(lambda x: x.strftime("%I:%M %p") if x and x != datetime.min else "")
+    summ["🐢 Slow"] = summ["Person"].map(lambda p: int(df[(df["Person"] == p) & df["Avg secs/unit"].str.contains("🐢")].shape[0]))
+    m = st.columns(3)
+    with m[0]: st.metric("👥 People", len(summ))
+    with m[1]: st.metric("🧾 Tasks", len(df))
+    with m[2]: st.metric("⏱️ Total task time", fmt_secs(df["_secs"].sum()))
+    st.markdown("**Per person**")
+    st.dataframe(summ[["Person", "Team", "Tasks", "Task Time", "First Task", "Last Task", "🐢 Slow"]]
+                 .sort_values(["Team", "Person"]), hide_index=True, width='stretch')
+
+    only_slow = st.toggle("Show only slow tasks 🐢 (more than 2× the day's typical speed for that task)", key=f"{kp}_slow")
+    view = df[df["Avg secs/unit"].str.contains("🐢")] if only_slow else df
+    view = view.sort_values(["Person", "_sort"])
+    st.markdown("**Every task**")
+    st.dataframe(view[["Person", "Team", "Start", "End", "Task", "Details", "Duration", "Qty", "Avg secs/unit"]],
+                 hide_index=True, width='stretch')
+    st.caption("🐢 slower than 2× and ⚡ faster than half the day's typical secs/unit for the same task type. "
+               "Pick one person and open 📋 Full Day to see breaks and idle gaps too.")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        view.drop(columns=["_secs", "_spu", "_sort"]).to_excel(w, index=False, sheet_name="Tasks")
+        summ.drop(columns=["Secs", "First", "Last"]).to_excel(w, index=False, sheet_name="Per person")
+    st.download_button("⬇️ Download Excel", buf.getvalue(), f"staff-work-{d}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
+
 # ── MANAGER: TEAM VIEW ────────────────────────────────────────────────────────
 def show_full_day_picker(kp="fd"):
     users = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
@@ -6133,7 +6209,8 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t1, t2, t3, t4, t5, t6 = st.tabs(["🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders"])
+    t0, t1, t2, t3, t4, t5, t6 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders"])
+    with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
     with t3: show_assign_tasks_admin("mgr_asg")
@@ -6147,8 +6224,9 @@ def show_admin_page():
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 Dashboard",
+        "👥 All Staff Work",
         "🔄 Pipeline",
         "📈 Performance",
         "📝 Submit Entry",
@@ -6163,6 +6241,9 @@ def show_admin_page():
 
     with tab11:
         show_shift_planner("adm_shift")
+
+    with tab12:
+        show_all_staff_work("adm_asw")
 
     with tab10:
         show_assign_tasks_admin("adm_asg")
