@@ -17,6 +17,7 @@ st.set_page_config(
 # ── CUSTOM CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600&display=swap');
 /* Force sidebar to stay open on desktop only */
 [data-testid="collapsedControl"] {
     display: none !important;
@@ -76,6 +77,33 @@ section[data-testid="stSidebar"] p {
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+
+/* ── COMMANDO THEME: navy #0B1F33 · olive #4B5D2E · gold #C9A227 ── */
+h1, h2 { font-family: 'Oswald', sans-serif !important; letter-spacing: 0.04em; text-transform: uppercase; }
+h1 { font-size: 1.9rem !important; }
+h3 { font-family: 'Oswald', sans-serif !important; letter-spacing: 0.02em; }
+section[data-testid="stSidebar"] { background: linear-gradient(180deg, #0B1F33 0%, #16324d 100%) !important; }
+section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] [data-testid="stMetricValue"],
+section[data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: #E8E4D8 !important; }
+section[data-testid="stSidebar"] .stButton > button { background: rgba(255,255,255,0.06) !important;
+    color: #E8E4D8 !important; border: 1px solid rgba(201,162,39,0.45) !important; }
+section[data-testid="stSidebar"] .stButton > button:hover { border-color: #C9A227 !important; color: #fff !important; }
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] { background: #4B5D2E !important; border-color: #C9A227 !important; }
+section[data-testid="stSidebar"] [data-testid="stAlert"] { background: rgba(201,162,39,0.14) !important; border-left: 3px solid #C9A227 !important; }
+.stButton > button[kind="primary"], .stFormSubmitButton > button, .stDownloadButton > button[kind="primary"] {
+    background: #4B5D2E !important; border: 1px solid #C9A227 !important; color: #fff !important; }
+.stButton > button[kind="primary"]:hover, .stFormSubmitButton > button:hover { background: #5d7238 !important; }
+[data-testid="stMetric"] { background: rgba(201,162,39,0.07); border-left: 3px solid #C9A227;
+    border-radius: 6px; padding: 0.35rem 0.6rem !important; }
+.mission-banner { position: relative; border-radius: 10px; padding: 0.9rem 1.1rem; margin: 0.2rem 0 0.6rem 0;
+    background: linear-gradient(120deg, #0B1F33 0%, #1d3a24 60%, #4B5D2E 100%); background-size: cover; background-position: center;
+    border: 1px solid rgba(201,162,39,0.6); box-shadow: 0 4px 14px rgba(0,0,0,0.18); }
+.mission-banner .mb-label { font-family: 'Oswald', sans-serif; color: #C9A227; font-size: 0.78rem; letter-spacing: 0.18em; }
+.mission-banner .mb-quote { color: #fff; font-size: 1.05rem; font-weight: 600; margin-top: 0.15rem; }
+.mission-banner .mb-sub { color: #d9d4c3; font-size: 0.8rem; margin-top: 0.2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,6 +117,34 @@ def time_str():
     return now_ist().strftime("%I:%M %p")
 def date_str():
     return today_ist().strftime("%Y-%m-%d")
+
+MISSION_QUOTES = [
+    "The only easy day was yesterday.",
+    "Discipline beats motivation. Start the timer, finish the mission.",
+    "Every order on time. Every bill checked. No one left behind.",
+    "Precision today, trust tomorrow.",
+    "Small missions, done right, win the war.",
+    "Stay sharp. Stay ready. Deliver.",
+    "Train hard, work smart, win together.",
+]
+
+def mission_banner(sub=""):
+    """Commando-style banner. Uses background.jpg from the repo if present (dark overlay keeps text readable)."""
+    bg = ""
+    try:
+        if os.path.exists("background.jpg"):
+            import base64
+            if "_bg_b64" not in st.session_state:
+                with open("background.jpg", "rb") as f:
+                    st.session_state["_bg_b64"] = base64.b64encode(f.read()).decode()
+            bg = (" style=\"background-image: linear-gradient(120deg, rgba(11,31,51,0.88), rgba(75,93,46,0.72)), "
+                  f"url('data:image/jpeg;base64,{st.session_state['_bg_b64']}');\"")
+    except Exception:
+        bg = ""
+    q = MISSION_QUOTES[today_ist().weekday()]
+    st.markdown(f'<div class="mission-banner"{bg}><div class="mb-label">🎯 MISSION OF THE DAY</div>'
+                f'<div class="mb-quote">“{q}”</div>' + (f'<div class="mb-sub">{sub}</div>' if sub else "") + '</div>',
+                unsafe_allow_html=True)
 
 def parse_task_time(s):
     """Read a task start/end time saved as '07:39:12 PM' (new) or '07:39 PM' (old)"""
@@ -160,7 +216,6 @@ def load_areas():
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
-@st.cache_data(ttl=300)
 def load_users():
     try:
         resp = supabase.table("app_users").select("*").eq("active", True).execute()
@@ -290,7 +345,8 @@ def show_login():
     with col2:
         st.markdown("---")
         st.markdown("# 💊 RapidSurge")
-        st.markdown("### Warehouse Management System")
+        st.markdown("### Warehouse Mission Control")
+        mission_banner("Log in to report for duty.")
         st.markdown("---")
         username = st.text_input("👤 Username", placeholder="Enter username")
         password = st.text_input("🔒 Password", type="password", placeholder="Enter password")
@@ -327,15 +383,7 @@ def show_sidebar():
         st.markdown(f"## {greeting}, {st.session_state.name}!")
 
         # Daily quote by day of week
-        quotes = [
-            "💪 Great things never come from comfort zones!",
-            "🎯 Success is the sum of small efforts repeated daily!",
-            "🔥 Push yourself because no one else will do it for you!",
-            "⭐ Hard work beats talent when talent doesn't work hard!",
-            "🚀 The only way to do great work is to love what you do!",
-            "💡 Every expert was once a beginner. Keep going!",
-            "🏆 Champions keep playing until they get it right!",
-        ]
+        quotes = ["🪖 " + q for q in MISSION_QUOTES]
         st.info(quotes[today_ist().weekday()])
         st.divider()
 
@@ -351,7 +399,7 @@ def show_sidebar():
                 .eq("person", st.session_state.name)\
                 .eq("date", date_str()).execute()
             today_count = len([t for t in (today_resp.data or []) if t.get("status") != "In Progress"])
-            st.markdown("**📊 Your Performance:**")
+            st.markdown("**🎖️ Missions Completed:**")
             c1,c2 = st.columns(2)
             with c1: st.metric("Yesterday", yest_count)
             with c2:
@@ -465,6 +513,7 @@ def timer_button(key, task_name=None):
 def end_timer(key, start_time, keep_record=False):
     end = now_ist()
     duration = int((end - start_time).total_seconds() / 60)
+    st.session_state["mission_done"] = int((end - start_time).total_seconds())
     st.session_state[f"{key}_start"] = None
     task_id = st.session_state.get(f"{key}_task_id")
     if task_id:
@@ -2921,7 +2970,7 @@ def show_user_page():
     c1,c2 = st.columns([4,1])
     with c1:
         st.title(f"💊 RapidSurge — {team} Team")
-        st.caption(f"👤 {st.session_state.name} | 📅 {today_ist().strftime('%A, %d %B %Y')}")
+        mission_banner(f"👤 {st.session_state.name} · {team} Team · 📅 {today_ist().strftime('%A, %d %B %Y')}")
     with c2:
         st.write("")
         if st.button("🚪 Logout", key="mobile_logout"):
@@ -2930,6 +2979,18 @@ def show_user_page():
             st.query_params.clear()
             st.rerun()
     st.divider()
+
+    done_secs = st.session_state.pop("mission_done", None)
+    if done_secs is not None:
+        st.toast(f"🎖️ Mission complete — {fmt_secs(done_secs)}", icon="✅")
+
+    # ── MANAGER: switch between own work and team view ───────────────────────
+    if st.session_state.get("role") == "manager":
+        mode = st.radio("View", ["🧑‍💼 My Work", "👥 Team View"], horizontal=True,
+                        key="mgr_mode", label_visibility="collapsed")
+        if mode == "👥 Team View":
+            show_manager_team_view()
+            return
 
     # ── ATTENDANCE: clock in first; no tasks while on a break ────────────────
     if not attendance_gate():
@@ -5210,9 +5271,9 @@ def attendance_gate():
         if s["clock_out"]:
             st.info(f"🔴 You clocked out at **{s['clock_out'].strftime('%I:%M %p')}**. Came back? Clock in again to continue.")
         else:
-            st.markdown(f"### 👋 Good to see you, {st.session_state.name}!")
-            st.caption("Please clock in to start your day.")
-        if st.button("🟢 Clock In", type="primary", width='stretch', key="att_in"):
+            st.markdown(f"### 🪖 Report for duty, {st.session_state.name}!")
+            st.caption("Clock in to start today's mission.")
+        if st.button("🟢 Clock In — Report for Duty", type="primary", width='stretch', key="att_in"):
             att_log("clock_in")
             st.rerun()
         return False
@@ -5518,6 +5579,7 @@ def finish_assigned_task(r, status, note):
     supabase.table("assigned_tasks").update({"status": status, "done_at": now.isoformat(),
                                              "note": note.strip() or None}).eq("id", r["id"]).execute()
     if status == "Done":
+        st.session_state["mission_done"] = int((now - (to_ist(r.get("started_at")) or now)).total_seconds())
         # count the work in My Tasks / Active % (from Start, if started today)
         t0 = to_ist(r.get("started_at"))
         start = t0 if t0 and t0.date() == now.date() else now
@@ -5787,6 +5849,25 @@ def show_person_day(person, day):
         df.to_excel(w, index=False, sheet_name=person[:30])
     st.download_button("⬇️ Download this day (Excel)", buf.getvalue(), f"{person}-{d}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"day_dl_{person}_{d}")
+
+# ── MANAGER: TEAM VIEW ────────────────────────────────────────────────────────
+def show_full_day_picker(kp="fd"):
+    users = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
+    people = sorted(u["name"] for u in users)
+    c1, c2 = st.columns(2)
+    with c1: day = st.date_input("Date", value=today_ist(), key=f"{kp}_day")
+    with c2: who = st.selectbox("Person", people, key=f"{kp}_who") if people else None
+    if who:
+        show_person_day(who, day)
+
+def show_manager_team_view():
+    st.markdown("## 👥 Team View")
+    t1, t2, t3, t4, t5 = st.tabs(["🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "🧾 Bills Register", "📦 Customer Orders"])
+    with t1: show_attendance_admin("mgr_att")
+    with t2: show_full_day_picker("mgr_fd")
+    with t3: show_assign_tasks_admin("mgr_asg")
+    with t4: show_bills_register("mgr_bills")
+    with t5: show_customer_order_tracker("mgr_trk", show_phone=True)
 
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
@@ -6814,7 +6895,8 @@ def show_admin_page():
                     new_password = st.text_input("Password *")
                 with c2:
                     new_team = st.selectbox("Team", ["Purchase","Stock","Call","Delivery","Admin"], key="nu_team")
-                    new_role = st.selectbox("Role", ["user","admin"], key="nu_role")
+                    new_role = st.selectbox("Role", ["user","manager","admin"], key="nu_role",
+                                            help="manager = own work + Team View (no settings/passwords)")
                     new_phone = st.text_input("Mobile (for WhatsApp reminders)", placeholder="98XXXXXXXX")
                 if st.form_submit_button("Add User ✅", type="primary", width='stretch'):
                     if not new_username or not new_name or not new_password:
@@ -6839,25 +6921,28 @@ def show_admin_page():
         with tab_u2:
             try:
                 users_resp = supabase.table("app_users").select("*").order("team").execute()
-                with st.expander("📱 Mobile numbers for WhatsApp reminders", expanded=False):
+                with st.expander("📱 Mobile numbers & roles", expanded=False):
                     act_users = [u for u in (users_resp.data or []) if u.get("active") and u.get("role") != "admin"]
                     if act_users and "phone" not in act_users[0]:
                         st.warning("Run the new line in attendance_setup.sql in Supabase first (adds the phone column).")
                     elif act_users:
                         ph_df = pd.DataFrame([{"id": u["id"], "Name": u["name"], "Team": u.get("team",""),
-                                               "Mobile": u.get("phone") or ""} for u in act_users])
+                                               "Mobile": u.get("phone") or "", "Role": u.get("role") or "user"} for u in act_users])
                         ph_ed = st.data_editor(ph_df, key="phone_editor", hide_index=True, width='stretch',
-                                               disabled=["Name","Team"], column_config={"id": None})
-                        if st.button("💾 Save mobile numbers", key="save_phones", type="primary"):
-                            old = {u["id"]: (u.get("phone") or "") for u in act_users}
+                                               disabled=["Name","Team"],
+                                               column_config={"id": None,
+                                                              "Role": st.column_config.SelectboxColumn("Role", options=["user","manager"], required=True,
+                                                                        help="manager = own work + 👥 Team View")})
+                        if st.button("💾 Save", key="save_phones", type="primary"):
+                            old = {u["id"]: (u.get("phone") or "", u.get("role") or "user") for u in act_users}
                             n = 0
                             for _, r in ph_ed.iterrows():
-                                new = str(r["Mobile"] or "").strip()
-                                if new != old.get(int(r["id"]), ""):
-                                    supabase.table("app_users").update({"phone": new}).eq("id", int(r["id"])).execute()
+                                new = (str(r["Mobile"] or "").strip(), str(r["Role"] or "user"))
+                                if new != old.get(int(r["id"]), ("", "user")):
+                                    supabase.table("app_users").update({"phone": new[0], "role": new[1]}).eq("id", int(r["id"])).execute()
                                     n += 1
                             load_users.clear()
-                            st.success(f"✅ {n} number(s) saved")
+                            st.success(f"✅ {n} change(s) saved — a new role applies at the person's next login")
                 if users_resp.data:
                     for u in users_resp.data:
                         c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
