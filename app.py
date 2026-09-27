@@ -5647,6 +5647,147 @@ def show_assign_tasks_admin(kp="asg"):
                         supabase.table("assigned_tasks").update({"active": False}).eq("id", t["id"]).execute()
                         st.rerun()
 
+# ── FULL DAY VIEW OF ONE PERSON (admin) ───────────────────────────────────────
+def task_qty_detail(t):
+    """(qty, details text) for any task type"""
+    d = t.get("details") or {}
+    tt = t.get("task_type", "")
+    num = lambda k: int(_to_float(d.get(k), 0))
+    join = lambda *p: " | ".join([str(x) for x in p if x not in (None, "", "0")])
+    if tt == "Purchase Order":
+        return num("no_sku"), join(d.get("distributor"), d.get("area"), f"SKUs: {num('no_sku')}")
+    if tt == "Arrangement Order":
+        n = d.get("arrangement_no", "")
+        return num("no_medicines"), join(f"#{n}" if n else "", d.get("distributor"), d.get("area"))
+    if tt in ("Register Entry", "Bill Cross Check", "Bill Upload (Software)", "Bill Upload", "Purchase Return"):
+        return num("no_items"), join(f"Bill {d.get('bill_no')}" if d.get("bill_no") else "", d.get("arrangement_no"),
+                                     d.get("distributor"), f"Items: {num('no_items')}")
+    if tt == "Stock Placement":
+        return num("no_medicines"), join(d.get("arrangement_no"), f"Bill {d.get('bill_no')}" if d.get("bill_no") else "",
+                                         d.get("distributor"), f"Medicines: {num('no_medicines')}")
+    if tt == "Call Log":
+        return num("calls_made"), f"Made {num('calls_made')} | Picked {num('calls_picked')} | Orders {d.get('orders_delivered', 0)}"
+    if tt == "Medicine Search":
+        return num("no_searched"), f"Searched {num('no_searched')} | Found {d.get('no_found', 0)}"
+    if tt in ("Order Import", "Customer Items Check", "Customer Items Received"):
+        return num("lines"), join(d.get("area"), d.get("arrangement_no"), f"{num('lines')} items")
+    return 0, join(d.get("task_name"), d.get("distributor"), d.get("remarks"))
+
+def show_person_day(person, day):
+    """Everything one person did on one day: attendance + every task + breaks + idle gaps"""
+    from datetime import timedelta
+    d = day.strftime("%Y-%m-%d")
+    is_today = d == date_str()
+    try:
+        tasks = fetch_all("daily_tasks", lambda q: q.eq("person", person).eq("date", d))
+    except Exception as e:
+        st.error(f"Could not load tasks: {e}")
+        return
+    try:
+        events = supabase.table("attendance_log").select("*").eq("person", person).eq("date", d).order("at").execute().data or []
+    except Exception:
+        events = []
+    day_dt = datetime.strptime(d, "%Y-%m-%d")
+    def on_day(tstr):
+        tt = parse_task_time(tstr)
+        return day_dt.replace(hour=tt.hour, minute=tt.minute, second=tt.second) if tt else None
+    naive = lambda x: x.replace(tzinfo=None) if x else None
+
+    s = att_state(events)
+    cin, cout = naive(s["clock_in"]), naive(s["clock_out"])
+    items = []   # (start, end, what, details, qty, kind)
+    for t in tasks:
+        stt, end = on_day(t.get("start_time")), on_day(t.get("end_time"))
+        if not stt:
+            stt = on_day(t.get("time"))
+        if t.get("status") == "In Progress":
+            items.append((stt, None, f"🔄 {t.get('task_type','')} (started, not submitted)", "", 0, "open"))
+            continue
+        if stt and end and end < stt:
+            end = end + timedelta(days=1)
+        q, det = task_qty_detail(t)
+        items.append((stt, end or stt, t.get("task_type", ""), det, q, "task"))
+    brk = None
+    for e in events:
+        t = naive(to_ist(e.get("at")))
+        ev = e.get("event")
+        if ev == "login":
+            items.append((t, t, "📱 Opened app", "", 0, "mark"))
+        elif ev == "clock_in":
+            items.append((t, t, "🟢 Clock In", "", 0, "mark"))
+        elif ev == "clock_out":
+            if brk:
+                items.append((brk[0], t, f"☕ {brk[1]} break", "", 0, "break")); brk = None
+            items.append((t, t, "🔴 Clock Out", "", 0, "mark"))
+        elif ev == "break_start":
+            brk = (t, e.get("break_type") or "Break")
+        elif ev == "break_end" and brk:
+            items.append((brk[0], t, f"☕ {brk[1]} break", "", 0, "break")); brk = None
+    now_n = naive(now_ist())
+    if brk:
+        items.append((brk[0], now_n if is_today else brk[0], f"☕ {brk[1]} break (running)", "", 0, "break"))
+    items = [i for i in items if i[0]]
+    items.sort(key=lambda i: (i[0], 0 if i[5] == "mark" else 1))
+
+    task_items = [i for i in items if i[5] == "task"]
+    task_secs_total = _merged_secs([(i[0], i[1]) for i in task_items])
+    if not items:
+        st.info(f"No activity recorded for {person} on {d}.")
+        return
+
+    # idle gaps (15+ min with no task / break) between clock-in (or first task) and clock-out (or now)
+    GAP = 15 * 60
+    day_start = cin or (task_items[0][0] if task_items else None)
+    day_end = cout or (now_n if is_today and cin else (max(i[1] for i in task_items) if task_items else None))
+    rows, cursor = [], day_start
+    for st_, en, what, det, q, kind in items:
+        is_out = kind == "mark" and "Clock Out" in what
+        if (kind in ("task", "break") or is_out) and cursor and st_ and (st_ - cursor).total_seconds() >= GAP and (not day_end or st_ <= day_end):
+            rows.append({"Time": cursor.strftime("%I:%M %p"), "What": "💤 No activity", "Details": "",
+                         "Start": cursor.strftime("%I:%M %p"), "End": st_.strftime("%I:%M %p"),
+                         "Duration": fmt_age(int((st_ - cursor).total_seconds() // 60)), "Qty": "", "Avg secs/unit": ""})
+        secs = int((en - st_).total_seconds()) if (en and st_ and kind in ("task", "break")) else None
+        rows.append({
+            "Time": st_.strftime("%I:%M %p"), "What": what, "Details": det,
+            "Start": st_.strftime("%I:%M:%S %p") if kind != "mark" else "",
+            "End": en.strftime("%I:%M:%S %p") if (en and kind in ("task", "break")) else "",
+            "Duration": fmt_secs(secs) if secs is not None else "",
+            "Qty": str(q) if q else "",
+            "Avg secs/unit": f"{round(secs / q, 1)} secs" if (q and secs) else "",
+        })
+        if kind in ("task", "break") and en and (cursor is None or en > cursor):
+            cursor = en
+        if is_out:
+            cursor = None          # nothing counted after clock-out
+    if cursor and day_end and not cout and (day_end - cursor).total_seconds() >= GAP:
+        rows.append({"Time": cursor.strftime("%I:%M %p"), "What": "💤 No activity" + (" (so far)" if is_today and not cout else ""),
+                     "Details": "", "Start": cursor.strftime("%I:%M %p"), "End": day_end.strftime("%I:%M %p"),
+                     "Duration": fmt_age(int((day_end - cursor).total_seconds() // 60)), "Qty": "", "Avg secs/unit": ""})
+
+    rows.sort(key=lambda r: datetime.strptime(r["Time"], "%I:%M %p"))   # keep time order
+
+    # summary line
+    present = (day_end - cin).total_seconds() if cin and day_end and day_end > cin else 0
+    base = max(0, present - s["break_secs"])
+    active = f"{round(task_secs_total / base * 100)}%" if base > 0 else "—"
+    idle_mins = sum(int((datetime.strptime(r["End"], "%I:%M %p") - datetime.strptime(r["Start"], "%I:%M %p")).total_seconds() // 60) % 1440
+                    for r in rows if r["What"].startswith("💤"))
+    parts = [f"🟢 In {cin.strftime('%I:%M %p')}" if cin else "⚠️ No clock-in",
+             f"🔴 Out {cout.strftime('%I:%M %p')}" if cout else ("still in" if is_today and cin else ""),
+             f"Present {fmt_age(int(present // 60))}" if present else "",
+             f"Breaks {s['breaks']} ({fmt_age(int(s['break_secs'] // 60))})" if s["breaks"] else "",
+             f"Task time {fmt_secs(task_secs_total)}", f"Active {active}",
+             f"{len(task_items)} tasks", f"💤 {fmt_age(idle_mins)} no activity" if idle_mins else ""]
+    st.markdown("**" + " · ".join([p for p in parts if p]) + "**")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, width='stretch')
+    st.caption("💤 No activity = 15+ minutes with no task and no break recorded.")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name=person[:30])
+    st.download_button("⬇️ Download this day (Excel)", buf.getvalue(), f"{person}-{d}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"day_dl_{person}_{d}")
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
@@ -6137,6 +6278,12 @@ def show_admin_page():
             if sel_person:
                 team = teams_dict.get(sel_person, "")
 
+                # Complete day: attendance + every task (any team) + breaks + idle gaps
+                st.markdown(f"#### 📋 Full Day — {sel_person}")
+                show_person_day(sel_person, perf_date)
+                st.divider()
+                st.markdown(f"#### 📊 {team} task metrics")
+
                 # Load today tasks
                 try:
                     tasks_resp = supabase.table("daily_tasks").select("*")\
@@ -6263,7 +6410,7 @@ def show_admin_page():
                             if r["Trend"] != "-":
                                 st.markdown(f"**{r['Task']}**: Today {r['Avg/SKU (mins)']} mins/SKU | Yesterday {r['Yesterday Avg']} mins/SKU | {r['Trend']}")
                     else:
-                        st.info(f"No matching tasks found for {sel_person}!")
+                        st.caption(f"No {team} team tasks for {sel_person} on this day — see the Full Day table above for everything else.")
 
         with perf_tab2:
             st.subheader("📈 CEO Dashboard")
