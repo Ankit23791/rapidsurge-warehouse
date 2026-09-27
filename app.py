@@ -3375,6 +3375,10 @@ def show_user_page():
                 type="primary" if st.session_state.call_active_form=="calllog" else "secondary"):
                 st.session_state.call_active_form = "calllog"
                 st.rerun()
+            if st.button("📞 Customer Delivery", width='stretch', key="c_custdel",
+                type="primary" if st.session_state.call_active_form=="custdel" else "secondary"):
+                st.session_state.call_active_form = "custdel"
+                st.rerun()
             if st.button("🔍 Medicine Search", width='stretch', key="c_medsearch",
                 type="primary" if st.session_state.call_active_form=="medsearch" else "secondary"):
                 st.session_state.call_active_form = "medsearch"
@@ -3417,6 +3421,7 @@ def show_user_page():
         if st.session_state.call_active_form:
             form_map = {
                 "calllog":   form_call_log,
+                "custdel":   form_customer_delivery,
                 "medsearch": form_medicine_search,
                 "porter":    form_book_porter,
                 "other":     form_other_task,
@@ -3436,6 +3441,9 @@ def show_user_page():
                 if st.button("🔍 Medicine Search", key="mc_medsearch", type="primary", use_container_width=True):
                     st.session_state.call_active_form = "medsearch"
                     st.rerun()
+            if st.button("📞 Customer Delivery Status", key="mc_custdel", type="primary", use_container_width=True):
+                st.session_state.call_active_form = "custdel"
+                st.rerun()
             st.markdown("#### 🚛 Logistics")
             c1,c2 = st.columns(2)
             with c1:
@@ -4279,7 +4287,7 @@ def show_user_page():
                     extra = f"Searched:{sku} | Found:{found} | Not Found:{not_found}"
                 elif row.get("task_type") == "Register Entry":
                     sku, extra = task_qty_detail(row)
-                elif row.get("task_type") in ["Order Import","Customer Items Check","Customer Items Received"]:
+                elif row.get("task_type") in ["Order Import","Customer Items Check","Customer Items Received","Customer Delivery Update"]:
                     try:
                         sku = int(float(details.get("lines",0) or 0))
                     except:
@@ -4288,6 +4296,8 @@ def show_user_page():
                         extra = f"{details.get('area','')} | {sku} new items ({details.get('file_lines','')} in file)"
                     elif row.get("task_type") == "Customer Items Check":
                         extra = f"{details.get('area','')} | In Store: {details.get('in_store',0)} | Not Available: {details.get('not_available',0)}"
+                    elif row.get("task_type") == "Customer Delivery Update":
+                        extra = f"Order {details.get('order','')} | Delivered: {details.get('delivered',0)} | Not delivered: {details.get('not_delivered',0)}"
                     else:
                         extra = f"{details.get('arrangement_no','')} | Received: {details.get('received',0)} | Short: {details.get('short',0)}"
                 elif row.get("task_type") == "Arrangement Order":
@@ -4982,6 +4992,9 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
         st.info("No customer orders imported for this day / area.")
         return
 
+    customer_order_summary(lines)
+    st.divider()
+
     # arrangement links for distributor names
     links = {}
     for part in _chunks([l["id"] for l in lines], 100):
@@ -5018,6 +5031,9 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
             "⏳ Pending": statuses.count("Pending"),
             "❌ N/A": statuses.count("Not Available") + statuses.count("Short"),
             "Status": stt,
+            "🚚 Delivery": ("✅ Delivered" if all(l.get("delivery_status") == "Delivered" for l in ls)
+                           else "❌ Not delivered" if all(l.get("delivery_status") == "Not Delivered" for l in ls)
+                           else "🟡 Partly" if any(l.get("delivery_status") for l in ls) else "📞 Awaiting call"),
             "Imported": t0.strftime("%I:%M %p"),
             "Time": fmt_age(mins) + ("" if done else " (running)"),
             "_mins": mins, "_done": done,
@@ -5055,6 +5071,8 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
             "Area": l.get("area", ""),
             "Status": LINE_ICON.get(l.get("status", ""), l.get("status", "")),
             "Checked By": l.get("decided_by", "") or "",
+            "Delivery": l.get("delivery_status") or "",
+            "Not Delivered Reason": l.get("delivery_reason") or "",
         })
     ldf = pd.DataFrame(line_rows)
     if not show_phone:
@@ -5065,6 +5083,168 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
                        file_name=f"customer-orders-{day}-{area.replace(' ', '_')}.csv", mime="text/csv",
                        key=f"{kp}_dl")
 
+
+# ── CUSTOMER DELIVERY STATUS (Call team) ──────────────────────────────────────
+NOT_DELIVERED_REASONS = [
+    "A) Already purchased from outside",
+    "B) Doesn't want an alternative medicine",
+    "C) Valid prescription not shared",
+    "D) Was only enquiring, doesn't need medicine",
+    "E) Wants a freebie to buy",
+    "F) Wants more discount",
+]
+DELIVERY_CHOICES = ["—", "✅ Delivered", "❌ Not Delivered"]
+
+def customer_order_summary(lines):
+    """Summary block in the format asked for by Ankit"""
+    ls = [l for l in lines if not l.get("removed")]
+    orders = {}
+    for l in ls:
+        orders.setdefault(l.get("order_no"), []).append(l)
+    st_ = lambda l: l.get("status", "Pending")
+    in_store = [l for l in ls if st_(l) == "In Store"]
+    to_arrange = [l for l in ls if st_(l) != "In Store"]
+    placed = [l for l in to_arrange if st_(l) in ("Arranged", "Partly Arranged", "Received", "Short")]
+    not_placed = [l for l in to_arrange if l not in placed]
+    pend_dec = [l for l in not_placed if st_(l) == "Pending"]
+    not_avail = [l for l in not_placed if st_(l) == "Not Available"]
+    deliv = [l for l in ls if l.get("delivery_status") == "Delivered"]
+    notdeliv = [l for l in ls if l.get("delivery_status") == "Not Delivered"]
+    ord_deliv = [o for o, x in orders.items() if x and all(l.get("delivery_status") == "Delivered" for l in x)]
+    ord_nd = [o for o, x in orders.items() if x and all(l.get("delivery_status") == "Not Delivered" for l in x)]
+    ord_part = [o for o, x in orders.items() if any(l.get("delivery_status") == "Delivered" for l in x)
+                and any(l.get("delivery_status") != "Delivered" for l in x)]
+    ord_wait = [o for o in orders if o not in ord_deliv and o not in ord_nd and o not in ord_part]
+
+    st.markdown(f"#### 📦 Customer orders (arrangement): **{len(orders)} orders · {len(ls)} medicines**")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**💊 Medicines**")
+        st.markdown(
+            f"- 🏪 Already in store: **{len(in_store)}**\n"
+            f"- 📦 To be arranged: **{len(to_arrange)}**\n"
+            f"    - ✅ Order placed with distributor: **{len(placed)}**\n"
+            f"    - ⏳ Order not placed: **{len(not_placed)}**"
+            + (f" (awaiting decision {len(pend_dec)} · not available {len(not_avail)})" if not_placed else ""))
+    with c2:
+        st.markdown("**🚚 Delivery to customer**")
+        md = (f"- ✅ Delivered: **{len(ord_deliv)} orders** · {len(deliv)} medicines\n"
+              + (f"- 🟡 Partly delivered: **{len(ord_part)} orders**\n" if ord_part else "")
+              + f"- ❌ Not delivered: **{len(ord_nd)} orders** · {len(notdeliv)} medicines\n")
+        reasons = {}
+        for l in notdeliv:
+            reasons[l.get("delivery_reason") or "No reason given"] = reasons.get(l.get("delivery_reason") or "No reason given", 0) + 1
+        for r in NOT_DELIVERED_REASONS + [k for k in reasons if k not in NOT_DELIVERED_REASONS]:
+            if reasons.get(r):
+                md += f"    - {r}: **{reasons[r]}**\n"
+        md += f"- 📞 Awaiting call: **{len(ord_wait)} orders**"
+        st.markdown(md)
+
+def form_customer_delivery():
+    """Call team: after calling the customer, mark each order delivered / not delivered with reason"""
+    from datetime import timedelta
+    st.subheader("📞 Customer Delivery Status")
+    st.caption("Call the customer, then mark the order ✅ Delivered or ❌ Not Delivered with the reason. "
+               "Use the table to mark individual medicines if only part of the order was taken.")
+    c1, c2 = st.columns(2)
+    with c1: area = st.selectbox("Area", ["All Areas"] + load_areas(), key="cd_area")
+    with c2: show_done = st.toggle("Show already-marked orders", key="cd_done")
+    since = IST.localize(datetime.combine(today_ist() - timedelta(days=7), datetime.min.time())).isoformat()
+    try:
+        q = supabase.table("customer_order_lines").select("*").eq("removed", False).gte("imported_at", since)
+        if area != "All Areas":
+            q = q.eq("area", area)
+        lines = q.execute().data or []
+    except Exception as e:
+        st.error(f"Could not load customer orders ({e})")
+        return
+    if lines and "delivery_status" not in lines[0]:
+        st.error("Run delivery_status_setup.sql in Supabase first.")
+        return
+    orders = {}
+    for l in lines:
+        orders.setdefault(l.get("order_no"), []).append(l)
+    if not show_done:
+        orders = {o: x for o, x in orders.items() if any(not l.get("delivery_status") for l in x)}
+    if not orders:
+        st.success("✅ No orders waiting for a call.")
+        return
+
+    def ready(x):
+        return all(l.get("status") in ("In Store", "Received", "Not Available", "Short") for l in x)
+    olist = sorted(orders.items(), key=lambda kv: (not ready(kv[1]), str(min(l.get("imported_at", "") for l in kv[1]))))
+    st.markdown(f"**{len(olist)} orders** · 🟢 ready = all medicines in store / received")
+
+    # quick whole-order action
+    labels = {f"{'🟢' if ready(x) else '⏳'} #{o} — {x[0].get('customer_name','')} — {x[0].get('customer_phone','')} — {len(x)} medicine(s)": o
+              for o, x in olist}
+    pick = st.selectbox("Order", list(labels.keys()), key="cd_pick")
+    o = labels[pick]
+    x = orders[o]
+    ph = "".join(ch for ch in str(x[0].get("customer_phone", "")) if ch.isdigit())
+    if ph:
+        st.markdown(f"📞 [Call {x[0].get('customer_name','')} ({ph})](tel:{ph})")
+    st.dataframe(pd.DataFrame([{"Medicine": l.get("item_name", ""), "Pack": l.get("pack_size", ""),
+                                "Qty": _qty_txt(l.get("qty")), "Stock": LINE_ICON.get(l.get("status"), l.get("status")),
+                                "Delivery": l.get("delivery_status") or "",
+                                "Reason": l.get("delivery_reason") or ""} for l in x]),
+                 hide_index=True, width='stretch')
+    b1, b2, b3 = st.columns([1, 2, 1])
+    with b1:
+        if st.button("✅ Whole order delivered", key=f"cd_all_ok_{o}", type="primary", width='stretch'):
+            save_delivery([(l["id"], "Delivered", None) for l in x], o)
+    with b2:
+        reason = st.selectbox("Reason", NOT_DELIVERED_REASONS, key=f"cd_reason_{o}", label_visibility="collapsed")
+    with b3:
+        if st.button("❌ Whole order not delivered", key=f"cd_all_no_{o}", width='stretch'):
+            save_delivery([(l["id"], "Not Delivered", reason) for l in x], o)
+
+    # per-medicine marking (all waiting orders)
+    with st.expander("✏️ Mark individual medicines (all waiting orders)"):
+        rows = [{"id": l["id"], "Order #": oo, "Customer": l.get("customer_name", ""), "Medicine": l.get("item_name", ""),
+                 "Stock": LINE_ICON.get(l.get("status"), l.get("status")),
+                 "Delivery": {"Delivered": "✅ Delivered", "Not Delivered": "❌ Not Delivered"}.get(l.get("delivery_status"), "—"),
+                 "Reason": l.get("delivery_reason") or ""}
+                for oo, xx in olist for l in xx]
+        ver = st.session_state.get("cd_ver", 0)
+        ed = st.data_editor(pd.DataFrame(rows), key=f"cd_editor_{ver}", hide_index=True, width='stretch',
+                            disabled=["Order #", "Customer", "Medicine", "Stock"],
+                            column_config={"id": None,
+                                           "Delivery": st.column_config.SelectboxColumn("Delivery", options=DELIVERY_CHOICES, required=True),
+                                           "Reason": st.column_config.SelectboxColumn("Reason (if not delivered)", options=[""] + NOT_DELIVERED_REASONS)})
+        if st.button("💾 Save medicine-wise", key="cd_save_lines", type="primary"):
+            old = {r["id"]: (r["Delivery"], r["Reason"]) for r in rows}
+            changes, missing = [], 0
+            for _, r in ed.iterrows():
+                if (r["Delivery"], r["Reason"]) == old.get(r["id"]) or r["Delivery"] == "—":
+                    continue
+                if r["Delivery"] == "❌ Not Delivered" and not r["Reason"]:
+                    missing += 1
+                    continue
+                changes.append((int(r["id"]), "Delivered" if r["Delivery"].startswith("✅") else "Not Delivered",
+                                None if r["Delivery"].startswith("✅") else r["Reason"]))
+            if missing:
+                st.error(f"{missing} medicine(s) marked Not Delivered without a reason — pick a reason.")
+            elif changes:
+                st.session_state["cd_ver"] = ver + 1
+                save_delivery(changes, "medicine-wise")
+            else:
+                st.info("Nothing changed.")
+
+def save_delivery(changes, label):
+    """changes: [(line_id, 'Delivered'/'Not Delivered', reason)]"""
+    now_s = now_iso()
+    try:
+        for lid, stt, reason in changes:
+            supabase.table("customer_order_lines").update({
+                "delivery_status": stt, "delivery_reason": reason,
+                "delivery_by": st.session_state.name, "delivery_at": now_s}).eq("id", lid).execute()
+        ok = sum(1 for c in changes if c[1] == "Delivered")
+        log_simple_task("Customer Delivery Update", {"lines": str(len(changes)), "delivered": str(ok),
+                                                      "not_delivered": str(len(changes) - ok), "order": str(label)})
+        st.rerun()
+    except Exception as e:
+        st.error(f"Could not save: {e}")
 
 # ── LOAD ALL ROWS (Supabase returns max 1000 per request) ─────────────────────
 def fetch_all(table, build=None, page=1000, max_rows=50000):
@@ -5997,6 +6177,8 @@ def task_qty_detail(t):
         return num("calls_made"), f"Made {num('calls_made')} | Picked {num('calls_picked')} | Orders {d.get('orders_delivered', 0)}"
     if tt == "Medicine Search":
         return num("no_searched"), f"Searched {num('no_searched')} | Found {d.get('no_found', 0)}"
+    if tt == "Customer Delivery Update":
+        return num("lines"), f"Order {d.get('order','')} | Delivered {d.get('delivered',0)} | Not delivered {d.get('not_delivered',0)}"
     if tt in ("Order Import", "Customer Items Check", "Customer Items Received"):
         return num("lines"), join(d.get("area"), d.get("arrangement_no"), f"{num('lines')} items")
     return 0, join(d.get("task_name"), d.get("distributor"), d.get("remarks"))
