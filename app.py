@@ -5070,9 +5070,28 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
     with m4: st.metric("🔴 Over 3 hrs", int((odf["_mins"] >= 180).sum()))
     with m5: st.metric("Avg Time to Ready", fmt_age(done_df["_mins"].mean()) if not done_df.empty else "—")
 
-    status_filter = st.multiselect("Show status", sorted(odf["Status"].unique()), default=[], key=f"{kp}_st",
-                                   placeholder="All statuses")
+    f1, f2 = st.columns([3, 2])
+    with f1:
+        search = st.text_input("🔍 Search — mobile no, order #, customer name or medicine", key=f"{kp}_search",
+                               placeholder="e.g. 98716  ·  158213  ·  Shivam  ·  Glizina").strip().lower()
+    with f2:
+        status_filter = st.multiselect("Show status", sorted(odf["Status"].unique()), default=[], key=f"{kp}_st",
+                                       placeholder="All statuses")
+    match_orders = None
+    if search:
+        s_digits = "".join(ch for ch in search if ch.isdigit())
+        match_orders = set()
+        for l in lines:
+            phone = "".join(ch for ch in str(l.get("customer_phone", "")) if ch.isdigit())
+            if (search in str(l.get("order_no", "")).lower()
+                    or search in str(l.get("customer_name", "")).lower()
+                    or search in str(l.get("item_name", "")).lower()
+                    or (s_digits and len(s_digits) >= 4 and s_digits in phone)):
+                match_orders.add(str(l.get("order_no", "")))
     view = odf if not status_filter else odf[odf["Status"].isin(status_filter)]
+    if match_orders is not None:
+        view = view[view["Order #"].astype(str).isin(match_orders)]
+        st.caption(f"🔍 {len(view)} order(s) match “{search}”")
     st.dataframe(view.drop(columns=["_mins", "_done"]), hide_index=True, width='stretch')
 
     # line level + export
@@ -5098,7 +5117,11 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
     ldf = pd.DataFrame(line_rows)
     if not show_phone:
         ldf = ldf.drop(columns=["Customer Phone"])
-    with st.expander("🔍 Item-level detail"):
+    if match_orders is not None:
+        # show the matching orders' lines; if the search is a medicine name, only those medicines
+        med_hit = ldf["Item Name"].str.lower().str.contains(search, regex=False)
+        ldf = ldf[ldf["Order #"].astype(str).isin(match_orders) & (med_hit if med_hit.any() else True)]
+    with st.expander(f"🔍 Item-level detail ({len(ldf)} medicines)", expanded=bool(search)):
         st.dataframe(ldf, hide_index=True, width='stretch')
     st.download_button("⬇️ Download (with Distributor Name filled)", ldf.to_csv(index=False).encode("utf-8"),
                        file_name=f"customer-orders-{'sched' if date_by == 'Scheduled date' else 'imported'}-{day}-{area.replace(' ', '_')}.csv", mime="text/csv",
