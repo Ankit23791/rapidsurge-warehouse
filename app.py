@@ -4971,25 +4971,48 @@ def order_status(statuses):
 
 def show_customer_order_tracker(kp="trk", show_phone=False):
     st.subheader("📦 Customer Order Tracker")
-    c1, c2 = st.columns(2)
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
+        date_by = st.selectbox("Date type", ["Scheduled date", "Imported on"], key=f"{kp}_dateby")
     with c1:
-        day = st.date_input("Imported on", value=today_ist(), key=f"{kp}_day")
+        day = st.date_input(date_by, value=today_ist(), key=f"{kp}_day")
     with c2:
         area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    with c3:
+        deliv_f = st.selectbox("Delivery", ["All", "✅ Delivered", "❌ Not delivered", "🟡 Partly", "📞 Awaiting call"],
+                               key=f"{kp}_deliv")
     start = IST.localize(datetime(day.year, day.month, day.day))
     from datetime import timedelta
     end = start + timedelta(days=1)
     try:
-        q = supabase.table("customer_order_lines").select("*").eq("removed", False)\
-            .gte("imported_at", start.isoformat()).lt("imported_at", end.isoformat())
+        q = supabase.table("customer_order_lines").select("*").eq("removed", False)
+        if date_by == "Scheduled date":
+            q = q.eq("scheduled_date", day.strftime("%Y-%m-%d"))
+        else:
+            q = q.gte("imported_at", start.isoformat()).lt("imported_at", end.isoformat())
         if area != "All Areas":
             q = q.eq("area", area)
         lines = q.execute().data or []
     except Exception as e:
         st.error(f"Could not load — has the setup SQL been run in Supabase? ({e})")
         return
+
+    def _order_delivery(ls):
+        if all(l.get("delivery_status") == "Delivered" for l in ls):
+            return "✅ Delivered"
+        if all(l.get("delivery_status") == "Not Delivered" for l in ls):
+            return "❌ Not delivered"
+        if any(l.get("delivery_status") for l in ls):
+            return "🟡 Partly"
+        return "📞 Awaiting call"
+    if deliv_f != "All" and lines:
+        by_o = {}
+        for l in lines:
+            by_o.setdefault(l.get("order_no"), []).append(l)
+        keep = {o for o, ls in by_o.items() if _order_delivery(ls) == deliv_f}
+        lines = [l for l in lines if l.get("order_no") in keep]
     if not lines:
-        st.info("No customer orders imported for this day / area.")
+        st.info(f"No customer orders for this {date_by.lower()} / area / delivery filter.")
         return
 
     customer_order_summary(lines)
@@ -5031,9 +5054,7 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
             "⏳ Pending": statuses.count("Pending"),
             "❌ N/A": statuses.count("Not Available") + statuses.count("Short"),
             "Status": stt,
-            "🚚 Delivery": ("✅ Delivered" if all(l.get("delivery_status") == "Delivered" for l in ls)
-                           else "❌ Not delivered" if all(l.get("delivery_status") == "Not Delivered" for l in ls)
-                           else "🟡 Partly" if any(l.get("delivery_status") for l in ls) else "📞 Awaiting call"),
+            "🚚 Delivery": _order_delivery(ls),
             "Imported": t0.strftime("%I:%M %p"),
             "Time": fmt_age(mins) + ("" if done else " (running)"),
             "_mins": mins, "_done": done,
@@ -5080,7 +5101,7 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
     with st.expander("🔍 Item-level detail"):
         st.dataframe(ldf, hide_index=True, width='stretch')
     st.download_button("⬇️ Download (with Distributor Name filled)", ldf.to_csv(index=False).encode("utf-8"),
-                       file_name=f"customer-orders-{day}-{area.replace(' ', '_')}.csv", mime="text/csv",
+                       file_name=f"customer-orders-{'sched' if date_by == 'Scheduled date' else 'imported'}-{day}-{area.replace(' ', '_')}.csv", mime="text/csv",
                        key=f"{kp}_dl")
 
 
