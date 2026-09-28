@@ -7275,13 +7275,440 @@ def show_order_sheet_report(kp="osr"):
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
 
 
+# ── MY DAY (admin's own planner, focus timer, interruption log) ───────────────
+MD_SLOTS = ["Any time"] + [datetime(2000, 1, 1, h, m).strftime("%I:%M %p") for h in range(6, 24) for m in (0, 30)]
+MD_KINDS = ["📞 Call", "💬 WhatsApp", "🚶 Walk-in", "📧 Other"]
+MD_CATS = ["🎯 Deep work", "👥 Team", "📞 Calls / follow-up", "🧾 Admin / accounts", "🏪 Store visit", "🙋 Personal"]
+MD_DEFAULT_WINDOWS = ["11:30 AM", "03:00 PM", "06:00 PM"]
+
+def _md_slot_key(s):
+    try:
+        return datetime.strptime(s, "%I:%M %p").time()
+    except Exception:
+        return datetime.max.time()
+
+def _md_secs(t, now=None):
+    s = int(t.get("actual_secs") or 0)
+    if t.get("status") == "Running" and to_ist(t.get("run_started_at")):
+        s += max(0, int(((now or now_ist()) - to_ist(t.get("run_started_at"))).total_seconds()))
+    return s
+
+def _md_load(person, day):
+    tasks = supabase.table("my_day_tasks").select("*").eq("person", person).eq("day", day).execute().data or []
+    ints = supabase.table("my_day_interruptions").select("*").eq("person", person).eq("day", day).execute().data or []
+    notes = supabase.table("my_day_notes").select("*").eq("person", person).eq("day", day).execute().data or []
+    tasks.sort(key=lambda t: (_md_slot_key(t.get("slot") or ""), int(t.get("id") or 0)))
+    ints.sort(key=lambda i: str(i.get("at") or ""))
+    return tasks, ints, notes
+
+def _md_settings(person):
+    try:
+        r = supabase.table("my_day_settings").select("*").eq("person", person).execute().data or []
+        if r:
+            return (r[0].get("call_windows") or MD_DEFAULT_WINDOWS), int(r[0].get("window_mins") or 20)
+    except Exception:
+        pass
+    return MD_DEFAULT_WINDOWS, 20
+
+def _md_window_status(windows, mins, now=None):
+    now = now or now_ist()
+    starts = []
+    for w in windows:
+        try:
+            starts.append(IST.localize(datetime.combine(now.date(), datetime.strptime(w, "%I:%M %p").time())))
+        except Exception:
+            pass
+    from datetime import timedelta
+    for s in sorted(starts):
+        if s <= now < s + timedelta(minutes=mins):
+            return "now", s + timedelta(minutes=mins)
+    nxt = [s for s in sorted(starts) if s > now]
+    return ("next", nxt[0]) if nxt else ("none", None)
+
+def _md_pause(t, status="Paused"):
+    upd = {"status": status, "actual_secs": _md_secs(t), "run_started_at": None}
+    if status == "Done":
+        upd["ended_at"] = now_iso()
+    supabase.table("my_day_tasks").update(upd).eq("id", t["id"]).execute()
+
+def _md_start(t, tasks):
+    for x in tasks:
+        if x.get("status") == "Running" and x["id"] != t["id"]:
+            _md_pause(x)
+    upd = {"status": "Running", "run_started_at": now_iso()}
+    if not t.get("started_at"):
+        upd["started_at"] = now_iso()
+    supabase.table("my_day_tasks").update(upd).eq("id", t["id"]).execute()
+
+def _md_close_int(i):
+    t = to_ist(i.get("at"))
+    mins = max(1, round((now_ist() - t).total_seconds() / 60)) if t else None
+    supabase.table("my_day_interruptions").update({"ended_at": now_iso(), "mins": mins}).eq("id", i["id"]).execute()
+
+def _md_move_unfinished(person, from_day, to_day):
+    old = supabase.table("my_day_tasks").select("*").eq("person", person).eq("day", from_day).execute().data or []
+    n = 0
+    for t in old:
+        if t.get("status") in ("Planned", "Paused", "Running"):
+            left = max(5, int(t.get("planned_mins") or 30) - _md_secs(t) // 60)
+            supabase.table("my_day_tasks").insert({
+                "person": person, "day": to_day, "title": t.get("title"), "category": t.get("category"),
+                "slot": t.get("slot") or "Any time", "planned_mins": left, "top3": bool(t.get("top3")),
+                "status": "Planned", "actual_secs": 0, "carried_from": t["id"]}).execute()
+            if t.get("status") == "Running":
+                _md_pause(t)
+            supabase.table("my_day_tasks").update({"status": "Moved"}).eq("id", t["id"]).execute()
+            n += 1
+    return n
+
+def _md_team_names():
+    return sorted(u.get("name") for u in (load_users() or {}).values() if u.get("name"))
+
+def show_my_day(kp="md"):
+    person = st.session_state.name
+    st.subheader("🎯 My Day")
+    try:
+        windows, wmins = _md_settings(person)
+        tasks, ints, notes = _md_load(person, date_str())
+    except Exception as e:
+        st.error(f"Could not load My Day — has my_day_setup.sql been run in Supabase? ({e})")
+        return
+    now = now_ist()
+    running = next((t for t in tasks if t.get("status") == "Running"), None)
+    open_int = next((i for i in ints if not i.get("ended_at")), None)
+    live = [t for t in tasks if t.get("status") != "Moved"]
+    focus = sum(_md_secs(t, now) for t in live)
+    stars = [t for t in live if t.get("top3")]
+    wst, wtime = _md_window_status(windows, wmins, now)
+
+    m = st.columns(5)
+    with m[0]: st.metric("✅ Done", f"{sum(1 for t in live if t.get('status') == 'Done')} / {len(live)}")
+    with m[1]: st.metric("⭐ Top 3 done", f"{sum(1 for t in stars if t.get('status') == 'Done')} / {len(stars)}")
+    with m[2]: st.metric("⏱️ Focus time", fmt_secs(focus))
+    with m[3]: st.metric("📞 Interruptions", len(ints), f"{sum(int(i.get('mins') or 0) for i in ints)} min", delta_color="off")
+    with m[4]:
+        if wst == "now":
+            st.metric("📞 Call window", "NOW", f"until {wtime.strftime('%I:%M %p')}", delta_color="off")
+        elif wst == "next":
+            st.metric("📵 Focus — next call window", wtime.strftime("%I:%M %p"))
+        else:
+            st.metric("📞 Call windows", "Done for today")
+
+    view = st.radio("View", ["▶️ Today", "📝 Plan", "📊 Review", "📈 Weekly", "⚙️ Call windows"], horizontal=True,
+                    key=f"{kp}_view", label_visibility="collapsed")
+    if view == "▶️ Today":
+        _md_today(kp, person, tasks, ints, notes, running, open_int, now)
+    elif view == "📝 Plan":
+        _md_plan(kp, person, tasks)
+    elif view == "📊 Review":
+        _md_review(kp, person)
+    elif view == "📈 Weekly":
+        _md_weekly(kp, person)
+    else:
+        _md_windows(kp, person, windows, wmins)
+
+def _md_int_form(kp, running):
+    with st.form(f"{kp}_int_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1: kind = st.radio("Type", MD_KINDS, key=f"{kp}_int_kind")
+        with c2:
+            who = st.selectbox("Who", ["—"] + _md_team_names() + ["Customer", "Distributor", "Family", "Other"], key=f"{kp}_int_who")
+            who_other = st.text_input("…or name", key=f"{kp}_int_who2")
+        with c3:
+            why = st.text_input("Why? (one or two words — e.g. bill status, payment, stock)", key=f"{kp}_int_why")
+            urgent = st.checkbox("Really needed me now", key=f"{kp}_int_urgent",
+                                 help="Untick if it could have waited for a call window or been answered by the app")
+        if st.form_submit_button("⏸️ Log & pause" if running else "📝 Log", type="primary"):
+            if running:
+                _md_pause(running)
+            supabase.table("my_day_interruptions").insert({
+                "person": st.session_state.name, "day": date_str(), "at": now_iso(),
+                "kind": kind, "who": who_other.strip() or (who if who != "—" else ""), "why": why.strip(),
+                "urgent": urgent, "task_id": running["id"] if running else None}).execute()
+            st.session_state[f"{kp}_int_open"] = False
+            st.rerun()
+
+def _md_today(kp, person, tasks, ints, notes, running, open_int, now):
+    # current state banner
+    if open_int:
+        back = next((t for t in tasks if t["id"] == open_int.get("task_id")), None)
+        st.warning(f"📞 **On interruption since {to_ist(open_int['at']).strftime('%I:%M %p')}** "
+                   f"({fmt_age(age_mins(open_int['at'], now))}) — {open_int.get('kind','')} {open_int.get('who','')}"
+                   + (f" · {open_int.get('why')}" if open_int.get("why") else ""))
+        c1, c2 = st.columns(2)
+        with c1:
+            if back and back.get("status") != "Done" and st.button(f"▶️ Back to: {back.get('title')}", key=f"{kp}_back",
+                                                                  type="primary", width='stretch'):
+                _md_close_int(open_int)
+                _md_start(back, tasks)
+                st.rerun()
+        with c2:
+            if st.button("✔️ Interruption finished", key=f"{kp}_int_done", width='stretch'):
+                _md_close_int(open_int)
+                st.rerun()
+    elif running:
+        secs = _md_secs(running, now)
+        plan = int(running.get("planned_mins") or 0) * 60
+        over = plan and secs > plan
+        st.success(f"🎯 **FOCUS: {running.get('title')}** — {fmt_secs(secs)}"
+                   + (f" of {running.get('planned_mins')} min planned" if plan else "")
+                   + (" · ⚠️ over plan" if over else ""))
+        if plan:
+            st.progress(min(1.0, secs / plan))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("✅ Done", key=f"{kp}_done", type="primary", width='stretch'):
+                _md_pause(running, "Done")
+                st.session_state["mission_done"] = secs
+                st.rerun()
+        with c2:
+            if st.button("⏸️ Pause", key=f"{kp}_pause", width='stretch'):
+                _md_pause(running)
+                st.rerun()
+        with c3:
+            if st.button("📞 Interrupted!", key=f"{kp}_int_btn", width='stretch'):
+                st.session_state[f"{kp}_int_open"] = True
+    else:
+        st.info("Nothing running. Pick a task below and press ▶️ — start with a ⭐ one.")
+
+    if not open_int and (st.session_state.get(f"{kp}_int_open") or not running):
+        with st.expander("📞 Log an interruption", expanded=bool(st.session_state.get(f"{kp}_int_open"))):
+            _md_int_form(kp, running)
+
+    # task list
+    live = [t for t in tasks if t.get("status") != "Moved"]
+    if not live:
+        st.info("No plan for today yet — open 📝 Plan and add your tasks (top 3 first).")
+    else:
+        st.markdown("**📋 Today's plan**")
+        icon = {"Planned": "⚪", "Running": "🟢", "Paused": "⏸️", "Done": "✅"}
+        for t in live:
+            secs = _md_secs(t, now)
+            c1, c2, c3 = st.columns([6, 2, 1])
+            with c1:
+                st.markdown(f"{icon.get(t.get('status'), '⚪')} {'⭐ ' if t.get('top3') else ''}**{t.get('title')}** "
+                            f"· {t.get('slot') or 'Any time'} · {t.get('category') or ''}")
+            with c2:
+                st.markdown(f"{fmt_secs(secs) if secs else '—'} / {t.get('planned_mins')} min")
+            with c3:
+                if t.get("status") in ("Planned", "Paused") and st.button("▶️", key=f"{kp}_start_{t['id']}",
+                                                                         help="Start (pauses whatever is running)"):
+                    if open_int:
+                        _md_close_int(open_int)
+                    _md_start(t, tasks)
+                    st.rerun()
+
+    # parking lot
+    st.markdown("**🅿️ Parking lot** — a thought pops up? Write it here and go back to your task.")
+    with st.form(f"{kp}_note_form", clear_on_submit=True):
+        c1, c2 = st.columns([5, 1])
+        with c1: txt = st.text_input("Note", key=f"{kp}_note", label_visibility="collapsed", placeholder="e.g. check Sehgal payment")
+        with c2: add = st.form_submit_button("➕ Park it")
+        if add and txt.strip():
+            supabase.table("my_day_notes").insert({"person": person, "day": date_str(), "text": txt.strip(), "done": False}).execute()
+            st.rerun()
+    for n in sorted(notes, key=lambda n: (bool(n.get("done")), n["id"])):
+        c1, c2 = st.columns([6, 1])
+        with c1: st.markdown(("~~" + n["text"] + "~~") if n.get("done") else f"• {n['text']}")
+        with c2:
+            if not n.get("done") and st.button("✔️", key=f"{kp}_nd_{n['id']}", help="Done"):
+                supabase.table("my_day_notes").update({"done": True}).eq("id", n["id"]).execute()
+                st.rerun()
+
+def _md_plan(kp, person, tasks):
+    from datetime import timedelta
+    st.caption("Plan in 5 minutes: pick your ⭐ top 3 (the tasks that make today a good day), give each a time slot and an estimate.")
+    live = [t for t in tasks if t.get("status") != "Moved"]
+    y = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+    c1, c2 = st.columns([3, 1])
+    with c2:
+        if st.button("↪️ Bring yesterday's unfinished", key=f"{kp}_carry", width='stretch'):
+            n = _md_move_unfinished(person, y, date_str())
+            st.session_state[f"{kp}_msg"] = f"↪️ {n} unfinished task(s) brought from yesterday" if n else "Nothing unfinished yesterday 👍"
+            st.rerun()
+    msg = st.session_state.pop(f"{kp}_msg", None)
+    if msg:
+        st.success(msg)
+    with st.form(f"{kp}_add", clear_on_submit=True):
+        c1, c2, c3, c4, c5 = st.columns([4, 2, 2, 1, 1])
+        with c1: title = st.text_input("Task *", placeholder="e.g. Review Normal Orders report")
+        with c2: cat = st.selectbox("Type", MD_CATS)
+        with c3: slot = st.selectbox("Time slot", MD_SLOTS)
+        with c4: mins = st.number_input("Mins", min_value=5, max_value=480, value=30, step=5)
+        with c5:
+            st.write("")
+            top = st.checkbox("⭐ Top 3")
+        if st.form_submit_button("➕ Add", type="primary"):
+            if not title.strip():
+                st.error("Write the task.")
+            else:
+                supabase.table("my_day_tasks").insert({
+                    "person": person, "day": date_str(), "title": title.strip(), "category": cat, "slot": slot,
+                    "planned_mins": int(mins), "top3": top, "status": "Planned", "actual_secs": 0}).execute()
+                st.rerun()
+    if not live:
+        return
+    n_star = sum(1 for t in live if t.get("top3"))
+    total = sum(int(t.get("planned_mins") or 0) for t in live)
+    st.markdown(f"**{len(live)} tasks · {total // 60}h {total % 60}m planned · ⭐ {n_star}**"
+                + (" — ⚠️ more than 3 stars: a top 3 only works if it's 3" if n_star > 3 else ""))
+    if total > 6 * 60:
+        st.warning("⚠️ More than 6 hours planned. Calls and team work will take time too — plan less, finish more.")
+    df = pd.DataFrame([{"id": t["id"], "⭐": bool(t.get("top3")), "Task": t.get("title"), "Type": t.get("category") or MD_CATS[0],
+                        "Slot": t.get("slot") or "Any time", "Mins": int(t.get("planned_mins") or 0),
+                        "Status": t.get("status"), "🗑️": False} for t in live])
+    ver = st.session_state.get(f"{kp}_pver", 0)
+    ed = st.data_editor(df, key=f"{kp}_ped_{ver}", hide_index=True, width='stretch', disabled=["Status"],
+                        column_config={"id": None, "⭐": st.column_config.CheckboxColumn("⭐"),
+                                       "Type": st.column_config.SelectboxColumn("Type", options=MD_CATS),
+                                       "Slot": st.column_config.SelectboxColumn("Slot", options=MD_SLOTS),
+                                       "Mins": st.column_config.NumberColumn("Mins", min_value=5, max_value=480, step=5),
+                                       "🗑️": st.column_config.CheckboxColumn("🗑️ Delete")})
+    old = {r["id"]: r for r in df.to_dict("records")}
+    ch = [r for r in ed.to_dict("records") if any(r[k] != old[r["id"]][k] for k in ("⭐", "Task", "Type", "Slot", "Mins", "🗑️"))]
+    if st.button(f"💾 Save plan changes ({len(ch)})", key=f"{kp}_psave", disabled=not ch):
+        for r in ch:
+            if r["🗑️"]:
+                supabase.table("my_day_tasks").delete().eq("id", r["id"]).execute()
+            else:
+                supabase.table("my_day_tasks").update({"top3": bool(r["⭐"]), "title": r["Task"], "category": r["Type"],
+                                                       "slot": r["Slot"], "planned_mins": int(r["Mins"])}).eq("id", r["id"]).execute()
+        st.session_state[f"{kp}_pver"] = ver + 1
+        st.rerun()
+
+def _md_count(items, key):
+    out = {}
+    for i in items:
+        k = (i.get(key) or "").strip() or "—"
+        out[k] = out.get(k, 0) + 1
+    return sorted(out.items(), key=lambda kv: -kv[1])
+
+def _md_review(kp, person):
+    from datetime import timedelta
+    day = st.date_input("Day", value=today_ist(), key=f"{kp}_rday")
+    d = day.strftime("%Y-%m-%d")
+    tasks, ints, _ = _md_load(person, d)
+    live = [t for t in tasks if t.get("status") != "Moved"]
+    if not live and not ints:
+        st.info("Nothing recorded for this day.")
+        return
+    planned = sum(int(t.get("planned_mins") or 0) for t in live) * 60
+    actual = sum(_md_secs(t) for t in live)
+    done_actual = sum(_md_secs(t) for t in live if t.get("status") == "Done")
+    done_plan = sum(int(t.get("planned_mins") or 0) for t in live if t.get("status") == "Done") * 60
+    stars = [t for t in live if t.get("top3")]
+    int_min = sum(int(i.get("mins") or 0) for i in ints)
+    avoid = sum(1 for i in ints if i.get("urgent") is False)
+    m = st.columns(5)
+    with m[0]: st.metric("✅ Tasks done", f"{sum(1 for t in live if t.get('status') == 'Done')} / {len(live)}")
+    with m[1]: st.metric("⭐ Top 3 done", f"{sum(1 for t in stars if t.get('status') == 'Done')} / {len(stars)}")
+    with m[2]: st.metric("⏱️ Focus time", fmt_secs(actual), f"planned {fmt_secs(planned)}", delta_color="off")
+    with m[3]: st.metric("📞 Interruptions", len(ints), f"{int_min} min lost", delta_color="off")
+    with m[4]: st.metric("🙅 Could have waited", avoid, help="Interruptions you marked as not really needing you then")
+    if done_plan:
+        ratio = done_actual / done_plan
+        st.caption(f"Finished tasks took **{round(ratio * 100)}%** of the time you estimated"
+                   + (" — you're under-estimating; add a buffer." if ratio > 1.3 else " — good estimates 👍" if ratio >= 0.8 else " — you over-estimate; you can plan more."))
+    if live:
+        rows = []
+        for t in live:
+            a = _md_secs(t)
+            p = int(t.get("planned_mins") or 0)
+            rows.append({"⭐": "⭐" if t.get("top3") else "", "Task": t.get("title"), "Type": t.get("category"),
+                         "Slot": t.get("slot"),
+                         "Started": to_ist(t.get("started_at")).strftime("%I:%M %p") if to_ist(t.get("started_at")) else "",
+                         "Planned": f"{p} min", "Actual": fmt_secs(a) if a else "—",
+                         "Diff": (f"+{round(a / 60 - p)} min" if a / 60 > p else f"{round(a / 60 - p)} min") if a else "",
+                         "Interruptions": sum(1 for i in ints if i.get("task_id") == t["id"]),
+                         "Status": t.get("status")})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+    if ints:
+        st.markdown("**📞 Interruptions**")
+        tmap = {t["id"]: t.get("title") for t in tasks}
+        st.dataframe(pd.DataFrame([{"Time": to_ist(i.get("at")).strftime("%I:%M %p") if to_ist(i.get("at")) else "",
+                                    "Type": i.get("kind"), "Who": i.get("who"), "Why": i.get("why"),
+                                    "Mins": i.get("mins") or "", "Needed me?": "✅" if i.get("urgent") else "🙅 could wait",
+                                    "During": tmap.get(i.get("task_id"), "")} for i in ints]),
+                     hide_index=True, width='stretch')
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Who interrupted most**")
+            st.markdown("\n".join(f"- {k}: **{v}**" for k, v in _md_count(ints, "who")[:8]))
+        with c2:
+            st.markdown("**Why**")
+            st.markdown("\n".join(f"- {k}: **{v}**" for k, v in _md_count(ints, "why")[:8]))
+    unfinished = [t for t in live if t.get("status") in ("Planned", "Paused", "Running")]
+    if d == date_str() and unfinished:
+        if st.button(f"➡️ Move {len(unfinished)} unfinished task(s) to tomorrow", key=f"{kp}_tomorrow"):
+            n = _md_move_unfinished(person, d, (today_ist() + timedelta(days=1)).strftime("%Y-%m-%d"))
+            st.success(f"➡️ {n} task(s) moved to tomorrow")
+
+def _md_weekly(kp, person):
+    from datetime import timedelta
+    start = (today_ist() - timedelta(days=13)).strftime("%Y-%m-%d")
+    tasks = fetch_all("my_day_tasks", lambda q: q.eq("person", person).gte("day", start))
+    ints = fetch_all("my_day_interruptions", lambda q: q.eq("person", person).gte("day", start))
+    if not tasks and not ints:
+        st.info("No data yet — use My Day for a few days and the trend appears here.")
+        return
+    def day_stats(d):
+        ts = [t for t in tasks if t.get("day") == d and t.get("status") != "Moved"]
+        its = [i for i in ints if i.get("day") == d]
+        st_ = [t for t in ts if t.get("top3")]
+        return {"Day": datetime.strptime(d, "%Y-%m-%d").strftime("%a %d %b"),
+                "Planned": len(ts), "Done": sum(1 for t in ts if t.get("status") == "Done"),
+                "⭐ Top 3 done": f"{sum(1 for t in st_ if t.get('status') == 'Done')}/{len(st_)}" if st_ else "",
+                "Focus hrs": round(sum(_md_secs(t) for t in ts) / 3600, 1),
+                "Interruptions": len(its), "Mins lost": sum(int(i.get("mins") or 0) for i in its),
+                "Could have waited": sum(1 for i in its if i.get("urgent") is False)}
+    days = [(today_ist() - timedelta(days=k)).strftime("%Y-%m-%d") for k in range(13, -1, -1)]
+    rows = [day_stats(d) for d in days]
+    this, last = rows[7:], rows[:7]
+    tot = lambda rs, k: sum(r[k] for r in rs)
+    m = st.columns(4)
+    with m[0]: st.metric("⏱️ Focus hrs (7 days)", round(tot(this, "Focus hrs"), 1),
+                         round(tot(this, "Focus hrs") - tot(last, "Focus hrs"), 1))
+    with m[1]: st.metric("✅ Tasks done (7 days)", tot(this, "Done"), tot(this, "Done") - tot(last, "Done"))
+    with m[2]: st.metric("📞 Interruptions (7 days)", tot(this, "Interruptions"),
+                         tot(this, "Interruptions") - tot(last, "Interruptions"), delta_color="inverse")
+    with m[3]: st.metric("⏳ Mins lost (7 days)", tot(this, "Mins lost"), tot(this, "Mins lost") - tot(last, "Mins lost"),
+                         delta_color="inverse")
+    st.caption("Change is vs the 7 days before. Green = better.")
+    st.dataframe(pd.DataFrame([r for r in this if r["Planned"] or r["Interruptions"]] or this),
+                 hide_index=True, width='stretch')
+    week_ints = [i for i in ints if i.get("day") >= days[7]]
+    if week_ints:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Who interrupted most this week**")
+            st.markdown("\n".join(f"- {k}: **{v}**" for k, v in _md_count(week_ints, "who")[:10]))
+        with c2:
+            st.markdown("**Top reasons this week**")
+            st.markdown("\n".join(f"- {k}: **{v}**" for k, v in _md_count(week_ints, "why")[:10]))
+        st.caption("💡 The same reason again and again? Fix it once — a rule, a WhatsApp group, or an app screen — instead of answering it daily.")
+
+def _md_windows(kp, person, windows, wmins):
+    st.caption("Fixed times when you return calls and reply on WhatsApp. Between them your phone is on Do Not Disturb "
+               "(starred contacts only; team calls twice for a real emergency).")
+    with st.form(f"{kp}_win"):
+        sel = st.multiselect("Call windows", MD_SLOTS[1:], default=[w for w in windows if w in MD_SLOTS], key=f"{kp}_wsel")
+        mins = st.number_input("Minutes per window", min_value=5, max_value=90, value=wmins, step=5, key=f"{kp}_wmins")
+        if st.form_submit_button("💾 Save", type="primary"):
+            sel = sorted(sel, key=_md_slot_key)
+            supabase.table("my_day_settings").upsert({"person": person, "call_windows": sel, "window_mins": int(mins)},
+                                                     on_conflict="person").execute()
+            st.success("✅ Saved")
+            st.rerun()
+
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11 = st.tabs([
+    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11 = st.tabs([
+        "🎯 My Day",
         "📊 Dashboard",
         "👥 All Staff Work",
         "🔄 Pipeline",
@@ -7296,6 +7723,9 @@ def show_admin_page():
         "📌 Assign Tasks",
         "📅 Shift Planner"
     ])
+
+    with tab0:
+        show_my_day("md")
 
     with tab11:
         show_shift_planner("adm_shift")
