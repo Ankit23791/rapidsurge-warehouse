@@ -4774,27 +4774,67 @@ def form_import_orders():
         st.session_state["imp_ver"] = st.session_state.get("imp_ver", 0) + 1
 
 # ── PURCHASE: PENDING ITEMS ───────────────────────────────────────────────────
+DELIVERY_TIMES = [""] + [datetime(2000, 1, 1, h, m).strftime("%I:%M %p") for h in range(7, 24) for m in (0, 30)]
+
+def due_info(line, now=None):
+    """(flag, minutes_left, label) from scheduled date + promised delivery time; None if no time"""
+    t = (line.get("delivery_time") or "").strip()
+    d = (line.get("scheduled_date") or "").strip()
+    if not t or not d:
+        return None
+    try:
+        due = IST.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %I:%M %p"))
+    except Exception:
+        return None
+    left = int(((due - (now or now_ist())).total_seconds()) // 60)
+    flag = "🔴" if left <= 60 else ("🟡" if left <= 180 else "🟢")
+    label = f"overdue {fmt_age(-left)}" if left < 0 else f"in {fmt_age(left)}"
+    return flag, left, label
+
+def _sched_label(d):
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b")
+    except Exception:
+        return d or ""
+
 def form_pending_items():
     st.subheader("🧾 Pending Customer Items")
     st.caption("For each item: 🏪 **In Store** (available, nothing to buy) or ❌ **Not Available** (can't be sourced). "
-               "Items to buy from a distributor → tick them in **📦 Arrangement Order**.")
-    area = st.selectbox("Area", ["All Areas"] + load_areas(), key="pi_area")
+               "Items to buy from a distributor → tick them in **📦 Arrangement Order**. "
+               "Set **Deliver by** (time promised to the customer) — it applies to the whole order.")
     try:
-        lines = get_open_lines(area)
+        all_lines = get_open_lines(None)
     except Exception as e:
         st.error(f"Could not load items — has the setup SQL been run in Supabase? ({e})")
         return
+    c1, c2 = st.columns(2)
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key="pi_area")
+    dates = sorted(set(l.get("scheduled_date") or "" for l in all_lines))
+    with c2:
+        sched = st.selectbox("Scheduled date", ["All dates"] + [d for d in dates if d], key="pi_sched",
+                             format_func=lambda d: d if d == "All dates" else _sched_label(d))
+    lines = [l for l in all_lines
+             if (area == "All Areas" or l.get("area") == area) and (sched == "All dates" or l.get("scheduled_date") == sched)]
     if not lines:
-        st.success("🎉 No pending customer items!")
+        st.success("🎉 No pending customer items for this filter!")
         return
 
     now = now_ist()
+    def sort_key(l):
+        di = due_info(l, now)
+        return (l.get("scheduled_date") or "9999", di[1] if di else 10**9, str(l.get("imported_at") or ""), str(l.get("order_no")))
+    lines = sorted(lines, key=sort_key)
     rows = []
     for l in lines:
         a = age_mins(l.get("imported_at"), now)
+        di = due_info(l, now)
         rows.append({
             "id": l["id"],
-            "⏰": age_flag(a),
+            "⏰": di[0] if di else age_flag(a),
+            "Sched": _sched_label(l.get("scheduled_date")),
+            "Deliver by": l.get("delivery_time") or "",
+            "Due": di[2] if di else "",
             "Age": fmt_age(a),
             "Order #": l.get("order_no", ""),
             "Customer": l.get("customer_name", ""),
@@ -4806,35 +4846,47 @@ def form_pending_items():
             "Action": "—",
         })
     df = pd.DataFrame(rows)
-    late = sum(1 for r in rows if r["⏰"] == "🔴")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Pending Items", len(rows))
     with c2: st.metric("Orders", df["Order #"].nunique())
-    with c3: st.metric("🔴 Over 3 hrs", late)
+    with c3: st.metric("🔴 Due within 1 hr / overdue", sum(1 for l in lines if (due_info(l, now) or (None, 10**9))[1] <= 60))
+    with c4: st.metric("⏱️ No delivery time set", df[df["Deliver by"] == ""]["Order #"].nunique())
 
     ver = st.session_state.get("pi_ver", 0)
     edited = st.data_editor(
         df, key=f"pi_editor_{ver}", hide_index=True, width='stretch',
-        disabled=[c for c in df.columns if c != "Action"],
+        disabled=[c for c in df.columns if c not in ("Action", "Deliver by")],
         column_config={
             "id": None,
+            "Deliver by": st.column_config.SelectboxColumn("Deliver by", options=DELIVERY_TIMES,
+                                                           help="Time promised to the customer (whole order)"),
             "Action": st.column_config.SelectboxColumn(
                 "Action", options=["—", "🏪 In Store", "❌ Not Available"], required=True),
         })
+    st.caption("⏰ with a delivery time: 🔴 due within 1 hr or overdue · 🟡 within 3 hrs · 🟢 later. "
+               "Without a time: age since upload.")
     chosen = edited[edited["Action"] != "—"]
-    if st.button(f"💾 Save {len(chosen)} decision(s)", type="primary", key="pi_save",
-                 disabled=chosen.empty, width='stretch'):
+    old_time = {r["id"]: r["Deliver by"] for r in rows}
+    time_changes = {}
+    for _, r in edited.iterrows():
+        if (r["Deliver by"] or "") != (old_time.get(r["id"]) or ""):
+            time_changes[str(r["Order #"])] = r["Deliver by"] or None
+    n_changes = len(chosen) + len(time_changes)
+    if st.button(f"💾 Save ({len(chosen)} decision(s), {len(time_changes)} delivery time(s))", type="primary",
+                 key="pi_save", disabled=n_changes == 0, width='stretch'):
         by_id = {l["id"]: l for l in lines}
         n_store = n_na = 0
         now_s = now_iso()
         try:
+            for order_no, t in time_changes.items():
+                supabase.table("customer_order_lines").update({"delivery_time": t})\
+                    .eq("order_no", order_no).eq("removed", False).execute()
             for _, r in chosen.iterrows():
                 line = by_id.get(int(r["id"]))
                 if not line:
                     continue
                 decision = "In Store" if "In Store" in r["Action"] else "Not Available"
                 if line.get("status") == "Partly Arranged":
-                    # rest of a split line: record what happened to the remainder
                     supabase.table("customer_order_lines").update({
                         "remainder_note": decision, "decided_by": st.session_state.name,
                         "decided_at": now_s}).eq("id", line["id"]).execute()
@@ -4847,13 +4899,14 @@ def form_pending_items():
                     n_store += 1
                 else:
                     n_na += 1
-            log_simple_task("Customer Items Check", {"area": area, "lines": str(n_store + n_na),
-                                                     "in_store": str(n_store), "not_available": str(n_na)})
+            if n_store + n_na:
+                log_simple_task("Customer Items Check", {"area": area, "lines": str(n_store + n_na),
+                                                         "in_store": str(n_store), "not_available": str(n_na)})
             st.session_state["pi_ver"] = ver + 1
-            st.success(f"✅ Saved: {n_store} In Store · {n_na} Not Available")
+            st.success(f"✅ Saved: {n_store} In Store · {n_na} Not Available · {len(time_changes)} delivery time(s)")
             st.rerun()
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error: {e} — has delivery_time_setup.sql been run in Supabase?")
 
 # ── ARRANGEMENT FORM: pick customer lines ────────────────────────────────────
 def arrangement_line_picker():
@@ -4873,10 +4926,15 @@ def arrangement_line_picker():
             st.info("No pending customer items for this area.")
             return link_area, []
         now = now_ist()
+        open_lines = sorted(open_lines, key=lambda l: (l.get("scheduled_date") or "9999",
+                                                       (due_info(l, now) or (None, 10**9))[1],
+                                                       str(l.get("imported_at") or "")))
         ldf = pd.DataFrame([{
             "id": l["id"],
             "Order?": False,
-            "⏰": age_flag(age_mins(l.get("imported_at"), now)),
+            "⏰": (due_info(l, now) or (age_flag(age_mins(l.get("imported_at"), now)),))[0],
+            "Deliver by": (f"{_sched_label(l.get('scheduled_date'))} {l.get('delivery_time')}"
+                           if l.get("delivery_time") else _sched_label(l.get("scheduled_date"))),
             "Order #": l.get("order_no", ""),
             "Customer": l.get("customer_name", ""),
             "Item": l.get("item_name", ""),
@@ -4886,7 +4944,7 @@ def arrangement_line_picker():
         } for l in open_lines])
         ed = st.data_editor(
             ldf, key=f"arr_link_editor_{ver}", hide_index=True, width='stretch',
-            disabled=["⏰", "Order #", "Customer", "Item", "Pack", "Needed"],
+            disabled=["⏰", "Deliver by", "Order #", "Customer", "Item", "Pack", "Needed"],
             column_config={
                 "id": None,
                 "Order?": st.column_config.CheckboxColumn("Order?", help="Tick items you are ordering from this distributor"),
@@ -5021,7 +5079,7 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
     # arrangement links for distributor names
     links = {}
     for part in _chunks([l["id"] for l in lines], 100):
-        for a in supabase.table("arrangement_lines").select("line_id,arrangement_no,distributor")\
+        for a in supabase.table("arrangement_lines").select("line_id,arrangement_no,distributor,ordered_by,ordered_at")\
                 .in_("line_id", part).execute().data or []:
             links.setdefault(a["line_id"], []).append(a)
 
@@ -5045,8 +5103,12 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
         }
         if show_phone:
             row["Phone"] = ls[0].get("customer_phone", "")
+        di = due_info(ls[0], now)
         row.update({
             "Area": ls[0].get("area", ""),
+            "Sched": _sched_label(ls[0].get("scheduled_date")),
+            "Deliver by": (f"{di[0]} {ls[0].get('delivery_time')} ({di[2]})" if di and not done
+                           else (ls[0].get("delivery_time") or "")),
             "Items": len(ls),
             "🏪 Store": statuses.count("In Store"),
             "📦 Arranged": sum(1 for s in statuses if s in ("Arranged", "Partly Arranged")),
@@ -5106,8 +5168,12 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
             "Item Name": l.get("item_name", ""),
             "Pack Size": l.get("pack_size", ""),
             "Qty": _qty_txt(l.get("qty")),
+            "Deliver by": l.get("delivery_time") or "",
             "Distributor Name": ", ".join(sorted(set(a.get("distributor", "") for a in ls))),
             "ARR No": ", ".join(sorted(set(a.get("arrangement_no", "") for a in ls))),
+            "Arranged By": ", ".join(sorted(set(a.get("ordered_by", "") or "" for a in ls))),
+            "Arranged At": ", ".join(sorted(set(to_ist(a.get("ordered_at")).strftime("%d %b %I:%M %p")
+                                                for a in ls if to_ist(a.get("ordered_at"))))),
             "Area": l.get("area", ""),
             "Status": LINE_ICON.get(l.get("status", ""), l.get("status", "")),
             "Checked By": l.get("decided_by", "") or "",
