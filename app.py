@@ -716,49 +716,50 @@ def form_arrangement():
 
     st.info(f"🔢 Auto Arrangement No: **{auto_arr_no}**")
 
-    st.markdown("📸 **Image of Order**")
-    arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key="arr_upload")
-    if arr_img:
-        st.session_state["arr_img"] = arr_img
-    elif "arr_img" not in st.session_state:
-        st.session_state["arr_img"] = None
-
     # Customer order items to link (optional)
     link_area, picked_lines = arrangement_line_picker()
+    picked_lines = [p for p in picked_lines if _to_float(p.get("Order Qty"), 0) > 0]
 
-    with st.form("arrangement_form", clear_on_submit=True):
+    # form keys change after each saved order -> fresh form; they do NOT change on an error,
+    # so a missing photo no longer resets the distributor / area
+    fv = st.session_state.get("arr_form_ver", 0)
+    area_default = link_area if link_area in AREAS else None
+    with st.form(f"arrangement_form_{fv}", clear_on_submit=False):
         c1,c2 = st.columns(2)
         with c1:
             arr_no        = st.text_input("Arrangement No", value=auto_arr_no, disabled=True)
-            distributor   = st.selectbox("Distributor *", DISTRIBUTORS, key="arr_dist")
-            area          = st.selectbox("Customer Area *", AREAS, key="arr_area")
-            bill_order_id = st.text_input("Bill Number / Order ID")
+            distributor   = st.selectbox("Distributor *", DISTRIBUTORS, key=f"arr_dist_{fv}")
+            area          = st.selectbox("Customer Area *", AREAS,
+                                         index=AREAS.index(area_default) if area_default else 0,
+                                         key=f"arr_area_{fv}_{area_default}",
+                                         disabled=bool(picked_lines),
+                                         help="Filled from the customer-order area above" if picked_lines else None)
+            bill_order_id = st.text_input("Bill Number / Order ID", key=f"arr_bill_{fv}")
         with c2:
-            urgency       = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="arr_urgency")
-            pickup_type   = st.selectbox("Pickup Type", ["Self Pick","Porter","Distributor Delivers"], key="arr_pickup")
-            no_medicines  = st.number_input("No of Medicines to Pick", min_value=0, max_value=200, step=1,
-                                            help="Maximum 200 medicines per arrangement")
-            order_time    = st.text_input("Order Time", value=time_str())
-
-        medicines = st.text_area("Medicines (one per line)" + ("" if picked_lines else " *"),
-                                 placeholder="Medicine 1 - Qty\nMedicine 2 - Qty" +
-                                 ("\n(optional — ticked customer items are added automatically)" if picked_lines else ""))
-        remarks = st.text_input("Remarks")
+            urgency       = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key=f"arr_urgency_{fv}")
+            pickup_type   = st.selectbox("Pickup Type", ["Self Pick","Porter","Distributor Delivers"], key=f"arr_pickup_{fv}")
+            no_medicines  = st.number_input("No of Medicines to Pick *", min_value=0, max_value=200, step=1,
+                                            value=len(picked_lines),
+                                            key=f"arr_nmed_{fv}_{len(picked_lines)}",
+                                            help="Filled from the ticked customer items — add any extra medicines. Max 200.")
+            order_time    = st.text_input("Order Time", value=time_str(), key=f"arr_time_{fv}")
+        remarks = st.text_input("Remarks", key=f"arr_remarks_{fv}")
+        st.markdown("📸 **Image of Order ***")
+        arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key=f"arr_upload_{fv}")
 
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
+            medicines = ""
             if picked_lines:
                 # Ticked customer items: area comes from them, medicines added automatically
                 area = link_area
-                auto_meds = [f"{p.get('Item','')} {('(' + str(p.get('Pack')) + ')') if p.get('Pack') else ''}".strip()
-                             + f" - {_qty_txt(min(_to_float(p.get('Order Qty'),0), _to_float(p.get('Needed'),0)))}"
-                             for p in picked_lines if _to_float(p.get('Order Qty'),0) > 0]
-                medicines = "\n".join(auto_meds + ([medicines.strip()] if medicines.strip() else []))
-                if not no_medicines:
-                    no_medicines = len([m for m in medicines.split("\n") if m.strip()])
-            if not arr_no or not medicines:
-                st.error("Fill Arrangement No and Medicines!")
-            elif st.session_state.get("arr_img") is None:
-                st.error("⚠️ Image of order is mandatory! Please upload or take photo.")
+                medicines = "\n".join(
+                    f"{p.get('Item','')} {('(' + str(p.get('Pack')) + ')') if p.get('Pack') else ''}".strip()
+                    + f" - {_qty_txt(min(_to_float(p.get('Order Qty'),0), _to_float(p.get('Needed'),0)))}"
+                    for p in picked_lines)
+            if not no_medicines:
+                st.error("Enter No of Medicines to Pick!")
+            elif arr_img is None:
+                st.error("⚠️ Image of order is mandatory! Please upload or take photo (just above Submit).")
             else:
                 # Check duplicate arrangement number
                 try:
@@ -769,7 +770,7 @@ def form_arrangement():
                     if check.data:
                         st.error(f"❌ Arrangement No #{arr_no} already exists! Please use a different number.")
                     else:
-                        img_name = upload_image(st.session_state.get("arr_img"), "arr") if st.session_state.get("arr_img") else ""
+                        img_name = upload_image(arr_img, "arr")
                         result = supabase.table("arrangements").insert({
                             "arrangement_no": arr_no,
                             "distributor": distributor,
@@ -789,7 +790,7 @@ def form_arrangement():
                             save_arrangement_links(arr_id, arr_no, distributor, area, picked_lines)
                         for med in medicines.strip().split("\n"):
                             if med.strip():
-                                parts = med.split("-")
+                                parts = med.rsplit(" - ", 1)
                                 med_name = parts[0].strip()
                                 qty = parts[1].strip() if len(parts) > 1 else "1"
                                 supabase.table("arrangement_medicines").insert({
@@ -814,12 +815,13 @@ def form_arrangement():
                                         "distributor": distributor,
                                         "no_medicines": str(no_medicines),
                                         "area": area,
-                                        "customer_lines": str(len(picked_lines))
+                                        "customer_lines": str(len(picked_lines)),
+                                        "remarks": remarks
                                     }
                                 }).eq("id", task_resp.data[0]["id"]).execute()
                         except:
                             pass
-                        st.session_state["arr_img"] = None
+                        st.session_state["arr_form_ver"] = fv + 1
                         st.success(f"✅ Arrangement #{arr_no} placed successfully!")
                         st.balloons()
                 except Exception as e:
@@ -4936,7 +4938,7 @@ def arrangement_line_picker():
     with st.expander("🔗 Customer order items for this distributor", expanded=True):
         link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
         if link_area == SELECT_AREA:
-            st.caption("Select an area to see its pending customer items. (You can still type medicines manually below.)")
+            st.caption("Select an area to see its pending customer items. (Or skip this and just enter the number of medicines below.)")
             return None, []
         try:
             open_lines = get_open_lines(link_area)
