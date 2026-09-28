@@ -4,6 +4,7 @@ import pandas as pd
 import os
 from datetime import datetime, date
 import io
+import re
 import pytz
 from supabase import create_client
 
@@ -234,7 +235,7 @@ def load_users():
 
 USERS = load_users()
 
-DISTRIBUTORS = [
+_OLD_DISTRIBUTORS = [
     "Acorns Health Solutions Private Limited","Admire Enterprises","Zone Ventures Put Ltd",
     "Amar Drugs Distributors","Amarjeet Medical Hall","Ankit Enterprises",
     "Ar Kay Medicos Private Limited","Bawa Medical Store","Bhakti Enterprises",
@@ -256,6 +257,17 @@ DISTRIBUTORS = [
     "Trisha Pharma","Vashudev Enterprises","Vijaydeep Medicose",
     "Vtc Tradewings Pvt Ltd","Xcelent Pharmaceuticals Private Limited","Unnati",
 ]
+
+@st.cache_data(ttl=300)
+def load_distributors():
+    """Distributor master from Supabase (Settings -> Distributors)"""
+    try:
+        return supabase.table("distributors").select("*").order("name").execute().data or []
+    except Exception:
+        return []
+
+# the master list once normal_order_setup.sql has been run; the old built-in list until then
+DISTRIBUTORS = [d["name"] for d in load_distributors() if d.get("active", True)] or _OLD_DISTRIBUTORS
 
 IMG_FOLDER = "images"
 os.makedirs(IMG_FOLDER, exist_ok=True)
@@ -449,7 +461,7 @@ def get_active_timer():
         "purchase_order","purchase_return","pharmarack","bounce",
         "arrangement_order","bill_crosscheck","bill_upload","bill_upload_normal",
         "stock_placement","rack_cleaning","inventory",
-        "call_log","medicine_search","delivery","other_task","pickup"
+        "call_log","medicine_search","delivery","other_task","pickup","sheet_order"
     ]
     for k in timer_keys:
         if st.session_state.get(f"{k}_start"):
@@ -538,6 +550,7 @@ def end_timer(key, start_time, keep_record=False):
 # ── PURCHASE TEAM FORMS ───────────────────────────────────────────────────────
 def form_purchase_order():
     st.subheader("🛒 Purchase Order")
+    st.caption("For orders NOT in the order sheet (e.g. phone orders). Sheet medicines → use 📑 **Order Sheet**.")
     start = timer_button("purchase_order")
     if start is None: return
     with st.form("purchase_order_form", clear_on_submit=True):
@@ -1106,8 +1119,8 @@ def form_pickup():
             # Show auto-filled values as text info
             st.markdown(f"**Distributor:** {auto_dist if auto_dist else 'Select below'}")
             distributor = st.selectbox("Change Distributor (if needed)",
-                DISTRIBUTORS,
-                index=DISTRIBUTORS.index(auto_dist) if auto_dist in DISTRIBUTORS else 0,
+                dist_options(auto_dist),
+                index=dist_options(auto_dist).index(auto_dist) if auto_dist else 0,
                 key="pu_dist")
             st.markdown(f"**Arrangement:** {auto_arr if auto_arr else 'Select below'}")
             arr_select = st.selectbox("Change Arrangement (if needed)",
@@ -1661,8 +1674,8 @@ def form_edit_register_entry():
                 with st.form(f"edit_form_{entry['id']}", clear_on_submit=False):
                     c1,c2 = st.columns(2)
                     with c1:
-                        new_dist  = st.selectbox("Distributor", DISTRIBUTORS,
-                            index=DISTRIBUTORS.index(d.get("distributor","")) if d.get("distributor","") in DISTRIBUTORS else 0,
+                        new_dist  = st.selectbox("Distributor", dist_options(d.get("distributor","")),
+                            index=dist_options(d.get("distributor","")).index(d.get("distributor","")) if d.get("distributor","") else 0,
                             key=f"ed_dist_{entry['id']}")
                         new_bill  = st.text_input("Bill Number", value=d.get("bill_no",""), key=f"ed_bill_{entry['id']}")
                         new_items = st.number_input("No of Items", value=int(float(d.get("no_items",0) or 0)), min_value=0, step=1, key=f"ed_items_{entry['id']}")
@@ -1740,8 +1753,8 @@ def form_register_entry():
     with st.form("register_entry_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
-            dist_idx    = DISTRIBUTORS.index(arr_dist) if arr_dist in DISTRIBUTORS else 0
-            distributor = st.selectbox("Distributor *", DISTRIBUTORS, index=dist_idx, key=f"re_dist_{arr_no}")
+            dist_idx    = dist_options(arr_dist).index(arr_dist) if arr_dist else 0
+            distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}")
             bill_no     = st.text_input("Bill Number *")
         with c2:
             no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
@@ -3673,6 +3686,10 @@ def show_user_page():
         with st.sidebar:
             st.divider()
             st.markdown("### 📦 Ordering")
+            if st.button("📑 Order Sheet", width='stretch', key="p_sheet",
+                type="primary" if st.session_state.purchase_active_form=="sheet" else "secondary"):
+                st.session_state.purchase_active_form = "sheet"
+                st.rerun()
             if st.button("🛒 Purchase Order", width='stretch', key="p_purchase",
                 type="primary" if st.session_state.purchase_active_form=="purchase" else "secondary"):
                 st.session_state.purchase_active_form = "purchase"
@@ -3773,6 +3790,7 @@ def show_user_page():
         if st.session_state.purchase_active_form:
             form_map = {
                 "purchase":    form_purchase_order,
+                "sheet":       form_order_sheet,
                 "return":      form_purchase_return,
                 "arrangement": form_arrangement,
                 "pharma":      form_pharmarack,
@@ -3795,6 +3813,9 @@ def show_user_page():
             # Mobile task buttons
             st.markdown("### 📋 Select Task:")
             st.markdown("#### 📦 Ordering")
+            if st.button("📑 Order Sheet", key="mp_sheet", type="primary", use_container_width=True):
+                st.session_state.purchase_active_form = "sheet"
+                st.rerun()
             c1,c2 = st.columns(2)
             with c1:
                 if st.button("🛒 Purchase Order", key="mp_purchase", type="primary", use_container_width=True):
@@ -6444,7 +6465,7 @@ def show_all_staff_work(kp="asw"):
         rows.append({"Person": t.get("person", ""), "Team": team_of.get(t.get("person"), ""),
                      "Task": t.get("task_type", ""), "Details": det,
                      "Start": t.get("start_time", "") or t.get("time", ""), "End": t.get("end_time", ""),
-                     "Duration": fmt_secs(secs), "Qty": q or "", "_secs": secs,
+                     "Duration": fmt_secs(secs), "Qty": _qty_txt(q) if q else "", "_secs": secs,
                      "_spu": (secs / q) if q and secs else None,
                      "_sort": parse_task_time(t.get("start_time") or t.get("time")) or datetime.min})
     df = pd.DataFrame(rows)
@@ -6501,7 +6522,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t0, t1, t2, t3, t4, t5, t6 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders"])
+    t0, t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors"])
     with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
@@ -6509,6 +6530,750 @@ def show_manager_team_view():
     with t4: show_shift_planner("mgr_shift")
     with t5: show_bills_register("mgr_bills")
     with t6: show_customer_order_tracker("mgr_trk", show_phone=True)
+    with t7: show_order_sheet_report("mgr_osr")
+    with t8: show_distributors_admin("mgr_dist")
+
+# ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
+DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
+
+def dist_options(current=""):
+    """Distributor dropdown list; keeps an old name visible so editing never silently changes it"""
+    return DISTRIBUTORS + ([current] if current and current not in DISTRIBUTORS else [])
+
+def show_distributors_admin(kp="dist"):
+    st.subheader("🏭 Distributors")
+    st.caption("This list feeds every distributor dropdown in the app. The name must match the column header "
+               "in the Order Sheet exactly.")
+    try:
+        rows = supabase.table("distributors").select("*").order("name").execute().data or []
+    except Exception as e:
+        st.error(f"Could not load distributors — has normal_order_setup.sql been run in Supabase? ({e})")
+        return
+    names_lc = {r["name"].strip().lower(): r for r in rows}
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.expander("➕ Add a distributor", expanded=False):
+            with st.form(f"{kp}_add", clear_on_submit=True):
+                name = st.text_input("Name *")
+                a1, a2 = st.columns(2)
+                with a1:
+                    mobile = st.text_input("Mobile")
+                    gst = st.text_input("GST No")
+                with a2:
+                    email = st.text_input("Email")
+                    margin = st.number_input("Usual margin %", min_value=0.0, max_value=100.0, step=0.5, value=0.0)
+                address = st.text_area("Address", height=70)
+                if st.form_submit_button("Add ✅", type="primary"):
+                    n = name.strip()
+                    if not n:
+                        st.error("Enter the distributor name.")
+                    elif n.lower() in names_lc:
+                        st.error(f"'{names_lc[n.lower()]['name']}' is already in the list.")
+                    else:
+                        try:
+                            supabase.table("distributors").insert({
+                                "name": n, "mobile": mobile.strip(), "email": email.strip(), "gst_no": gst.strip().upper(),
+                                "address": address.strip(), "usual_margin": margin or None, "active": True}).execute()
+                            load_distributors.clear()
+                            st.success(f"✅ {n} added")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+    with c2:
+        with st.expander("📤 Upload list from Excel", expanded=False):
+            buf = io.BytesIO()
+            pd.DataFrame(columns=DIST_XL_COLS).to_excel(buf, index=False)
+            st.download_button("⬇️ Download format", buf.getvalue(), "distributors-format.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_fmt")
+            up = st.file_uploader("Filled distributor sheet (.xlsx)", type=["xlsx", "xls"],
+                                  key=f"{kp}_up_{st.session_state.get(kp + '_upv', 0)}")
+            if up:
+                try:
+                    df = pd.read_excel(up, dtype=str)
+                    cm = {_norm_col(c): c for c in df.columns}
+                    if "name" not in cm:
+                        st.error("The sheet needs a 'Name' column — use the format above.")
+                    else:
+                        recs = []
+                        for _, r in df.iterrows():
+                            n = _clean_str(r.get(cm["name"]))
+                            if not n:
+                                continue
+                            g = lambda k: _clean_str(r.get(cm[k])) if k in cm else ""
+                            rec = {"name": names_lc.get(n.lower(), {}).get("name", n)}
+                            for col, key in [("address", "address"), ("gstno", "gst_no"), ("mobile", "mobile"), ("email", "email")]:
+                                if g(col):
+                                    rec[key] = g(col).upper() if key == "gst_no" else g(col)
+                            if g("usualmargin"):
+                                rec["usual_margin"] = _to_float(g("usualmargin"), None)
+                            if g("active"):
+                                rec["active"] = g("active").lower() not in ("no", "n", "false", "0", "inactive")
+                            recs.append(rec)
+                        new = sum(1 for x in recs if x["name"].lower() not in names_lc)
+                        st.info(f"📄 {len(recs)} distributors in file · {new} new · {len(recs) - new} to update")
+                        if st.button("💾 Save list", key=f"{kp}_up_save", type="primary"):
+                            for x in recs:
+                                if x["name"].lower() in names_lc:
+                                    upd = {k: v for k, v in x.items() if k != "name"}
+                                    if upd:
+                                        supabase.table("distributors").update(upd).eq("id", names_lc[x["name"].lower()]["id"]).execute()
+                                else:
+                                    supabase.table("distributors").insert({"active": True, **x}).execute()
+                            load_distributors.clear()
+                            st.session_state[kp + "_upv"] = st.session_state.get(kp + "_upv", 0) + 1
+                            st.success("✅ Distributor list saved")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Could not read the file: {e}")
+
+    if not rows:
+        st.info("No distributors yet — add them above.")
+        return
+    act = [r for r in rows if r.get("active", True)]
+    missing = sum(1 for r in act if not (r.get("mobile") and r.get("gst_no")))
+    st.markdown(f"**{len(act)} active distributors**" + (f" · ⚠️ {missing} missing mobile / GST" if missing else ""))
+    df = pd.DataFrame([{"id": r["id"], "Name": r["name"], "Mobile": r.get("mobile") or "", "Email": r.get("email") or "",
+                        "GST No": r.get("gst_no") or "", "Address": r.get("address") or "",
+                        "Usual Margin %": r.get("usual_margin"), "Active": bool(r.get("active", True))} for r in rows])
+    ver = st.session_state.get(kp + "_ver", 0)
+    ed = st.data_editor(df, key=f"{kp}_ed_{ver}", hide_index=True, width='stretch', disabled=["Name"],
+                        column_config={"id": None,
+                                       "Usual Margin %": st.column_config.NumberColumn("Usual Margin %", min_value=0, max_value=100, format="%.2f"),
+                                       "Active": st.column_config.CheckboxColumn("Active")})
+    st.caption("Edit details in the table, then save. Names can't be edited here (old bills keep the old name) — "
+               "untick Active and add the new name instead.")
+    old = {r["id"]: r for r in df.to_dict("records")}
+    changes = []
+    for r in ed.to_dict("records"):
+        o = old.get(r["id"])
+        diff = {}
+        for col, key in [("Mobile", "mobile"), ("Email", "email"), ("GST No", "gst_no"), ("Address", "address"), ("Active", "active")]:
+            if (r[col] or "") != (o[col] or ""):
+                diff[key] = r[col]
+        a, b = r["Usual Margin %"], o["Usual Margin %"]
+        if not ((a is None or pd.isna(a)) and (b is None or pd.isna(b))) and a != b:
+            diff["usual_margin"] = None if a is None or pd.isna(a) else float(a)
+        if diff:
+            changes.append((r["id"], diff))
+    if st.button(f"💾 Save changes ({len(changes)})", key=f"{kp}_save", type="primary", disabled=not changes):
+        try:
+            for i, diff in changes:
+                supabase.table("distributors").update(diff).eq("id", i).execute()
+            load_distributors.clear()
+            st.session_state[kp + "_ver"] = ver + 1
+            st.success(f"✅ {len(changes)} distributor(s) updated")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+# ── NORMAL ORDER SHEET (Purchase) ─────────────────────────────────────────────
+NOT_ORDERED_REASONS = [
+    "A) Not available with any distributor",
+    "B) Margin too low",
+    "C) Enough stock already",
+    "D) Minimum order value not met",
+    "E) Short expiry",
+    "F) Distributor credit / payment hold",
+    "G) Duplicate item",
+    "H) Other",
+]
+OFF_TOP_REASONS = ["Not available with top distributors", "Needed urgently", "Payment issue", "Other"]
+MED_TYPE_ORDER = ["Fast", "Average", "Slow Regular", "Very Slow Regular", "Rare", "New"]
+SHEET_BASE_COLS = {"itemname": "item_name", "packsize": "pack_size", "closingstock": "closing_stock",
+                   "closingstrip": "closing_strip", "combine": None, "type": "item_type", "medtype": "med_type",
+                   "order": "order_qty", "bestdist1": "best1", "bestdist2": "best2", "bestdist3": "best3"}
+SHEET_TEMPLATE_COLS = ["Item Name", "Pack Size", "Closing Stock", "Closing (Strip)", "combine", "Type", "Med Type",
+                       "Order", "Best Dist 1", "Best Dist 2", "Best Dist 3"]
+
+def _cell_lines(v):
+    s = "" if v is None else str(v)
+    if s.strip().lower() in ("", "nan", "none", "-", "—"):
+        return []
+    return [p.strip() for p in s.splitlines() if p.strip()]
+
+def _parse_best(v):
+    """'Jai Medical Agency\\n 30.29% -'  ->  {name, margin, scheme}"""
+    parts = _cell_lines(v)
+    if not parts:
+        return None
+    rest = " ".join(parts[1:])
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*%", rest)
+    scheme = (rest[m.end():] if m else rest).strip()
+    return {"name": parts[0], "margin": float(m.group(1)) if m else None,
+            "scheme": "" if scheme in ("-", "—") else scheme}
+
+def _parse_offer(v):
+    """distributor column cell '5+1\\n Mgn 39.64%\\n Qty 62'  ->  {margin, qty, scheme}"""
+    parts = _cell_lines(v)
+    if not parts:
+        return None
+    s = " ".join(parts)
+    m = re.search(r"mgn\s*(-?\d+(?:\.\d+)?)\s*%", s, re.I)
+    q = re.search(r"qty\s*(-?\d+(?:\.\d+)?)", s, re.I)
+    if not m and not q:
+        return None
+    scheme = parts[0] if not parts[0].lower().startswith(("mgn", "qty")) else ""
+    return {"margin": float(m.group(1)) if m else None, "qty": float(q.group(1)) if q else None,
+            "scheme": "" if scheme in ("-", "—") else scheme}
+
+def parse_order_sheet(uploaded):
+    """-> (lines, distributor column names, rows skipped (order 0), error)"""
+    name = uploaded.name.lower()
+    raw = pd.read_excel(uploaded, dtype=str) if name.endswith((".xlsx", ".xls")) else pd.read_csv(uploaded, dtype=str)
+    colmap, dist_cols = {}, []
+    for c in raw.columns:
+        k = _norm_col(c)
+        if k in SHEET_BASE_COLS:
+            if SHEET_BASE_COLS[k] and SHEET_BASE_COLS[k] not in colmap.values():
+                colmap[c] = SHEET_BASE_COLS[k]
+        elif k and not k.startswith("unnamed"):
+            dist_cols.append(c)
+    inv = {v: k for k, v in colmap.items()}
+    if "item_name" not in inv or "order_qty" not in inv:
+        return [], [], 0, "The file needs 'Item Name' and 'Order' columns — download the format and compare the headers."
+    lines, seen, skipped = [], {}, 0
+    for _, r in raw.iterrows():
+        g = lambda k: r.get(inv[k]) if k in inv else None
+        item = _clean_str(g("item_name"))
+        if not item:
+            continue
+        oq = _to_float(g("order_qty"), 0)
+        if oq <= 0:
+            skipped += 1
+            continue
+        pack = _clean_str(g("pack_size"))
+        key = f"{item.lower()}|{pack.lower()}"
+        if key in seen:                           # same medicine twice in one sheet -> add qty
+            seen[key]["order_qty"] += oq
+            continue
+        offers = {}
+        for c in dist_cols:
+            o = _parse_offer(r.get(c))
+            if o:
+                offers[str(c).strip()] = o
+        line = {"item_key": key, "item_name": item, "pack_size": pack,
+                "closing_stock": _to_float(g("closing_stock"), 0), "closing_strip": _to_float(g("closing_strip"), 0),
+                "item_type": _clean_str(g("item_type")) or "Ok", "med_type": _clean_str(g("med_type")),
+                "order_qty": oq, "best": [b for b in (_parse_best(g(f"best{i}")) for i in (1, 2, 3)) if b],
+                "offers": offers}
+        seen[key] = line
+        lines.append(line)
+    return lines, [str(c).strip() for c in dist_cols], skipped, None
+
+def order_sheet_template():
+    names = [d for d in DISTRIBUTORS]
+    ex = {"Item Name": "Atorva 20 Tablet", "Pack Size": "15 Tablet", "Closing Stock": "30", "Closing (Strip)": "2",
+          "combine": "Atorva 20 Tablet15 Tablet", "Type": "Ok", "Med Type": "Fast", "Order": "6",
+          "Best Dist 1": "Jai Medical Agency\n 30.29% -", "Best Dist 2": "Sehgal pharma\n 30.07% -",
+          "Best Dist 3": "Zonne Ventures Pvt Ltd\n 29.3% -"}
+    cols = SHEET_TEMPLATE_COLS + names
+    df = pd.DataFrame([{c: ex.get(c, "") for c in cols}])
+    for n, cell in [("Jai Medical Agency", "—\n Mgn 30.29%\n Qty 51"), ("Sehgal pharma", "—\n Mgn 30.07%\n Qty 22")]:
+        if n in df.columns:
+            df.loc[0, n] = cell
+    notes = pd.DataFrame({"How to fill": [
+        "One row per medicine. Row 2 is an example — delete it before uploading.",
+        "Order = strips to order (not loose). Rows with Order 0 are ignored.",
+        "Type: Ok / Discontinued / Duplicate / JIT.  Med Type: Fast / Average / Slow Regular / Very Slow Regular / Rare / New.",
+        "Best Dist 1-3: distributor name on line 1, then 'margin% scheme' on line 2 (e.g. 30.29% 5+1). Use - if none.",
+        "Distributor columns: scheme on line 1 (— if none), then 'Mgn 28.5%' and 'Qty 198'. Leave blank if the distributor doesn't have it.",
+        "Distributor column headers must match names in the app's distributor list exactly.",
+    ]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Order Sheet")
+        notes.to_excel(w, index=False, sheet_name="How to fill")
+    return buf.getvalue()
+
+def import_order_sheet(lines, area, fname):
+    d = date_str()
+    now_s = now_iso()
+    prev = supabase.table("order_sheets").select("*").eq("area", area).eq("sheet_date", d).execute().data or []
+    rnd = max([int(p.get("round") or 0) for p in prev] + [0]) + 1
+    sheet = supabase.table("order_sheets").insert({
+        "area": area, "sheet_date": d, "round": rnd, "file_name": fname, "lines": len(lines),
+        "uploaded_by": st.session_state.name, "uploaded_at": now_s}).execute().data[0]
+    earlier = fetch_all("order_sheet_lines", lambda q: q.eq("area", area).eq("sheet_date", d)) if prev else []
+    ordered_before, pending_before = {}, {}
+    for l in earlier:
+        if l.get("status") == "Ordered":
+            ordered_before.setdefault(l.get("item_key"), l)
+        elif l.get("status") == "Pending":
+            pending_before.setdefault(l.get("item_key"), []).append(l)
+    keys = set(l["item_key"] for l in lines)
+    superseded = [x["id"] for k, xs in pending_before.items() if k in keys for x in xs]
+    for ch in _chunks(superseded, 200):
+        supabase.table("order_sheet_lines").update({"status": "Superseded", "superseded_by": sheet["id"]})\
+            .in_("id", ch).execute()
+    rows = [{**l, "sheet_id": sheet["id"], "area": area, "sheet_date": d, "round": rnd, "status": "Pending",
+             "repeat_of": (ordered_before.get(l["item_key"]) or {}).get("id"), "uploaded_at": now_s} for l in lines]
+    for ch in _chunks(rows, 200):
+        supabase.table("order_sheet_lines").insert(ch).execute()
+    return {"round": rnd, "lines": len(rows), "repeats": sum(1 for r in rows if r["repeat_of"]),
+            "superseded": len(superseded)}
+
+def delete_order_sheet(sheet_id):
+    """Undo a wrong upload: remove its lines and bring back the lines it replaced"""
+    supabase.table("order_sheet_lines").delete().eq("sheet_id", sheet_id).execute()
+    supabase.table("order_sheet_lines").update({"status": "Pending", "superseded_by": None})\
+        .eq("superseded_by", sheet_id).execute()
+    supabase.table("order_sheets").delete().eq("id", sheet_id).execute()
+
+def _usual_margins():
+    return {d["name"]: d.get("usual_margin") for d in load_distributors()}
+
+def dist_rank_info(l, dist, usual=None):
+    """rank of `dist` for this medicine (1-3 = Best Dist, 4+ by margin), its margin/scheme/stock, best margin"""
+    best = l.get("best") or []
+    offers = l.get("offers") or {}
+    names = [b.get("name") for b in best]
+    o = offers.get(dist) or {}
+    ranked = [k for k, _ in sorted(offers.items(), key=lambda kv: -(kv[1].get("margin") or -1)) if k not in names]
+    order = names + ranked
+    rank = order.index(dist) + 1 if dist in order else None
+    if dist in names:
+        b = best[names.index(dist)]
+        margin = b.get("margin") if b.get("margin") is not None else o.get("margin")
+        scheme = b.get("scheme") or o.get("scheme") or ""
+    else:
+        margin, scheme = o.get("margin"), o.get("scheme") or ""
+    usual_used = False
+    if margin is None and usual and usual.get(dist) is not None:
+        margin, usual_used = float(usual[dist]), True
+    best_margin = best[0].get("margin") if best else None
+    return {"rank": rank, "margin": margin, "scheme": scheme, "qty": o.get("qty"), "best_margin": best_margin,
+            "usual": usual_used, "top3": dist in names}
+
+def _best_txt(l):
+    b = (l.get("best") or [None])[0]
+    if not b:
+        return "— none —"
+    return f"{b.get('name')} {b.get('margin')}%" + (f" {b['scheme']}" if b.get("scheme") else "")
+
+def _mt_sort(m):
+    return MED_TYPE_ORDER.index(m) if m in MED_TYPE_ORDER else len(MED_TYPE_ORDER)
+
+def _suggest_reason(l):
+    if "dup" in str(l.get("item_type", "")).lower():
+        return "G) Duplicate item"
+    if not l.get("best") and not l.get("offers"):
+        return "A) Not available with any distributor"
+    return ""
+
+def _repeat_txt(l, by_id):
+    p = by_id.get(l.get("repeat_of"))
+    if not p:
+        return ""
+    return f"🔁 R{p.get('round')}: {_qty_txt(p.get('ordered_qty'))} from {p.get('distributor','')} ({p.get('marked_by','')})"
+
+def load_sheet_lines(area, d):
+    q = lambda q: q.eq("sheet_date", d) if area in ("All Areas", None) else q.eq("sheet_date", d).eq("area", area)
+    return fetch_all("order_sheet_lines", q)
+
+def form_order_sheet():
+    st.subheader("📑 Normal Order Sheet")
+    view = st.radio("View", ["🛒 Order by distributor", "❌ Not ordered", "📤 Upload sheet"], horizontal=True,
+                    key="os_view", label_visibility="collapsed")
+    c1, c2 = st.columns(2)
+    with c1:
+        area = st.selectbox("Area *", [SELECT_AREA] + load_areas(), key="os_area")
+    day = today_ist()
+    if view != "📤 Upload sheet":
+        with c2:
+            day = st.date_input("Sheet date", value=today_ist(), key="os_date")
+    if area == SELECT_AREA:
+        st.info("Select the area first.")
+        return
+    if view == "📤 Upload sheet":
+        _order_sheet_upload(area)
+        return
+    d = day.strftime("%Y-%m-%d")
+    try:
+        all_lines = load_sheet_lines(area, d)
+    except Exception as e:
+        st.error(f"Could not load the order sheet — has normal_order_setup.sql been run in Supabase? ({e})")
+        return
+    live = [l for l in all_lines if l.get("status") != "Superseded"]
+    if not live:
+        st.info(f"No order sheet uploaded for {area} on {day.strftime('%d %b')}. Use 📤 Upload sheet.")
+        return
+    cnt = lambda s: sum(1 for l in live if l.get("status") == s)
+    m = st.columns(4)
+    with m[0]: st.metric("📋 To order", len(live))
+    with m[1]: st.metric("✅ Ordered", cnt("Ordered"))
+    with m[2]: st.metric("❌ Not ordered", cnt("Not Ordered"))
+    with m[3]: st.metric("⏳ Not marked", cnt("Pending"))
+    by_id = {l["id"]: l for l in all_lines}
+    pending = [l for l in live if l.get("status") == "Pending"]
+    if view == "🛒 Order by distributor":
+        _order_by_distributor(area, d, pending, by_id)
+    else:
+        _mark_not_ordered(area, d, pending, live, by_id)
+
+def _order_sheet_upload(area):
+    st.caption("Upload the order sheet from the software for this area. Up to 3 rounds a day — each upload is a new round. "
+               "Medicines still pending from an earlier round move to the new round.")
+    st.download_button("⬇️ Download blank format", order_sheet_template(), "order-sheet-format.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="os_fmt")
+    try:
+        today_sheets = supabase.table("order_sheets").select("*").eq("area", area).eq("sheet_date", date_str())\
+            .order("round").execute().data or []
+    except Exception as e:
+        st.error(f"Could not load uploads — has normal_order_setup.sql been run in Supabase? ({e})")
+        return
+    nxt = max([int(s.get("round") or 0) for s in today_sheets] + [0]) + 1
+    up = st.file_uploader("Order sheet (.xlsx or .csv)", type=["xlsx", "xls", "csv"],
+                          key=f"os_file_{st.session_state.get('os_upv', 0)}")
+    if up:
+        try:
+            lines, dcols, skipped, err = parse_order_sheet(up)
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+            lines, err = [], None
+        if err:
+            st.error(err)
+        elif lines:
+            known = {n.lower() for n in DISTRIBUTORS}
+            found = set(dcols) | {b["name"] for l in lines for b in l["best"]}
+            new_d = sorted(n for n in found if n.lower() not in known)
+            no_dist = sum(1 for l in lines if not l["best"] and not l["offers"])
+            st.info(f"📄 **{len(lines)} medicines** to order · {sum(l['order_qty'] for l in lines):,.0f} strips"
+                    + (f" · {no_dist} with no distributor" if no_dist else "")
+                    + (f" · {skipped} rows with Order 0 skipped" if skipped else "")
+                    + f"  →  this will be **Round {nxt}** for {area} today")
+            if nxt > 3:
+                st.warning(f"⚠️ {area} already has {nxt - 1} uploads today. Continue only if this is really a new round.")
+            if new_d:
+                st.warning("🏭 New distributor(s) not in the distributor list: " + ", ".join(new_d))
+                if st.button(f"➕ Add {len(new_d)} to distributor list", key="os_add_dist"):
+                    try:
+                        for n in new_d:
+                            supabase.table("distributors").insert({"name": n, "active": True}).execute()
+                        load_distributors.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            prev = pd.DataFrame([{"Medicine": l["item_name"], "Pack": l["pack_size"], "Type": l["item_type"],
+                                  "Med Type": l["med_type"], "Stock (strips)": _qty_txt(l["closing_strip"]),
+                                  "Order": _qty_txt(l["order_qty"]), "Best #1": _best_txt(l)} for l in lines])
+            st.dataframe(prev, hide_index=True, width='stretch', height=250)
+            if st.button(f"📥 Upload as Round {nxt}", type="primary", key="os_go", width='stretch'):
+                try:
+                    res = import_order_sheet(lines, area, up.name)
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+                    return
+                log_simple_task("Order Sheet Upload", {"area": area, "round": str(res["round"]), "lines": str(res["lines"])})
+                st.session_state["os_upv"] = st.session_state.get("os_upv", 0) + 1
+                st.session_state["os_msg"] = (f"✅ Round {res['round']} uploaded: {res['lines']} medicines"
+                    + (f" · {res['superseded']} still-pending medicines moved from the earlier round" if res["superseded"] else "")
+                    + (f" · 🔁 {res['repeats']} were already ordered earlier today" if res["repeats"] else ""))
+                st.rerun()
+        else:
+            st.warning("No medicines with Order above 0 found in this file.")
+    msg = st.session_state.pop("os_msg", None)
+    if msg:
+        st.success(msg)
+    if today_sheets:
+        st.markdown(f"**Today's uploads — {area}**")
+        for s in today_sheets:
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                st.markdown(f"Round {s.get('round')} · {s.get('lines')} medicines · {s.get('uploaded_by','')} · "
+                            f"{(to_ist(s.get('uploaded_at')) or now_ist()).strftime('%I:%M %p')} · {s.get('file_name','')}")
+            with c2:
+                if st.button("🗑️ Delete", key=f"os_del_{s['id']}", help="Wrong file? Delete it (only before any medicine is marked)"):
+                    marked = supabase.table("order_sheet_lines").select("id").eq("sheet_id", s["id"])\
+                        .in_("status", ["Ordered", "Not Ordered"]).execute().data or []
+                    if marked:
+                        st.error(f"Can't delete — {len(marked)} medicine(s) of this round are already marked.")
+                    else:
+                        delete_order_sheet(s["id"])
+                        st.rerun()
+
+def _order_by_distributor(area, d, pending, by_id):
+    msg = st.session_state.pop("os_msg2", None)
+    if msg:
+        st.success(msg)
+    if not pending:
+        st.success("🎉 Every medicine in this sheet is marked.")
+        return
+    usual = _usual_margins()
+    top_count = {}
+    for l in pending:
+        for b in l.get("best") or []:
+            top_count[b.get("name")] = top_count.get(b.get("name"), 0) + 1
+    names = sorted(set(DISTRIBUTORS) | set(top_count), key=lambda n: (-top_count.get(n, 0), n.lower()))
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        dist = st.selectbox("Distributor *", names, key="os_dist",
+                            format_func=lambda n: f"{n} — {top_count[n]} medicine(s) in top 3" if top_count.get(n) else n)
+    with c2:
+        mode = st.selectbox("Mode", ["Through Call", "Pharma Rack", "Excel Send"], key="os_mode")
+    show_all = st.toggle(f"Also show medicines where {dist} is NOT in the top 3", key="os_all")
+    start = timer_button("sheet_order", "Purchase Order")
+    if start is None:
+        return
+    rows = []
+    for l in pending:
+        ri = dist_rank_info(l, dist, usual)
+        if not ri["top3"] and not show_all:
+            continue
+        rows.append({
+            "id": l["id"], "Order?": False, "Rnd": l.get("round"),
+            "Medicine": l.get("item_name", ""), "Pack": l.get("pack_size", ""), "Type": l.get("item_type", ""),
+            "Med Type": l.get("med_type", ""), "Stock": _qty_txt(l.get("closing_strip")), "Order": _qty_txt(l.get("order_qty")),
+            "Rank": f"#{ri['rank']}" if ri["rank"] else "not offered",
+            "Margin": (f"{ri['margin']}%" + (" (usual)" if ri["usual"] else "")) if ri["margin"] is not None else "",
+            "Scheme": ri["scheme"], "Dist Qty": _qty_txt(ri["qty"]) if ri["qty"] is not None else "",
+            "Best #1": _best_txt(l), "🔁": _repeat_txt(l, by_id),
+            "Order Qty": float(l.get("order_qty") or 0), "Why not top 3?": "", "Note": "",
+            "_top": ri["top3"], "_r": ri["rank"] or 99, "_mt": _mt_sort(l.get("med_type"))})
+    if not rows:
+        st.info(f"{dist} is not in the top 3 for any pending medicine. Switch on the toggle above to see all medicines.")
+        return
+    rows.sort(key=lambda r: (not r["_top"], r["_r"], r["_mt"], r["Medicine"]))
+    df = pd.DataFrame(rows)
+    meta = {r["id"]: r for r in rows}
+    ver = st.session_state.get("os_ver", 0)
+    ed = st.data_editor(
+        df.drop(columns=["_top", "_r", "_mt"]), key=f"os_ed_{ver}", hide_index=True, width='stretch',
+        disabled=["Rnd", "Medicine", "Pack", "Type", "Med Type", "Stock", "Order", "Rank", "Margin", "Scheme",
+                  "Dist Qty", "Best #1", "🔁"],
+        column_config={
+            "id": None,
+            "Order?": st.column_config.CheckboxColumn("Order?", help="Tick medicines you are ordering from this distributor"),
+            "Stock": st.column_config.TextColumn("Stock", help="Closing stock in strips"),
+            "Order": st.column_config.TextColumn("Order", help="Strips to order (from the sheet)"),
+            "Order Qty": st.column_config.NumberColumn("Order Qty", min_value=0, step=1, help="Strips you are ordering"),
+            "Why not top 3?": st.column_config.SelectboxColumn("Why not top 3?", options=[""] + OFF_TOP_REASONS,
+                                                                help="Needed only when this distributor is not Best Dist 1-3"),
+        })
+    st.caption("Rank #1-#3 = Best Dist 1-3 in the sheet; #4 and below are ranked by margin. "
+               "Margin is this distributor's margin for that medicine.")
+    picked = ed[ed["Order?"] == True]
+    n = len(picked)
+    strips = float(picked["Order Qty"].fillna(0).sum()) if n else 0
+    if st.button(f"💾 Save order — {dist} ({n} SKUs, {_qty_txt(strips)} strips)", type="primary", key="os_save",
+                 disabled=n == 0, width='stretch'):
+        errs = []
+        for _, r in picked.iterrows():
+            mt = meta[r["id"]]
+            if not (r["Order Qty"] and r["Order Qty"] > 0):
+                errs.append(f"{r['Medicine']}: enter Order Qty")
+            if not mt["_top"] and not r["Why not top 3?"]:
+                errs.append(f"{r['Medicine']}: {dist} is not in the top 3 — pick 'Why not top 3?'")
+            if r["Why not top 3?"] == "Other" and not str(r["Note"] or "").strip():
+                errs.append(f"{r['Medicine']}: write a note for 'Other'")
+        if errs:
+            st.error("Fix these before saving:\n\n- " + "\n- ".join(errs[:10]))
+            return
+        end_time, duration = end_timer("sheet_order", start)
+        now_s = now_iso()
+        try:
+            off_top = int(sum(1 for _, r in picked.iterrows() if not meta[r["id"]]["_top"]))
+            task = supabase.table("daily_tasks").insert({
+                "date": date_str(), "time": time_str(), "person": st.session_state.name, "team": "Purchase",
+                "task_type": "Purchase Order",
+                "details": {"distributor": dist, "area": area, "order_type": "Regular", "no_sku": str(n),
+                            "strips": _qty_txt(strips), "mode": mode, "urgency": "Normal", "source": "Order Sheet",
+                            "sheet_date": d, "off_top3": str(off_top), "remarks": ""},
+                "start_time": start.strftime("%I:%M:%S %p"), "end_time": end_time,
+                "duration_mins": str(duration), "status": "Completed"}).execute().data
+            task_id = task[0]["id"] if task else None
+            usual = _usual_margins()
+            for _, r in picked.iterrows():
+                l = by_id[int(r["id"])]
+                ri = dist_rank_info(l, dist, usual)
+                supabase.table("order_sheet_lines").update({
+                    "status": "Ordered", "ordered_qty": float(r["Order Qty"]), "distributor": dist,
+                    "dist_rank": ri["rank"], "dist_margin": ri["margin"], "best_margin": ri["best_margin"],
+                    "off_top_reason": r["Why not top 3?"] or None, "note": str(r["Note"] or "").strip() or None,
+                    "po_task_id": task_id, "marked_by": st.session_state.name, "marked_at": now_s}).eq("id", l["id"]).execute()
+            st.session_state["os_ver"] = ver + 1
+            st.session_state["os_msg2"] = f"✅ Order saved — {dist}: {n} SKUs, {_qty_txt(strips)} strips"
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+def _mark_not_ordered(area, d, pending, live, by_id):
+    st.caption("Medicines you are NOT ordering — pick a reason for each. Suggested reasons are pre-filled; check them before saving.")
+    if pending:
+        rows = [{"id": l["id"], "Rnd": l.get("round"), "Medicine": l.get("item_name", ""), "Pack": l.get("pack_size", ""),
+                 "Type": l.get("item_type", ""), "Med Type": l.get("med_type", ""),
+                 "Stock": _qty_txt(l.get("closing_strip")), "Order": _qty_txt(l.get("order_qty")),
+                 "Best #1": _best_txt(l), "🔁": _repeat_txt(l, by_id),
+                 "Reason": _suggest_reason(l), "Note": "", "_mt": _mt_sort(l.get("med_type"))} for l in pending]
+        rows.sort(key=lambda r: (r["Reason"] == "", r["_mt"], r["Medicine"]))
+        df = pd.DataFrame(rows).drop(columns=["_mt"])
+        ver = st.session_state.get("os_nver", 0)
+        ed = st.data_editor(df, key=f"os_ned_{ver}", hide_index=True, width='stretch',
+                            disabled=[c for c in df.columns if c not in ("Reason", "Note")],
+                            column_config={"id": None,
+                                           "Reason": st.column_config.SelectboxColumn("Reason", options=[""] + NOT_ORDERED_REASONS)})
+        chosen = ed[ed["Reason"].fillna("") != ""]
+        if st.button(f"💾 Save {len(chosen)} as Not ordered", type="primary", key="os_nsave",
+                     disabled=len(chosen) == 0, width='stretch'):
+            bad = [r["Medicine"] for _, r in chosen.iterrows() if r["Reason"].startswith("H)") and not str(r["Note"] or "").strip()]
+            if bad:
+                st.error("Write a note for 'Other': " + ", ".join(bad[:10]))
+                return
+            now_s = now_iso()
+            try:
+                for _, r in chosen.iterrows():
+                    supabase.table("order_sheet_lines").update({
+                        "status": "Not Ordered", "not_ordered_reason": r["Reason"],
+                        "note": str(r["Note"] or "").strip() or None,
+                        "marked_by": st.session_state.name, "marked_at": now_s}).eq("id", int(r["id"])).execute()
+                log_simple_task("Order Sheet - Not Ordered", {"area": area, "lines": str(len(chosen)), "sheet_date": d})
+                st.session_state["os_nver"] = ver + 1
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+    else:
+        st.success("🎉 Nothing left to mark.")
+    done = [l for l in live if l.get("status") == "Not Ordered"]
+    if done:
+        with st.expander(f"↩️ Undo — {len(done)} medicine(s) marked Not ordered"):
+            opts = {f"{l.get('item_name')} — {l.get('not_ordered_reason')} ({l.get('marked_by','')})": l["id"] for l in done}
+            back = st.multiselect("Move back to pending", list(opts.keys()), key="os_undo")
+            if st.button("↩️ Move back", key="os_undo_go", disabled=not back):
+                for k in back:
+                    supabase.table("order_sheet_lines").update({"status": "Pending", "not_ordered_reason": None,
+                                                                "note": None, "marked_by": None, "marked_at": None})\
+                        .eq("id", opts[k]).execute()
+                st.rerun()
+
+
+# ── NORMAL ORDER REPORT (admin / manager) ─────────────────────────────────────
+def show_order_sheet_report(kp="osr"):
+    st.subheader("🛒 Normal Orders — sheet vs ordered")
+    c1, c2 = st.columns(2)
+    with c1: day = st.date_input("Sheet date", value=today_ist(), key=f"{kp}_day")
+    with c2: area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    d = day.strftime("%Y-%m-%d")
+    try:
+        all_lines = load_sheet_lines(area, d)
+        sheets = supabase.table("order_sheets").select("*").eq("sheet_date", d).execute().data or []
+    except Exception as e:
+        st.error(f"Could not load — has normal_order_setup.sql been run in Supabase? ({e})")
+        return
+    by_id = {l["id"]: l for l in all_lines}
+    ls = [l for l in all_lines if l.get("status") != "Superseded"]
+    if not ls:
+        st.info("No order sheet uploaded for this date / area.")
+        return
+    S = lambda l: l.get("status")
+    ordered = [l for l in ls if S(l) == "Ordered"]
+    notord = [l for l in ls if S(l) == "Not Ordered"]
+    pend = [l for l in ls if S(l) == "Pending"]
+    rep = [l for l in ls if l.get("repeat_of")]
+    notbest = [l for l in ordered if l.get("best_margin") is not None and (l.get("dist_rank") or 99) != 1]
+    m = st.columns(6)
+    with m[0]: st.metric("📋 To order", len(ls))
+    with m[1]: st.metric("✅ Ordered", len(ordered), f"{round(100 * len(ordered) / len(ls))}%", delta_color="off")
+    with m[2]: st.metric("❌ Not ordered", len(notord))
+    with m[3]: st.metric("⏳ Not marked", len(pend))
+    with m[4]: st.metric("🔁 Came again", len(rep), help="Medicine appeared again in a later round after it was ordered")
+    with m[5]: st.metric("⚠️ Not best distributor", len(notbest))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**❌ Not ordered — reasons**")
+        rs = {}
+        for l in notord:
+            rs[l.get("not_ordered_reason") or "No reason"] = rs.get(l.get("not_ordered_reason") or "No reason", 0) + 1
+        st.markdown("\n".join(f"- {r}: **{rs[r]}**" for r in NOT_ORDERED_REASONS + [k for k in rs if k not in NOT_ORDERED_REASONS] if rs.get(r))
+                    or "_None_")
+    with c2:
+        st.markdown("**By Med Type**")
+        mts = sorted(set(l.get("med_type") or "—" for l in ls), key=_mt_sort)
+        mdf = pd.DataFrame([{"Med Type": t,
+                             "To order": sum(1 for l in ls if (l.get("med_type") or "—") == t),
+                             "Ordered": sum(1 for l in ordered if (l.get("med_type") or "—") == t),
+                             "Not ordered": sum(1 for l in notord if (l.get("med_type") or "—") == t),
+                             "Not marked": sum(1 for l in pend if (l.get("med_type") or "—") == t)} for t in mts])
+        mdf["% Ordered"] = (100 * mdf["Ordered"] / mdf["To order"]).round(0).astype(int).astype(str) + "%"
+        st.dataframe(mdf, hide_index=True, width='stretch')
+
+    st.markdown("**👤 By person**")
+    people = sorted(set(l.get("marked_by") for l in ls if l.get("marked_by")))
+    if people:
+        pr = []
+        for p in people:
+            o = [l for l in ordered if l.get("marked_by") == p]
+            lost = [(l["best_margin"] - (l.get("dist_margin") or 0)) for l in o
+                    if l.get("best_margin") is not None and l.get("dist_margin") is not None and (l.get("dist_rank") or 99) != 1]
+            pr.append({"Person": p, "SKUs ordered": len(o), "Strips": _qty_txt(sum(float(l.get("ordered_qty") or 0) for l in o)),
+                       "Distributors": len(set(l.get("distributor") for l in o)),
+                       "Not ordered marked": sum(1 for l in notord if l.get("marked_by") == p),
+                       "Not best dist": len(lost), "Avg margin lost": f"{round(sum(lost) / len(lost), 2)}%" if lost else ""})
+        st.dataframe(pd.DataFrame(pr), hide_index=True, width='stretch')
+    else:
+        st.caption("Nothing marked yet.")
+
+    st.markdown("**📤 Uploads (rounds)**")
+    sh = [s for s in sheets if area == "All Areas" or s.get("area") == area]
+    if sh:
+        st.dataframe(pd.DataFrame([{
+            "Area": s.get("area"), "Round": s.get("round"),
+            "Uploaded": (to_ist(s.get("uploaded_at")) or now_ist()).strftime("%I:%M %p"), "By": s.get("uploaded_by"),
+            "Medicines": s.get("lines"),
+            "Ordered": sum(1 for l in ordered if l.get("sheet_id") == s["id"]),
+            "Not ordered": sum(1 for l in notord if l.get("sheet_id") == s["id"]),
+            "Moved to next round": sum(1 for l in all_lines if l.get("sheet_id") == s["id"] and S(l) == "Superseded"),
+            "Not marked": sum(1 for l in pend if l.get("sheet_id") == s["id"])}
+            for s in sorted(sh, key=lambda s: (s.get("area"), s.get("round")))]), hide_index=True, width='stretch')
+
+    if notbest:
+        st.markdown("**⚠️ Not ordered from Best Dist 1**")
+        nb = [{"Medicine": l.get("item_name"), "Area": l.get("area"), "Ordered from": f"{l.get('distributor')} " + (f"(#{l['dist_rank']})" if l.get("dist_rank") else "(not in sheet)"),
+               "Margin": f"{l.get('dist_margin')}%" if l.get("dist_margin") is not None else "",
+               "Best was": _best_txt(l),
+               "Lost": f"-{round(l['best_margin'] - l['dist_margin'], 2)}%" if l.get("dist_margin") is not None else "",
+               "Why": l.get("off_top_reason") or ("(within top 3)" if (l.get("dist_rank") or 99) <= 3 else ""),
+               "Note": l.get("note") or "", "By": l.get("marked_by")}
+              for l in sorted(notbest, key=lambda l: -((l.get("best_margin") or 0) - (l.get("dist_margin") or 0)))]
+        st.dataframe(pd.DataFrame(nb), hide_index=True, width='stretch')
+
+    st.markdown("**📋 Every medicine**")
+    search = st.text_input("🔍 Search medicine / distributor / person", key=f"{kp}_q").strip().lower()
+    stat_f = st.multiselect("Status", ["Ordered", "Not Ordered", "Pending"], key=f"{kp}_st", placeholder="All")
+    icon = {"Ordered": "✅ Ordered", "Not Ordered": "❌ Not ordered", "Pending": "⏳ Not marked"}
+    rows = []
+    for l in sorted(ls, key=lambda l: (l.get("area"), _mt_sort(l.get("med_type")), l.get("item_name", ""))):
+        if stat_f and S(l) not in stat_f:
+            continue
+        oq, q = float(l.get("order_qty") or 0), l.get("ordered_qty")
+        qflag = ""
+        if q is not None and oq and (float(q) < 0.5 * oq or float(q) > 2 * oq):
+            qflag = " ⚠️"
+        r = {"Area": l.get("area"), "Rnd": l.get("round"), "Medicine": l.get("item_name"), "Pack": l.get("pack_size"),
+             "Type": l.get("item_type"), "Med Type": l.get("med_type"), "Stock": _qty_txt(l.get("closing_strip")),
+             "Order": _qty_txt(oq), "Status": icon.get(S(l), S(l)),
+             "Ordered Qty": (_qty_txt(q) + qflag) if q is not None else "",
+             "Distributor": l.get("distributor") or "", "Rank": f"#{l['dist_rank']}" if l.get("dist_rank") else "",
+             "Margin": f"{l.get('dist_margin')}%" if l.get("dist_margin") is not None else "",
+             "Best #1": _best_txt(l),
+             "Reason": l.get("not_ordered_reason") or l.get("off_top_reason") or "", "Note": l.get("note") or "",
+             "🔁": _repeat_txt(l, by_id), "By": l.get("marked_by") or "",
+             "At": to_ist(l.get("marked_at")).strftime("%I:%M %p") if to_ist(l.get("marked_at")) else ""}
+        if search and search not in " ".join(str(v) for v in r.values()).lower():
+            continue
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, width='stretch')
+    st.caption("⚠️ next to Ordered Qty = less than half or more than double the sheet's Order qty.")
+    if len(df):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="Medicines")
+            mdf.to_excel(w, index=False, sheet_name="By Med Type")
+        st.download_button("⬇️ Download Excel", buf.getvalue(), f"normal-orders-{d}.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
+
 
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
@@ -6516,7 +7281,7 @@ def show_admin_page():
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11 = st.tabs([
         "📊 Dashboard",
         "👥 All Staff Work",
         "🔄 Pipeline",
@@ -6525,6 +7290,7 @@ def show_admin_page():
         "👥 Settings",
         "📥 Reports",
         "📦 Customer Orders",
+        "🛒 Normal Orders",
         "🧾 Bills Register",
         "🕐 Attendance",
         "📌 Assign Tasks",
@@ -6533,6 +7299,9 @@ def show_admin_page():
 
     with tab11:
         show_shift_planner("adm_shift")
+
+    with tab13:
+        show_order_sheet_report("adm_osr")
 
     with tab12:
         show_all_staff_work("adm_asw")
@@ -7612,8 +8381,10 @@ def show_admin_page():
                 st.error(f"Error: {e}")
 
         st.divider()
-        st.subheader("🏭 Warehouses & Areas")
-        tab_w, tab_a = st.tabs(["🏭 Warehouses","📍 Areas"])
+        st.subheader("🏭 Warehouses, Areas & Distributors")
+        tab_w, tab_a, tab_d = st.tabs(["🏭 Warehouses","📍 Areas","🚚 Distributors"])
+        with tab_d:
+            show_distributors_admin("adm_dist")
         with tab_w:
             c1,c2 = st.columns(2)
             with c1:
