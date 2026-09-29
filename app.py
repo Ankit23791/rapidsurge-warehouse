@@ -8785,14 +8785,28 @@ def show_admin_page():
                                                                         help="manager = own work + 👥 Team View")})
                         if st.button("💾 Save", key="save_phones", type="primary"):
                             old = {u["id"]: (u.get("phone") or "", u.get("role") or "user") for u in act_users}
-                            n = 0
+                            done, failed = [], []
                             for _, r in ph_ed.iterrows():
+                                uid = int(r["id"])
                                 new = (str(r["Mobile"] or "").strip(), str(r["Role"] or "user"))
-                                if new != old.get(int(r["id"]), ("", "user")):
-                                    supabase.table("app_users").update({"phone": new[0], "role": new[1]}).eq("id", int(r["id"])).execute()
-                                    n += 1
+                                if new == old.get(uid, ("", "user")):
+                                    continue
+                                try:
+                                    supabase.table("app_users").update({"phone": new[0], "role": new[1]}).eq("id", uid).execute()
+                                    chk = supabase.table("app_users").select("role,phone").eq("id", uid).execute().data or []
+                                    if chk and (chk[0].get("role") or "user") == new[1]:
+                                        done.append(r["Name"])
+                                    else:
+                                        failed.append(f"{r['Name']}: database did not accept the change")
+                                except Exception as e:
+                                    failed.append(f"{r['Name']}: {e}")
                             load_users.clear()
-                            st.success(f"✅ {n} change(s) saved — a new role applies at the person's next login")
+                            if done:
+                                st.success(f"✅ Saved: {', '.join(done)} — a new role applies after that person logs out and in again")
+                            for f in failed:
+                                st.error(f"❌ {f} — run fix_roles.sql in Supabase (see Claude's note), then try again")
+                            if not done and not failed:
+                                st.info("Nothing changed — edit a cell first, then Save.")
                 if users_resp.data:
                     for u in users_resp.data:
                         c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
