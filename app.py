@@ -7009,11 +7009,25 @@ def _order_by_distributor(area, d, pending, by_id):
             top_count[b.get("name")] = top_count.get(b.get("name"), 0) + 1
     names = sorted(set(DISTRIBUTORS) | set(top_count), key=lambda n: (-top_count.get(n, 0), n.lower()))
     c1, c2 = st.columns([3, 1])
+    with c2:
+        mode = st.selectbox("Mode", ["Through Call", "Pharma Rack", "Excel Send"], key="os_mode")
+    pr_upload = False
+    if mode == "Pharma Rack":
+        how = st.radio("PharmaRack method", ["🔍 Search medicines one by one", "📤 Upload PharmaRack order file(s)"],
+                       horizontal=True, key="os_pr_how", label_visibility="collapsed")
+        pr_upload = how.startswith("📤")
+    if pr_upload:
+        with c1:
+            st.markdown("**Distributor**")
+            st.caption("Read from each PharmaRack order file (Store column).")
+        start = timer_button("sheet_order", "Purchase Order")
+        if start is None:
+            return
+        _pharmarack_upload(area, d, pending, by_id, start)
+        return
     with c1:
         dist = st.selectbox("Distributor *", names, key="os_dist",
                             format_func=lambda n: f"{n} — {top_count[n]} medicine(s) in top 3" if top_count.get(n) else n)
-    with c2:
-        mode = st.selectbox("Mode", ["Through Call", "Pharma Rack", "Excel Send"], key="os_mode")
     show_all = st.toggle(f"Also show medicines where {dist} is NOT in the top 3", key="os_all")
     start = timer_button("sheet_order", "Purchase Order")
     if start is None:
@@ -7147,6 +7161,448 @@ def _mark_not_ordered(area, d, pending, live, by_id):
                                                                 "note": None, "marked_by": None, "marked_at": None})\
                         .eq("id", opts[k]).execute()
                 st.rerun()
+
+
+# ── PHARMARACK ORDER-FILE UPLOAD (Normal Order Sheet) ─────────────────────────
+# Purchase person places orders on PharmaRack by uploading an Excel, then downloads
+# the order/invoice file per order (Order No, Store, Product, Qty, Free, Scheme ...).
+# Uploading those files here marks the matching order-sheet medicines as Ordered.
+import difflib
+from datetime import timedelta
+
+PR_COLS = {"orderno": "order_no", "orderdate": "order_date", "store": "store", "product": "product",
+           "productname": "product", "itemname": "product", "productcode": "product_code", "qty": "qty",
+           "quantity": "qty", "ptr": "ptr", "free": "free", "scheme": "scheme", "amount": "amount", "total": "total"}
+PR_FORM = {"tab": "tab", "tabs": "tab", "tablet": "tab", "tablets": "tab", "cap": "cap", "caps": "cap",
+           "capsule": "cap", "capsules": "cap", "inj": "inj", "injection": "inj", "syp": "syp", "syrup": "syp",
+           "susp": "susp", "suspension": "susp", "drop": "drop", "drops": "drop", "oint": "oint", "ointment": "oint",
+           "cream": "cream", "gel": "gel", "sol": "sol", "solution": "sol", "spray": "spray", "lotion": "lotion",
+           "powder": "powder", "sachet": "sachet", "rotacap": "rotacap", "rotacaps": "rotacap", "soap": "soap"}
+PR_UNITS = {"mg", "mcg", "ml", "g", "gm", "gms", "iu", "k", "kg", "l"}
+PR_NOISE = {"s", "the", "of", "and", "new", "pvt", "ltd"}
+PR_VARIANTS = {"forte", "plus", "total", "trio", "gold", "max", "fort", "duo", "mini", "kid", "kids", "junior", "neo"}
+PR_NONE = "— not in sheet —"
+PR_SURE, PR_CHECK = 0.78, 0.55          # match score thresholds: ✅ sure / 🟡 check / ❌ not found
+
+
+def _pr_tokens(name):
+    """'TELMA-LN 40MG TAB 15`S' -> (['telma','ln'], {'40'}, {'tab'})"""
+    s = str(name or "").lower().replace("`", "").replace("'", "")
+    s = re.sub(r"[^a-z0-9.]+", " ", s)
+    s = re.sub(r"(\d)([a-z])", r"\1 \2", s)
+    s = re.sub(r"([a-z])(\d)", r"\1 \2", s)
+    toks = [t.strip(".") for t in s.split() if t.strip(".")]
+    words, nums, forms = [], set(), set()
+    for i, t in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if re.fullmatch(r"\d+(\.\d+)?", t):
+            if nxt == "s":                  # pack count like 10S / 15`S -> not a strength
+                continue
+            nums.add(str(float(t)).rstrip("0").rstrip("."))
+        elif t in PR_FORM:
+            forms.add(PR_FORM[t])
+        elif t in PR_UNITS or t in PR_NOISE:
+            continue
+        else:
+            words.append(t)
+    return words, nums, forms
+
+
+def _pr_score(a, b):
+    """0..1 similarity between a PharmaRack product name and an order-sheet medicine name"""
+    wa, na, fa = a
+    wb, nb, fb = b
+    if not wa or not wb:
+        return 0.0
+    sa, sb = " ".join(wa), " ".join(wb)
+    name_sim = difflib.SequenceMatcher(None, sa, sb).ratio()
+    brand = difflib.SequenceMatcher(None, wa[0], wb[0]).ratio()
+    ja, jb = set(wa), set(wb)
+    tok = len(ja & jb) / len(ja | jb)
+    if na and nb:
+        num = 1.0 if na == nb else (0.75 if (na <= nb or nb <= na) else 0.0)
+    elif na or nb:
+        num = 0.7
+    else:
+        num = 1.0
+    form = 0.85 if (fa and fb and not (fa & fb)) else 1.0
+    # variant words on one side only (LN, H, SP, AM, Forte, Plus ...) usually mean a different medicine
+    variant = 0.75 if any(len(t) <= 3 or t in PR_VARIANTS for t in (ja ^ jb)) else 1.0
+    return variant *  (0.45 * name_sim + 0.25 * tok + 0.30 * brand) * (0.35 + 0.65 * num) * form
+
+
+def _pr_dist_norm(s):
+    s = re.sub(r"\(.*?\)", " ", str(s or "").lower())
+    s = re.sub(r"\bm\s*/\s*s\b", " ", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    rep = {"pvt": "private", "ltd": "limited", "co": "company", "llp": ""}
+    return " ".join(rep.get(w, w) for w in s.split() if rep.get(w, w))
+
+
+def pr_guess_distributor(store, names, saved=None):
+    """-> (best distributor name or None, score)"""
+    if saved and saved.get(store) in names:
+        return saved[store], 1.0
+    ns = _pr_dist_norm(store)
+    best, score = None, 0.0
+    for n in names:
+        nn = _pr_dist_norm(n)
+        sc = difflib.SequenceMatcher(None, ns, nn).ratio()
+        if ns.split()[:1] == nn.split()[:1]:
+            sc += 0.15
+        if sc > score:
+            best, score = n, sc
+    return (best, score) if score >= 0.6 else (None, score)
+
+
+def _pr_read(uploaded):
+    name = uploaded.name.lower()
+    read = (lambda **k: pd.read_excel(uploaded, dtype=str, **k)) if name.endswith((".xlsx", ".xls")) \
+        else (lambda **k: pd.read_csv(uploaded, dtype=str, **k))
+    raw = read()
+    cols = {_norm_col(c) for c in raw.columns}
+    if "product" not in cols and "productname" not in cols:
+        # header may not be on the first row -> look for it in the first 15 rows
+        uploaded.seek(0)
+        top = read(header=None, nrows=15)
+        for i, row in top.iterrows():
+            vals = {_norm_col(v) for v in row.values}
+            if ("product" in vals or "productname" in vals) and ("qty" in vals or "quantity" in vals):
+                uploaded.seek(0)
+                return read(header=i)
+    return raw
+
+
+def parse_pharmarack_files(files):
+    """-> (orders {order_no: {...}}, errors [str], duplicate_files [str])"""
+    orders, errors, dups = {}, [], []
+    for f in files:
+        try:
+            raw = _pr_read(f)
+        except Exception as e:
+            errors.append(f"{f.name}: could not read ({e})")
+            continue
+        ren = {}
+        for c in raw.columns:
+            k = PR_COLS.get(_norm_col(c))
+            if k and k not in ren.values():
+                ren[c] = k
+        df = raw.rename(columns=ren)
+        if "product" not in df.columns or "qty" not in df.columns:
+            errors.append(f"{f.name}: needs 'Product' and 'Qty' columns")
+            continue
+        file_orders = {}
+        for _, r in df.iterrows():
+            prod = _clean_str(r.get("product"))
+            if not prod:
+                continue
+            ono = _clean_str(r.get("order_no")) or f"FILE-{f.name}"
+            o = file_orders.setdefault(ono, {
+                "order_no": ono, "order_date": _clean_str(r.get("order_date")), "store": _clean_str(r.get("store")),
+                "file": f.name, "total": _to_float(r.get("total"), 0), "lines": []})
+            o["lines"].append({
+                "product": prod, "product_code": _clean_str(r.get("product_code")),
+                "qty": _to_float(r.get("qty"), 0), "free": _to_float(r.get("free"), 0),
+                "scheme": _clean_str(r.get("scheme")), "ptr": _to_float(r.get("ptr"), 0),
+                "amount": _to_float(r.get("amount"), 0)})
+        if not file_orders:
+            errors.append(f"{f.name}: no product rows found")
+        for ono, o in file_orders.items():
+            if ono in orders:
+                dups.append(f"{f.name} (order {ono} also in {orders[ono]['file']})")
+                continue
+            if not o["total"]:
+                o["total"] = sum(l["amount"] for l in o["lines"])
+            orders[ono] = o
+    return orders, errors, dups
+
+
+def pr_match_lines(pr_lines, sheet_lines, saved_items=None, dists=None):
+    """Match invoice lines to order-sheet lines one-to-one.
+    dists: distributor of each pr line (optional) — on a tie the line goes to the order whose distributor
+    is in that medicine's top 3.
+    -> list (same order as pr_lines) of (sheet_line or None, score, how) ; how = 'saved' | 'auto' | 'dup:<id>' | ''"""
+    saved_items = saved_items or {}
+    by_key = {}
+    for l in sheet_lines:
+        by_key.setdefault(l.get("item_key"), l)
+    res = [(None, 0.0, "")] * len(pr_lines)
+    used = set()
+    # 1) matches confirmed earlier
+    for i, p in enumerate(pr_lines):
+        k = saved_items.get(_pr_item_key(p["product"]))
+        l = by_key.get(k)
+        if l and l["id"] not in used:
+            res[i] = (l, 1.0, "saved")
+            used.add(l["id"])
+    # 2) fuzzy, best pairs first
+    st_tok = [(l, _pr_tokens(l.get("item_name"))) for l in sheet_lines]
+    pairs = []
+    for i, p in enumerate(pr_lines):
+        if res[i][0]:
+            continue
+        pt = _pr_tokens(p["product"])
+        for l, lt in st_tok:
+            sc = _pr_score(pt, lt)
+            if sc >= PR_CHECK:
+                top = bool(dists) and dists[i] in [b.get("name") for b in (l.get("best") or [])]
+                pairs.append((sc, i, l, top))
+    pairs.sort(key=lambda x: (-round(x[0], 3), not x[3]))
+    pairs = [x[:3] for x in pairs]
+    for sc, i, l in pairs:
+        if res[i][0] or l["id"] in used:
+            continue
+        res[i] = (l, sc, "auto")
+        used.add(l["id"])
+    # 3) still unmatched but clearly the same medicine as a line another product already took
+    #    (same medicine ordered twice / from two distributors) -> report it, don't link it
+    for sc, i, l in pairs:
+        if not res[i][0] and not res[i][2] and sc >= PR_SURE:
+            res[i] = (None, sc, f"dup:{l['id']}")
+    return res
+
+
+def _pr_item_key(product):
+    return " ".join(str(product or "").lower().split())
+
+
+@st.cache_data(ttl=120)
+def load_pr_map():
+    """Saved PharmaRack -> app mappings. -> (stores {store: distributor}, items {product: item_key}, ok)"""
+    try:
+        rows = supabase.table("pharmarack_map").select("kind,source,target").execute().data or []
+    except Exception:
+        return {}, {}, False
+    stores = {r["source"]: r["target"] for r in rows if r["kind"] == "store"}
+    items = {r["source"]: r["target"] for r in rows if r["kind"] == "item"}
+    return stores, items, True
+
+
+def _pr_already_imported(order_nos):
+    """order numbers already saved as Purchase Orders (so the same file can't be counted twice)"""
+    if not order_nos:
+        return {}
+    try:
+        rows = supabase.table("daily_tasks").select("id,person,date,details")\
+            .eq("task_type", "Purchase Order").in_("details->>pharmarack_order_no", list(order_nos)).execute().data or []
+    except Exception:
+        since = (today_ist() - timedelta(days=10)).strftime("%Y-%m-%d")
+        rows = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Purchase Order").gte("date", since))
+    out = {}
+    for r in rows:
+        n = (r.get("details") or {}).get("pharmarack_order_no")
+        if n in order_nos:
+            out[n] = r
+    return out
+
+
+def _pr_label(l):
+    return f"{l.get('item_name', '')} · {l.get('pack_size', '')} · R{l.get('round')} #{l['id']}"
+
+
+def _pharmarack_upload(area, d, pending, by_id, start):
+    st.caption("Upload the order file(s) you downloaded from PharmaRack after placing the order — one file per order, "
+               "as many files as you like. Each order's distributor is read from the **Store** column, and each "
+               "product is matched to the medicine in today's order sheet. Check the matches, then save.")
+    ver = st.session_state.get("pr_ver", 0)
+    files = st.file_uploader("PharmaRack order file(s) (.csv / .xlsx)", type=["csv", "xlsx", "xls"],
+                             accept_multiple_files=True, key=f"pr_files_{ver}")
+    if not files:
+        return
+    orders, errors, dups = parse_pharmarack_files(files)
+    for e in errors:
+        st.error("❌ " + e)
+    if dups:
+        st.warning("⚠️ Same order in two files — used only once: " + "; ".join(dups))
+    done = _pr_already_imported(set(orders))
+    for ono, t in done.items():
+        st.warning(f"🔁 Order **{ono}** was already saved by {t.get('person', '')} on {t.get('date', '')} — skipped.")
+        orders.pop(ono, None)
+    if not orders:
+        return
+
+    stores_saved, items_saved, map_ok = load_pr_map()
+    if not map_ok:
+        st.caption("ℹ️ Run **pharmarack_setup.sql** in Supabase so the app remembers your corrections "
+                   "(distributor names and medicine matches) for next time.")
+    live = [l for l in by_id.values() if l.get("status") != "Superseded"]
+    labels = {}
+    for l in live:
+        labels[_pr_label(l)] = l
+    options = [PR_NONE] + sorted(labels, key=str.lower)
+    dist_names = sorted(set(DISTRIBUTORS) | {b.get("name") for l in live for b in (l.get("best") or []) if b.get("name")})
+    usual = _usual_margins()
+
+    # match all orders together so one sheet medicine is never claimed by two orders
+    flat = [(ono, p) for ono, o in orders.items() for p in o["lines"]]
+    guesses = {ono: pr_guess_distributor(o["store"], dist_names, stores_saved)[0] for ono, o in orders.items()}
+    for ono in orders:                                   # a distributor the person already picked wins
+        guesses[ono] = st.session_state.get(f"pr_dist_{ver}_{ono}") or guesses[ono]
+    flat_res = pr_match_lines([p for _, p in flat], live, items_saved, [guesses[ono] for ono, _ in flat])
+    taken_by = {}
+    for (ono, p), (l, _, _) in zip(flat, flat_res):
+        if l:
+            taken_by[l["id"]] = ono
+    res_by_order = {}
+    for (ono, _), r in zip(flat, flat_res):
+        res_by_order.setdefault(ono, []).append(r)
+
+    plans = []                       # one per order: (order, distributor, editor df, meta rows)
+    for ono, o in orders.items():
+        st.markdown("---")
+        guess, _ = pr_guess_distributor(o["store"], dist_names, stores_saved)
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            st.markdown(f"**🧾 Order {ono}**  \n{o['order_date']} · {len(o['lines'])} items · ₹{o['total']:,.2f}  \n"
+                        f"PharmaRack store: _{o['store'] or '—'}_")
+        with c2:
+            dopts = ["— Select distributor —"] + dist_names
+            dist = st.selectbox("Distributor *", dopts, index=dopts.index(guess) if guess in dopts else 0,
+                                key=f"pr_dist_{ver}_{ono}",
+                                help="Guessed from the Store name — change it if wrong. Your choice is remembered.")
+        matches = res_by_order[ono]
+        rows = []
+        for p, (l, sc, how) in zip(o["lines"], matches):
+            if l is None and how.startswith("dup:"):
+                status = f"🔁 Also in order {taken_by.get(int(how[4:]), '?')}"
+            elif l is None:
+                status = "❌ Not in sheet"
+            elif l.get("status") == "Ordered":
+                status = f"🔁 Already ordered ({l.get('distributor', '')})"
+            elif l.get("status") == "Not Ordered":
+                status = "⚠️ Marked Not ordered"
+            elif how == "saved" or sc >= PR_SURE:
+                status = "✅ Matched"
+            else:
+                status = "🟡 Check"
+            ri = dist_rank_info(l, dist, usual) if (l and dist in dist_names) else None
+            rows.append({
+                "Status": status, "OK": not status.startswith("🟡"), "PharmaRack product": p["product"], "Qty": _qty_txt(p["qty"]),
+                "Free": _qty_txt(p["free"]) if p["free"] else "", "Scheme": p["scheme"],
+                "Order sheet medicine": _pr_label(l) if l else PR_NONE,
+                "Sheet qty": _qty_txt(l.get("order_qty")) if l else "",
+                "Rank": (f"#{ri['rank']}" if ri and ri["rank"] else ("not offered" if ri else "")),
+                "Why not top 3?": "", "Note": ""})
+        n_ok = sum(1 for r in rows if r["Status"].startswith("✅"))
+        n_chk = sum(1 for r in rows if r["Status"].startswith("🟡"))
+        n_no = sum(1 for r in rows if r["Status"].startswith("❌"))
+        n_dup = sum(1 for r in rows if r["Status"].startswith("🔁"))
+        st.caption(f"✅ {n_ok} matched · 🟡 {n_chk} to check · ❌ {n_no} not in sheet"
+                   + (f" · 🔁 {n_dup} already ordered / in another order" if n_dup else "") + " — "
+                   "fix any wrong match in the **Order sheet medicine** column. 🟡 rows: tick **OK** once checked.")
+        ed = st.data_editor(
+            pd.DataFrame(rows), key=f"pr_ed_{ver}_{ono}", hide_index=True, width='stretch',
+            disabled=["Status", "PharmaRack product", "Qty", "Free", "Scheme", "Sheet qty", "Rank"],
+            column_config={
+                "OK": st.column_config.CheckboxColumn("OK", help="Tick after checking a 🟡 match"),
+                "Order sheet medicine": st.column_config.SelectboxColumn(
+                    "Order sheet medicine", options=options, width="large",
+                    help="The order-sheet medicine this product is for. Pick '— not in sheet —' if it isn't in the sheet."),
+                "Why not top 3?": st.column_config.SelectboxColumn(
+                    "Why not top 3?", options=[""] + OFF_TOP_REASONS,
+                    help="Needed only when this distributor is not Best Dist 1-3 for the medicine"),
+            })
+        plans.append((o, dist, ed, rows))
+
+    st.markdown("---")
+    tot_lines = sum(len(o["lines"]) for o, _, _, _ in plans)
+    if not st.button(f"💾 Save {len(plans)} PharmaRack order(s) — {tot_lines} items", type="primary",
+                     key=f"pr_save_{ver}", width='stretch'):
+        return
+
+    # ── validate ──
+    errs, work, seen = [], [], {}
+    for o, dist, ed, rows in plans:
+        if dist not in dist_names:
+            errs.append(f"Order {o['order_no']}: select the distributor")
+            continue
+        items = []
+        for (_, r), p, orig in zip(ed.iterrows(), o["lines"], rows):
+            l = labels.get(r["Order sheet medicine"])
+            if l is None:
+                items.append((p, None, r, orig))
+                continue
+            if orig["Status"].startswith("🟡") and r["Order sheet medicine"] == orig["Order sheet medicine"] \
+                    and not r["OK"]:
+                errs.append(f"{p['product']} → {l.get('item_name')}: check this match and tick OK (or change it)")
+            if l["id"] in seen:
+                errs.append(f"{l.get('item_name')}: matched to two products ({seen[l['id']]} and {p['product']})")
+            seen[l["id"]] = p["product"]
+            if l.get("status") == "Ordered":
+                items.append((p, None, r, orig))        # already ordered earlier -> nothing to mark
+                continue
+            ri = dist_rank_info(l, dist, usual)
+            if not ri["top3"] and not r["Why not top 3?"]:
+                errs.append(f"{l.get('item_name')}: {dist} is not in the top 3 — pick 'Why not top 3?'")
+            if r["Why not top 3?"] == "Other" and not str(r["Note"] or "").strip():
+                errs.append(f"{l.get('item_name')}: write a note for 'Other'")
+            items.append((p, l, r, orig))
+        work.append((o, dist, items))
+    if errs:
+        st.error("Fix these before saving:\n\n- " + "\n- ".join(errs[:12]))
+        return
+
+    # ── save ──
+    end_time, duration = end_timer("sheet_order", start)
+    now_s = now_iso()
+    total_items = sum(len(o["lines"]) for o, _, _ in work) or 1
+    summary, map_rows = [], []
+    try:
+        for o, dist, items in work:
+            marked = [(p, l, r) for p, l, r, _ in items if l is not None]
+            unlinked = [(p, r, orig) for p, l, r, orig in items if l is None]
+            already = [p["product"] for p, r, orig in unlinked
+                       if labels.get(r["Order sheet medicine"]) or
+                       (r["Order sheet medicine"] == PR_NONE and orig["Status"].startswith("🔁"))]
+            extra = [p["product"] for p, r, orig in unlinked if p["product"] not in already]
+            off_top = sum(1 for _, l, _ in marked if not dist_rank_info(l, dist, usual)["top3"])
+            share = round(duration * len(o["lines"]) / total_items)      # split the timer across orders
+            task = supabase.table("daily_tasks").insert({
+                "date": date_str(), "time": time_str(), "person": st.session_state.name, "team": "Purchase",
+                "task_type": "Purchase Order",
+                "details": {"distributor": dist, "area": area, "order_type": "Regular",
+                            "no_sku": str(len(o["lines"])), "strips": _qty_txt(sum(p["qty"] for p in o["lines"])),
+                            "mode": "Pharma Rack", "urgency": "Normal", "source": "PharmaRack Upload",
+                            "pharmarack_order_no": o["order_no"], "pharmarack_store": o["store"],
+                            "order_date": o["order_date"], "amount": f"{o['total']:.2f}", "file": o["file"],
+                            "sheet_date": d, "matched": str(len(marked)), "not_in_sheet": str(len(extra)),
+                            "not_in_sheet_items": extra[:100], "already_ordered_items": already[:100],
+                            "off_top3": str(off_top), "remarks": ""},
+                "start_time": start.strftime("%I:%M:%S %p"), "end_time": end_time,
+                "duration_mins": str(share), "status": "Completed"}).execute().data
+            task_id = task[0]["id"] if task else None
+            for p, l, r in marked:
+                ri = dist_rank_info(l, dist, usual)
+                note = f"PharmaRack {o['order_no']}" + (f" · free {_qty_txt(p['free'])}" if p["free"] else "") \
+                    + (f" · {p['scheme']}" if p["scheme"] else "")
+                extra_note = str(r["Note"] or "").strip()
+                supabase.table("order_sheet_lines").update({
+                    "status": "Ordered", "ordered_qty": float(p["qty"]), "distributor": dist,
+                    "dist_rank": ri["rank"], "dist_margin": ri["margin"], "best_margin": ri["best_margin"],
+                    "off_top_reason": r["Why not top 3?"] or None,
+                    "note": note + (f" · {extra_note}" if extra_note else ""),
+                    "po_task_id": task_id, "marked_by": st.session_state.name, "marked_at": now_s}).eq("id", l["id"]).execute()
+                map_rows.append({"kind": "item", "source": _pr_item_key(p["product"]), "target": l.get("item_key"),
+                                 "updated_by": st.session_state.name, "updated_at": now_s})
+            if o["store"]:
+                map_rows.append({"kind": "store", "source": o["store"], "target": dist,
+                                 "updated_by": st.session_state.name, "updated_at": now_s})
+            summary.append(f"{o['order_no']} → {dist}: {len(marked)} marked"
+                           + (f", {len(extra)} not in sheet" if extra else "")
+                           + (f", {len(already)} already ordered" if already else ""))
+    except Exception as e:
+        st.error(f"Error while saving: {e}")
+        return
+    if map_ok and map_rows:
+        try:
+            uniq = {(m["kind"], m["source"]): m for m in map_rows}
+            supabase.table("pharmarack_map").upsert(list(uniq.values()), on_conflict="kind,source").execute()
+            load_pr_map.clear()
+        except Exception as e:
+            st.warning(f"Orders saved, but the matches could not be remembered: {e}")
+    st.session_state["pr_ver"] = ver + 1
+    st.session_state["os_msg2"] = "✅ PharmaRack orders saved — " + " · ".join(summary)
+    st.rerun()
 
 
 # ── NORMAL ORDER REPORT (admin / manager) ─────────────────────────────────────
