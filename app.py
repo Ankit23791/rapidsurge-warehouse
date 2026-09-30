@@ -920,8 +920,8 @@ def form_arrangement():
                   "qty": _qty_txt(min(_to_float(p.get("Order Qty"), 0), _to_float(p.get("Needed"), 0)))}
                  for p in picked_lines],
                 f"📋 {auto_arr_no} · {link_area} · {today_ist().strftime('%d %b %Y')}")
-            st.caption("Take the screenshot, upload it as the Image of Order below. "
-                       "The delivery boy also sees this list on his Pickup screen.")
+            st.caption("✅ No screenshot needed — this list is sent automatically to the delivery boy's Pickup screen. "
+                       "(Screenshot only if you want to send it to the distributor on WhatsApp.)")
 
     # form keys change after each saved order -> fresh form; they do NOT change on an error,
     # so a missing photo no longer resets the distributor / area
@@ -953,7 +953,10 @@ def form_arrangement():
             order_time    = st.text_input("Order Time", value=time_str(), key=f"arr_time_{fv}")
         target_choice, target_custom = _pickup_target_input(fv)
         remarks = st.text_input("Remarks", key=f"arr_remarks_{fv}")
-        st.markdown("📸 **Image of Order ***")
+        if picked_lines:
+            st.markdown("📸 **Image of Order** (optional — the ticked medicines go to the delivery boy automatically)")
+        else:
+            st.markdown("📸 **Image of Order *** (required when no customer items are ticked)")
         arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key=f"arr_upload_{fv}")
 
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
@@ -973,8 +976,9 @@ def form_arrangement():
                 st.error("Enter No of Medicines to Pick!")
             elif target_err:
                 st.error("⏰ " + target_err)
-            elif arr_img is None:
-                st.error("⚠️ Image of order is mandatory! Please upload or take photo (just above Submit).")
+            elif arr_img is None and not picked_lines:
+                st.error("⚠️ Image of order is mandatory when no customer items are ticked! "
+                         "Tick the medicines above, or upload / take a photo (just above Submit).")
             else:
                 # Check duplicate arrangement number
                 try:
@@ -985,7 +989,7 @@ def form_arrangement():
                     if check.data:
                         st.error(f"❌ Arrangement No #{arr_no} already exists! Please use a different number.")
                     else:
-                        img_name = upload_image(arr_img, "arr")
+                        img_name = upload_image(arr_img, "arr") if arr_img is not None else ""
                         arr_row = {
                             "arrangement_no": arr_no,
                             "distributor": distributor,
@@ -1363,9 +1367,10 @@ def form_pickup():
     if meds:
         medicine_list_card([{"name": m.get("medicine_name", ""), "qty": m.get("quantity", "")} for m in meds],
                            f"💊 Medicines to pick — #{arr_no} · {arr.get('distributor','')}")
-    with st.expander("📄 Order image from Purchase Team", expanded=not meds):
-        if not show_image(arr.get("order_image", ""), "Order image", key=f"inv_{arr_no}"):
-            st.warning("⚠️ No order image uploaded by Purchase Team for this arrangement")
+    if arr.get("order_image") or not meds:
+        with st.expander("📄 Order image from Purchase Team", expanded=not meds):
+            if not show_image(arr.get("order_image", ""), "Order image", key=f"inv_{arr_no}"):
+                st.warning("⚠️ No order image or medicine list for this arrangement — call the Purchase Team")
 
     # ── Step 1: reached distributor ──
     open_task = _open_pickup(arr_no)
