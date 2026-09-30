@@ -787,6 +787,107 @@ def _pickup_target_value(choice, custom):
         return None, f"Custom pickup time {custom.strftime('%I:%M %p')} has already passed."
     return t, None
 
+# ── ARRANGEMENT: ORDER ID / INVOICE NO ────────────────────────────────────────
+ARR_NEW_COLS = {"target_pickup_at": "pickup_target_setup.sql",
+                "order_via": "arrangement_invoice_setup.sql", "distributor_order_id": "arrangement_invoice_setup.sql",
+                "invoice_no": "arrangement_invoice_setup.sql", "invoice_added_by": "arrangement_invoice_setup.sql",
+                "invoice_added_at": "arrangement_invoice_setup.sql"}
+
+def insert_arrangement(row):
+    """Insert an arrangement; if newer columns aren't in Supabase yet, save without them and say which SQL to run"""
+    try:
+        return supabase.table("arrangements").insert(row).execute()
+    except Exception as e:
+        missing = [c for c in ARR_NEW_COLS if c in str(e) and c in row]
+        if not missing:
+            raise
+        sqls = sorted({ARR_NEW_COLS[c] for c in ARR_NEW_COLS if c in row})
+        for c in ARR_NEW_COLS:
+            row.pop(c, None)
+        res = supabase.table("arrangements").insert(row).execute()
+        st.warning("Arrangement saved, but without target pickup time / invoice details — run "
+                   + " and ".join(f"**{x}**" for x in sqls) + " in Supabase.")
+        return res
+
+def arr_ref_text(a):
+    """'Order ID: X · Invoice: Y' (or ⏳ awaited)"""
+    oid, inv = a.get("distributor_order_id") or "", a.get("invoice_no") or ""
+    if not oid and not inv:
+        return f"Bill/Order ID: {a.get('bill_order_id') or '—'}"
+    return (f"Order ID: {oid} · " if oid else "") + (f"Invoice: {inv}" if inv else "Invoice: ⏳ awaited")
+
+def count_missing_invoices():
+    try:
+        since = (today_ist() - timedelta(days=5)).strftime("%Y-%m-%d")
+        rows = supabase.table("arrangements").select("id,invoice_no,pickup_type").gte("order_placed_date", since)\
+            .is_("invoice_no", "null").execute().data or []
+        return len(rows)
+    except Exception:
+        return 0
+
+def form_add_invoice():
+    st.subheader("🧾 Add Invoice No — arrangement orders")
+    st.caption("Orders placed on PharmaRack / distributor software get an Order ID first and the invoice number later. "
+               "Type the invoice number here when you get it — it then flows to pickup, register entry and bill check.")
+    c1, c2 = st.columns(2)
+    with c1:
+        days = st.selectbox("Orders from", [2, 5, 10], index=1, format_func=lambda d: f"last {d} days", key="ai_days")
+    with c2:
+        show = st.radio("Show", ["⏳ Invoice awaited", "All"], horizontal=True, key="ai_show")
+    since = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        arrs = supabase.table("arrangements").select("*").gte("order_placed_date", since).order("id", desc=True)\
+            .execute().data or []
+        if arrs and "invoice_no" not in arrs[0]:
+            raise Exception("column invoice_no does not exist")
+    except Exception as e:
+        st.error(f"Could not load — run **arrangement_invoice_setup.sql** in Supabase first. ({e})")
+        return
+    if show.startswith("⏳"):
+        arrs = [a for a in arrs if not a.get("invoice_no")]
+    msg = st.session_state.pop("ai_msg", None)
+    if msg:
+        st.success(msg)
+    if not arrs:
+        st.success("🎉 Every arrangement has its invoice number.")
+        return
+    now = now_ist()
+    rows = [{"id": a["id"], "Arrangement": a.get("arrangement_no", ""), "Date": _sched_label(a.get("order_placed_date")),
+             "Placed": a.get("order_placed_time", ""), "Waiting": fmt_age(age_mins(a.get("created_at"), now)) if a.get("created_at") else "",
+             "Distributor": a.get("distributor", ""), "Area": a.get("area", ""), "Via": a.get("order_via") or "",
+             "By": a.get("order_by", ""), "Status": a.get("status", ""),
+             "Order ID": a.get("distributor_order_id") or "", "Invoice No": a.get("invoice_no") or ""} for a in arrs]
+    df = pd.DataFrame(rows)
+    if not any(r["Waiting"] for r in rows):
+        df = df.drop(columns=["Waiting"])
+    ver = st.session_state.get("ai_ver", 0)
+    ed = st.data_editor(df, key=f"ai_ed_{ver}", hide_index=True, width='stretch',
+                        disabled=[c for c in df.columns if c not in ("Order ID", "Invoice No")],
+                        column_config={"id": None,
+                                       "Invoice No": st.column_config.TextColumn("Invoice No ✏️", help="Type the invoice / bill number"),
+                                       "Order ID": st.column_config.TextColumn("Order ID ✏️")})
+    old = {r["id"]: r for r in rows}
+    changes = []
+    for r in ed.to_dict("records"):
+        o = old[r["id"]]
+        inv, oid = str(r["Invoice No"] or "").strip(), str(r["Order ID"] or "").strip()
+        if inv != o["Invoice No"] or oid != o["Order ID"]:
+            changes.append((r, inv, oid))
+    if st.button(f"💾 Save ({len(changes)})", type="primary", key="ai_save", disabled=not changes, width='stretch'):
+        now_s = now_iso()
+        try:
+            for r, inv, oid in changes:
+                upd = {"invoice_no": inv or None, "distributor_order_id": oid or None, "bill_order_id": inv or oid}
+                if inv:
+                    upd.update({"invoice_added_by": st.session_state.name, "invoice_added_at": now_s})
+                supabase.table("arrangements").update(upd).eq("id", r["id"]).execute()
+            log_simple_task("Invoice No Added", {"arrangements": ", ".join(r["Arrangement"] for r, _, _ in changes)})
+            st.session_state["ai_ver"] = ver + 1
+            st.session_state["ai_msg"] = f"✅ Saved {len(changes)} arrangement(s)"
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
 def form_arrangement():
     st.subheader("📋 New Arrangement Order")
     start = timer_button("arrangement_order", "Arrangement Order")
@@ -834,7 +935,12 @@ def form_arrangement():
                                          key=f"arr_area_{fv}_{area_default}",
                                          disabled=bool(picked_lines),
                                          help="Filled from the customer-order area above" if picked_lines else None)
-            bill_order_id = st.text_input("Bill Number / Order ID", key=f"arr_bill_{fv}")
+            order_via     = st.selectbox("Order placed via", ["Call", "PharmaRack", "Distributor software / app", "WhatsApp", "Other"],
+                                         key=f"arr_via_{fv}")
+            dist_order_id = st.text_input("Order ID (from PharmaRack / distributor app)", key=f"arr_oid_{fv}")
+            invoice_no    = st.text_input("Invoice / Bill No (if you have it now)", key=f"arr_bill_{fv}",
+                                          help="On a call you usually get it now. For PharmaRack / software orders leave "
+                                               "it blank — add it later in 🧾 Add Invoice No.")
         with c2:
             urgency       = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key=f"arr_urgency_{fv}")
             pickup_type   = st.selectbox("Pickup Type", ["Self Pick","Porter","Distributor Delivers"], key=f"arr_pickup_{fv}")
@@ -857,6 +963,8 @@ def form_arrangement():
                     f"{p.get('Item','')} {('(' + str(p.get('Pack')) + ')') if p.get('Pack') else ''}".strip()
                     + f" - {_qty_txt(min(_to_float(p.get('Order Qty'),0), _to_float(p.get('Needed'),0)))}"
                     for p in picked_lines)
+            invoice_no, dist_order_id = invoice_no.strip(), dist_order_id.strip()
+            bill_order_id = invoice_no or dist_order_id
             target_at, target_err = (None, None) if pickup_type == "Distributor Delivers" \
                 else _pickup_target_value(target_choice, target_custom)
             if not no_medicines:
@@ -892,14 +1000,11 @@ def form_arrangement():
                         }
                         if target_at:
                             arr_row["target_pickup_at"] = target_at.isoformat()
-                        try:
-                            result = supabase.table("arrangements").insert(arr_row).execute()
-                        except Exception as ins_err:
-                            if "target_pickup_at" not in str(ins_err):
-                                raise
-                            arr_row.pop("target_pickup_at", None)       # column not created yet
-                            result = supabase.table("arrangements").insert(arr_row).execute()
-                            st.warning("⏰ Arrangement saved without target pickup time — " + PICKUP_SQL_HINT)
+                        arr_row.update({"order_via": order_via, "distributor_order_id": dist_order_id or None,
+                                        "invoice_no": invoice_no or None})
+                        if invoice_no:
+                            arr_row.update({"invoice_added_by": st.session_state.name, "invoice_added_at": now_iso()})
+                        result = insert_arrangement(arr_row)
                         arr_id = result.data[0]["id"]
                         if picked_lines:
                             save_arrangement_links(arr_id, arr_no, distributor, area, picked_lines)
@@ -1249,7 +1354,7 @@ def form_pickup():
 
     c1, c2, c3 = st.columns(3)
     with c1: st.info(f"📍 Area: **{arr.get('area','N/A')}**")
-    with c2: st.info(f"🧾 Bill/Order ID: **{arr.get('bill_order_id') or 'N/A'}**")
+    with c2: st.info(f"🧾 {arr_ref_text(arr)}")
     with c3: st.info(f"💊 Medicines to Pick: **{arr.get('no_medicines','N/A')}**")
 
     meds = load_arrangement_medicines(arr_id)
@@ -2542,7 +2647,7 @@ def show_pickup_images():
                 if meds:
                     medicine_list_card([{"name": m.get("medicine_name", ""), "qty": m.get("quantity", "")} for m in meds],
                                        "💊 Medicines ordered")
-            st.caption(f"Area: {arr.get('area','')} · Bill/Order ID: {arr.get('bill_order_id') or '—'} · "
+            st.caption(f"Area: {arr.get('area','')} · {arr_ref_text(arr)} · "
                        f"Delivery by: {d.get('delivery_by','')} · Porter: {d.get('porter_no') or '—'} · "
                        f"Remarks: {d.get('remarks') or '—'}")
 
@@ -3859,6 +3964,11 @@ def show_user_page():
                 type="primary" if st.session_state.purchase_active_form=="arrangement" else "secondary"):
                 st.session_state.purchase_active_form = "arrangement"
                 st.rerun()
+            n_inv = count_missing_invoices()
+            if st.button(f"🧾 Add Invoice No" + (f" ({n_inv})" if n_inv else ""), width='stretch', key="p_invoice",
+                type="primary" if st.session_state.purchase_active_form=="invoice" else "secondary"):
+                st.session_state.purchase_active_form = "invoice"
+                st.rerun()
 
             st.markdown("### 🧾 Customer Orders")
             if st.button("📥 Import Orders", width='stretch', key="p_import",
@@ -3950,6 +4060,7 @@ def show_user_page():
                 "sheet":       form_order_sheet,
                 "return":      form_purchase_return,
                 "arrangement": form_arrangement,
+                "invoice":     form_add_invoice,
                 "pharma":      form_pharmarack,
                 "bounce":      form_bounce_medicine,
                 "porter":      form_book_porter,
@@ -3982,6 +4093,9 @@ def show_user_page():
                 if st.button("📦 Arrangement", key="mp_arrangement", type="primary", use_container_width=True):
                     st.session_state.purchase_active_form = "arrangement"
                     st.rerun()
+            if st.button("🧾 Add Invoice No" + (f" ({n_inv})" if n_inv else ""), key="mp_invoice", use_container_width=True):
+                st.session_state.purchase_active_form = "invoice"
+                st.rerun()
             c1,c2 = st.columns(2)
             with c1:
                 if st.button("↩️ Return", key="mp_return", use_container_width=True):
