@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import io
 import re
 import pytz
@@ -719,6 +719,15 @@ def form_arrangement():
     # Customer order items to link (optional)
     link_area, picked_lines = arrangement_line_picker()
     picked_lines = [p for p in picked_lines if _to_float(p.get("Order Qty"), 0) > 0]
+    if picked_lines:
+        if st.toggle(f"📸 Show only the {len(picked_lines)} selected medicine(s) — for screenshot", key="arr_shot"):
+            medicine_list_card(
+                [{"name": p.get("Item", ""), "pack": p.get("Pack", ""),
+                  "qty": _qty_txt(min(_to_float(p.get("Order Qty"), 0), _to_float(p.get("Needed"), 0)))}
+                 for p in picked_lines],
+                f"📋 {auto_arr_no} · {link_area} · {today_ist().strftime('%d %b %Y')}")
+            st.caption("Take the screenshot, upload it as the Image of Order below. "
+                       "The delivery boy also sees this list on his Pickup screen.")
 
     # form keys change after each saved order -> fresh form; they do NOT change on an error,
     # so a missing photo no longer resets the distributor / area
@@ -1028,191 +1037,206 @@ def form_call_log():
                 st.error(f"Error: {e}")
 
 # ── PICKUP FORM ──────────────────────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def load_image_bytes(name):
+    """Download an image from Supabase storage once and reuse it (images never change)"""
+    return supabase.storage.from_("Images").download(name.strip())
+
+def show_image(name, caption="", key="", width='stretch'):
+    if not name or not str(name).strip():
+        return False
+    try:
+        data = load_image_bytes(name)
+        st.image(data, caption=caption or None, width=width)
+        if key:
+            st.download_button("🔍 Download to zoom", data, file_name=f"{key}.jpg", mime="image/jpeg", key=f"dl_{key}")
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Image error: {e}")
+        return False
+
+def load_arrangement_medicines(arr_id):
+    try:
+        return supabase.table("arrangement_medicines").select("medicine_name,quantity")\
+            .eq("arrangement_id", arr_id).order("id").execute().data or []
+    except Exception:
+        return []
+
+def medicine_list_card(meds, title=""):
+    """Clean, large medicine list — easy to read on a phone and to screenshot"""
+    if not meds:
+        return
+    rows = "".join(
+        f"<tr><td style='padding:6px 10px;color:#6b7280'>{i}</td>"
+        f"<td style='padding:6px 10px;font-weight:600'>{m['name']}</td>"
+        f"<td style='padding:6px 10px'>{m.get('pack','')}</td>"
+        f"<td style='padding:6px 10px;text-align:right;font-weight:700;font-size:1.15em'>{m['qty']}</td></tr>"
+        for i, m in enumerate(meds, 1))
+    st.markdown(
+        f"<div style='border:2px solid #0B1F33;border-radius:10px;padding:10px 12px;background:#fff;color:#111'>"
+        + (f"<div style='font-weight:700;font-size:1.1em;margin-bottom:6px'>{title}</div>" if title else "")
+        + "<table style='width:100%;border-collapse:collapse;font-size:1.05em'>"
+          "<tr style='background:#0B1F33;color:#fff'><th style='padding:6px 10px;text-align:left'>#</th>"
+          "<th style='padding:6px 10px;text-align:left'>Medicine</th><th style='padding:6px 10px;text-align:left'>Pack</th>"
+          "<th style='padding:6px 10px;text-align:right'>Qty</th></tr>"
+        + rows + f"</table><div style='margin-top:6px;color:#374151'><b>{len(meds)} medicine(s)</b></div></div>",
+        unsafe_allow_html=True)
+
+def _open_pickup(arr_no):
+    """Pickup started (reached distributor) but not submitted yet -> daily_tasks row or None"""
+    try:
+        since = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        rows = supabase.table("daily_tasks").select("*").eq("task_type", "Pickup").eq("status", "In Progress")\
+            .eq("person", st.session_state.name).gte("date", since).order("id", desc=True).execute().data or []
+    except Exception:
+        return None
+    return next((r for r in rows if (r.get("details") or {}).get("arrangement_no") == arr_no), None)
+
 def form_pickup():
     st.subheader("📋 Pickup Log")
-
-    # Simple date filter for Naresh
-    from datetime import timedelta
-    pickup_date = st.date_input("Filter by Order Date",
-        value=today_ist(),
-        key="naresh_date_filter",
-        min_value=today_ist() - timedelta(days=2),
-        max_value=today_ist())
-
+    pickup_date = st.date_input("Filter by Order Date", value=today_ist(), key="naresh_date_filter",
+                                min_value=today_ist() - timedelta(days=2), max_value=today_ist())
     try:
-        resp = supabase.table("arrangements").select("*")\
-            .eq("status", "Pending")\
-            .eq("pickup_type", "Self Pick")\
-            .eq("order_placed_date", pickup_date.strftime("%Y-%m-%d"))\
-            .execute()
-        arrangements = resp.data if resp.data else []
+        arrangements = supabase.table("arrangements").select("*")\
+            .eq("status", "Pending").eq("pickup_type", "Self Pick")\
+            .eq("order_placed_date", pickup_date.strftime("%Y-%m-%d")).execute().data or []
     except Exception as e:
         st.error(f"Error: {e}")
         arrangements = []
-
+    msg = st.session_state.pop("pu_msg", None)
+    if msg:
+        st.success(msg)
     if not arrangements:
         st.info("No pending arrangements!")
         return
 
-    # Show pending summary
-    pending = [a for a in arrangements if a.get("status") == "Pending"]
-
-    if pending:
-        st.markdown(f"**🔴 {len(pending)} Pending Arrangements:**")
-        for arr in pending:
-            urgency_color = "🔴" if arr.get("urgency") == "Very Urgent" else "🟡" if arr.get("urgency") == "Urgent" else "🟢"
-            st.markdown(f"{urgency_color} **#{arr.get('arrangement_no')}** — {arr.get('distributor')} — Area: {arr.get('area','')} — Medicines: {arr.get('no_medicines','')} — {arr.get('urgency')}")
-
+    st.markdown(f"**🔴 {len(arrangements)} Pending Arrangements:**")
+    for arr in arrangements:
+        u = arr.get("urgency")
+        icon = "🔴" if u == "Very Urgent" else "🟡" if u == "Urgent" else "🟢"
+        st.markdown(f"{icon} **#{arr.get('arrangement_no')}** — {arr.get('distributor')} — Area: {arr.get('area','')} "
+                    f"— Medicines: {arr.get('no_medicines','')} — {u}")
     st.divider()
     st.subheader("➕ Add Pickup Entry")
 
     arr_options = {f"#{a.get('arrangement_no')} — {a.get('distributor')} — {a.get('area','')}": a for a in arrangements}
+    ver = st.session_state.get("pu_ver", 0)
+    sel = st.selectbox("Arrangement *", ["—"] + list(arr_options), key=f"pu_arr_{ver}")
+    if sel == "—":
+        st.caption("Select the arrangement you are picking up.")
+        return
+    arr = arr_options[sel]
+    arr_id, arr_no = arr["id"], arr.get("arrangement_no")
 
-    # Show invoice image OUTSIDE form so it stays visible
-    if "selected_pickup_arr" not in st.session_state:
-        st.session_state.selected_pickup_arr = None
+    c1, c2, c3 = st.columns(3)
+    with c1: st.info(f"📍 Area: **{arr.get('area','N/A')}**")
+    with c2: st.info(f"🧾 Bill/Order ID: **{arr.get('bill_order_id') or 'N/A'}**")
+    with c3: st.info(f"💊 Medicines to Pick: **{arr.get('no_medicines','N/A')}**")
 
-    arr_keys = ["—"] + list(arr_options.keys())
-    selected_preview = st.selectbox("Preview Arrangement", arr_keys, key="pu_preview")
-    if selected_preview != "—":
-        preview_arr = arr_options[selected_preview]
-        st.session_state.selected_pickup_arr = selected_preview
-        # Store for auto-fill in form
-        st.session_state["pickup_auto_dist"] = preview_arr.get("distributor","")
-        st.session_state["pickup_auto_arr"]  = selected_preview
+    meds = load_arrangement_medicines(arr_id)
+    if meds:
+        medicine_list_card([{"name": m.get("medicine_name", ""), "qty": m.get("quantity", "")} for m in meds],
+                           f"💊 Medicines to pick — #{arr_no} · {arr.get('distributor','')}")
+    with st.expander("📄 Order image from Purchase Team", expanded=not meds):
+        if not show_image(arr.get("order_image", ""), "Order image", key=f"inv_{arr_no}"):
+            st.warning("⚠️ No order image uploaded by Purchase Team for this arrangement")
 
-        c1,c2,c3 = st.columns(3)
-        with c1: st.info(f"📍 Area: **{preview_arr.get('area','N/A')}**")
-        with c2: st.info(f"🧾 Bill/Order ID: **{preview_arr.get('bill_order_id','N/A')}**")
-        with c3: st.info(f"💊 Medicines to Pick: **{preview_arr.get('no_medicines','N/A')}**")
-        order_img = preview_arr.get("order_image","")
-        if order_img and order_img.strip():
-            st.markdown("**📄 Invoice Image from Purchase Team:**")
+    # ── Step 1: reached distributor ──
+    open_task = _open_pickup(arr_no)
+    if not open_task:
+        st.markdown("#### 1️⃣ Reached the distributor?")
+        if st.button("📍 I have reached the distributor", type="primary", width='stretch', key=f"pu_reach_{arr_id}"):
+            now = now_ist()
             try:
-                img_data = supabase.storage.from_("Images").download(order_img.strip())
-                from PIL import Image
-                import io
-                img = Image.open(io.BytesIO(img_data))
-                st.image(img, caption="Invoice (Download to zoom)", width='stretch')
-                st.download_button(
-                    "🔍 Download to Zoom",
-                    img_data,
-                    file_name=f"invoice_{preview_arr.get('arrangement_no','')}.jpg",
-                    mime="image/jpeg",
-                    key=f"dl_inv_{preview_arr.get('arrangement_no','')}"
-                )
-            except Exception as img_err:
-                st.warning(f"⚠️ Image error: {img_err}")
-        else:
-            st.warning("⚠️ No invoice image uploaded by Purchase Team for this arrangement")
+                supabase.table("daily_tasks").insert({
+                    "date": date_str(), "time": time_str(), "person": st.session_state.name, "team": "Delivery",
+                    "task_type": "Pickup", "status": "In Progress", "start_time": now.strftime("%I:%M:%S %p"),
+                    "details": {"arrangement_no": str(arr_no), "arrangement_id": arr_id,
+                                "distributor": arr.get("distributor", ""), "time_reached": now.strftime("%I:%M %p")}
+                }).execute()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+        st.caption("Press this when you reach the distributor — the time is saved automatically.")
+        return
 
-    # Auto fill from preview
-    auto_dist = st.session_state.get("pickup_auto_dist","")
-    auto_arr  = st.session_state.get("pickup_auto_arr","")
-    arr_keys  = ["—"] + list(arr_options.keys())
+    reached = (open_task.get("details") or {}).get("time_reached", open_task.get("start_time", ""))
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.success(f"📍 Reached distributor at **{reached}**")
+    with c2:
+        if st.button("↩️ Undo", key=f"pu_undo_{arr_id}", help="Pressed by mistake? Remove the reached time"):
+            supabase.table("daily_tasks").delete().eq("id", open_task["id"]).eq("status", "In Progress").execute()
+            st.rerun()
 
-    # Show selected info above form
-    if auto_dist:
-        st.success(f"✅ Auto-filled: **{auto_dist}** | **{auto_arr}**")
-
-    with st.form("pickup_form", clear_on_submit=True):
+    # ── Step 2: pickup details, submitted when medicines are handed over ──
+    st.markdown("#### 2️⃣ Medicines received")
+    with st.form(f"pickup_form_{arr_id}", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
-            # Show auto-filled values as text info
-            st.markdown(f"**Distributor:** {auto_dist if auto_dist else 'Select below'}")
-            distributor = st.selectbox("Change Distributor (if needed)",
-                dist_options(auto_dist),
-                index=dist_options(auto_dist).index(auto_dist) if auto_dist else 0,
-                key="pu_dist")
-            st.markdown(f"**Arrangement:** {auto_arr if auto_arr else 'Select below'}")
-            arr_select = st.selectbox("Change Arrangement (if needed)",
-                arr_keys,
-                index=arr_keys.index(auto_arr) if auto_arr in arr_keys else 0,
-                key="pu_arr")
-            delivery_by = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
+            opts = dist_options(arr.get("distributor", ""))
+            distributor = st.selectbox("Distributor (change only if different)", opts,
+                                       index=opts.index(arr.get("distributor")) if arr.get("distributor") in opts else 0,
+                                       key=f"pu_dist_{arr_id}")
+            delivery_by = st.selectbox("Delivery By", ["Self Pick", "Distributor"], key=f"pu_delby_{arr_id}")
         with c2:
-            no_sku_received = st.number_input("No of SKUs Actually Received", min_value=0, step=1)
-            time_reached    = st.time_input("Time Reached Distributor", key="pu_reached")
-            time_handover   = st.time_input("Handover Received Time", key="pu_handover")
-
-        # Show invoice image if arrangement selected
-        if arr_select != "—":
-            selected_arr = arr_options[arr_select]
-            no_medicines = selected_arr.get("no_medicines", "N/A")
-            bill_id      = selected_arr.get("bill_order_id", "N/A")
-            area         = selected_arr.get("area", "N/A")
-            st.info(f"📋 Area: **{area}** | Bill/Order ID: **{bill_id}** | Medicines to Pick: **{no_medicines}**")
-
-        # Porter details
+            no_sku_received = st.number_input("No of SKUs Actually Received *", min_value=0, step=1,
+                                              value=int(_to_float(arr.get("no_medicines"), 0)),
+                                              key=f"pu_sku_{arr_id}")
+            st.caption("⏱️ Handover received time is saved automatically when you press Submit.")
         st.markdown("**Porter Details (if applicable)**")
         c3, c4 = st.columns(2)
         with c3:
-            porter_no     = st.text_input("Porter No", placeholder="Leave blank if not applicable")
+            porter_no = st.text_input("Porter No", placeholder="Leave blank if not applicable", key=f"pu_porter_no_{arr_id}")
         with c4:
-            porter_pickup = st.time_input("Porter Pickup Time", key="pu_porter")
-
-        # Medicine received image
-        st.markdown("**📸 Image of Medicine Received**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="pu_radio", label_visibility="collapsed")
+            porter_pickup = st.time_input("Porter Pickup Time", value=now_ist().time().replace(second=0, microsecond=0),
+                                          key=f"pu_porter_{arr_id}")
+        st.markdown("**📸 Image of Medicine / Bill Received ***")
+        upload_opt = st.radio("Image Option", ["Upload", "Camera"], horizontal=True, key=f"pu_radio_{arr_id}",
+                              label_visibility="collapsed")
         if upload_opt == "Upload":
-            medicine_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="pu_upload")
+            medicine_img = st.file_uploader("Select Image", type=["jpg", "jpeg", "png"], key=f"pu_upload_{arr_id}")
         else:
-            medicine_img = st.camera_input("Take Photo", key="pu_cam")
+            medicine_img = st.camera_input("Take Photo", key=f"pu_cam_{arr_id}")
+        remarks = st.text_input("Remarks", key=f"pu_remarks_{arr_id}")
+        submitted = st.form_submit_button("Submit ✅ (medicines handed over)", type="primary", width='stretch')
 
-        remarks = st.text_input("Remarks")
-
-        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
-            if not medicine_img:
-                st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
-            else:
-                arr_id = None
-                arr_no = None
-                if arr_select != "—":
-                    selected_arr = arr_options[arr_select]
-                    arr_id = selected_arr["id"]
-                    arr_no = selected_arr.get("arrangement_no")
-
-                med_img_name = upload_image(medicine_img, "pickup") if medicine_img else ""
-
-                try:
-                    supabase.table("daily_tasks").insert({
-                        "date": date_str(),
-                        "time": time_str(),
-                        "person": st.session_state.name,
-                        "team": "Delivery",
-                        "task_type": "Pickup",
-                        "details": {
-                            "distributor": distributor,
-                            "arrangement_no": str(arr_no) if arr_no else "",
-                            "delivery_by": delivery_by,
-                            "pickup_by": st.session_state.name,
-                            "no_sku_received": str(no_sku_received),
-                            "time_reached": str(time_reached),
-                            "time_handover": str(time_handover),
-                            "porter_no": porter_no,
-                            "porter_pickup_time": str(porter_pickup) if porter_no else "",
-                        "medicine_image": med_img_name,
-                            "remarks": remarks
-                        },
-                        "start_time": str(time_reached),
-                        "end_time": str(time_handover),
-                    }).execute()
-
-                    if arr_id:
-                        supabase.table("arrangements").update({
-                            "status": "Picked Up - In Transit",
-                            "pickup_by": st.session_state.name,
-                            "pickup_time": str(time_reached),
-                            "handover_type": delivery_by,
-                            "porter_no": porter_no,
-                            "no_sku_received": str(no_sku_received),
-                        }).eq("id", arr_id).execute()
-
-                    st.success("✅ Pickup entry submitted!")
-                    st.balloons()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+    if not submitted:
+        return
+    if not medicine_img:
+        st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
+        return
+    handover = now_ist()
+    med_img_name = upload_image(medicine_img, "pickup")
+    if not med_img_name:
+        return                                   # upload_image already showed the error
+    s_dt = parse_task_time(open_task.get("start_time", ""))
+    e_dt = parse_task_time(handover.strftime("%I:%M:%S %p"))
+    dur = str(int(((e_dt - s_dt).total_seconds() % 86400) // 60)) if s_dt and e_dt else ""
+    try:
+        supabase.table("daily_tasks").update({
+            "status": "Completed", "time": time_str(),
+            "end_time": handover.strftime("%I:%M:%S %p"), "duration_mins": dur,
+            "details": {
+                "distributor": distributor, "arrangement_no": str(arr_no), "arrangement_id": arr_id,
+                "delivery_by": delivery_by, "pickup_by": st.session_state.name,
+                "no_sku_received": str(no_sku_received), "no_sku_ordered": str(arr.get("no_medicines", "")),
+                "time_reached": reached, "time_handover": handover.strftime("%I:%M %p"),
+                "porter_no": porter_no, "porter_pickup_time": porter_pickup.strftime("%I:%M %p") if porter_no else "",
+                "medicine_image": med_img_name, "remarks": remarks},
+        }).eq("id", open_task["id"]).execute()
+        supabase.table("arrangements").update({
+            "status": "Picked Up - In Transit", "pickup_by": st.session_state.name, "pickup_time": reached,
+            "handover_type": delivery_by, "porter_no": porter_no, "no_sku_received": str(no_sku_received),
+        }).eq("id", arr_id).execute()
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return
+    st.session_state["pu_ver"] = ver + 1
+    st.session_state["pu_msg"] = (f"✅ Pickup of #{arr_no} submitted — reached {reached}, "
+                                  f"handed over {handover.strftime('%I:%M %p')}")
+    st.balloons()
+    st.rerun()
 
 # ── DELIVERY FORM ─────────────────────────────────────────────────────────────
 def form_delivery():
@@ -2330,68 +2354,66 @@ def form_bill_upload_arrangement():
 
 def show_pickup_images():
     st.subheader("📸 Pickup Images from Naresh/Sandeep")
-    try:
-        from datetime import timedelta
-        two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-        resp = supabase.table("daily_tasks").select("*")\
-            .eq("task_type", "Pickup")\
-            .eq("team", "Delivery")\
-            .gte("date", two_days_ago)\
-            .execute()
-        pickups = resp.data if resp.data else []
-    except Exception as e:
-        st.error(f"Error: {e}")
-        pickups = []
-
-    if not pickups:
-        st.info("No pickup images found for last 2 days!")
-        return
-
-    c1,c2,c3 = st.columns(3)
+    st.caption("What was ordered (order image) next to what the delivery boy picked up (his photo of medicines / bill).")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        filter_date = st.date_input("Filter by Date", value=today_ist(), key="pi_date")
+        filter_date = st.date_input("Pickup date", value=today_ist(), key="pi_date")
     with c2:
         filter_dist = st.text_input("Search Distributor", placeholder="Type to search...", key="pi_dist")
     with c3:
         filter_arr = st.text_input("Arrangement No", placeholder="e.g. ARR-001", key="pi_arr")
-
-    filter_date_str = filter_date.strftime("%Y-%m-%d")
-    filtered = [p for p in pickups if p.get("date","") == filter_date_str]
+    try:
+        pickups = supabase.table("daily_tasks").select("*").eq("task_type", "Pickup").eq("team", "Delivery")\
+            .eq("date", filter_date.strftime("%Y-%m-%d")).order("id", desc=True).execute().data or []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return
+    pickups = [p for p in pickups if p.get("status") != "In Progress"]
     if filter_dist:
-        filtered = [p for p in filtered if filter_dist.lower() in p.get("details",{}).get("distributor","").lower()]
+        pickups = [p for p in pickups if filter_dist.lower() in (p.get("details") or {}).get("distributor", "").lower()]
     if filter_arr:
-        filtered = [p for p in filtered if filter_arr.lower() in p.get("details",{}).get("arrangement_no","").lower()]
-
-    st.markdown(f"**{len(filtered)} pickup entries found**")
-
-    for p in filtered:
-        d = p.get("details",{})
-        img_name = d.get("medicine_image","")
-        with st.expander(f"📦 {d.get('distributor','')} | Arr: {d.get('arrangement_no','')} | By: {p.get('person','')} | {p.get('start_time','')}"):
-            c1,c2 = st.columns([2,1])
+        pickups = [p for p in pickups if filter_arr.lower() in (p.get("details") or {}).get("arrangement_no", "").lower()]
+    if not pickups:
+        st.info("No pickups for this date.")
+        return
+    arr_nos = [(p.get("details") or {}).get("arrangement_no") for p in pickups]
+    arr_nos = [a for a in arr_nos if a]
+    try:
+        arrs = supabase.table("arrangements").select("*").in_("arrangement_no", arr_nos).execute().data or [] if arr_nos else []
+    except Exception:
+        arrs = []
+    by_no = {a.get("arrangement_no"): a for a in arrs}
+    st.markdown(f"**{len(pickups)} pickup(s)**")
+    for i, p in enumerate(pickups):
+        d = p.get("details") or {}
+        arr = by_no.get(d.get("arrangement_no")) or {}
+        got, want = d.get("no_sku_received", ""), d.get("no_sku_ordered") or arr.get("no_medicines", "")
+        short = str(got).strip() and str(want).strip() and _to_float(got) < _to_float(want)
+        when = d.get("time_reached") or p.get("start_time", "")
+        if d.get("time_handover"):
+            when += f" → {d['time_handover']}"
+        title = (f"{'⚠️' if short else '📦'} #{d.get('arrangement_no') or '— no arrangement —'} | {d.get('distributor','')} | "
+                 f"{p.get('person','')} | {when} | SKUs {got}/{want or '?'}")
+        with st.expander(title, expanded=(i < 3)):
+            if short:
+                st.warning(f"⚠️ Short pickup — {got} of {want} medicines received. {d.get('remarks','')}")
+            c1, c2 = st.columns(2)
             with c1:
-                if img_name:
-                    try:
-                        img_data = supabase.storage.from_("Images").download(img_name)
-                        from PIL import Image
-                        import io as io_module
-                        img = Image.open(io_module.BytesIO(img_data))
-                        st.image(img, width='stretch')
-                        st.download_button("🔍 Download",
-                            img_data,
-                            file_name=f"pickup_{d.get('arrangement_no','')}.jpg",
-                            mime="image/jpeg",
-                            key=f"dl_pickup_{p['id']}")
-                    except:
-                        st.warning("Image not available")
-                else:
-                    st.warning("⚠️ No image uploaded!")
+                st.markdown("**📋 Ordered (Purchase Team)**")
+                if not show_image(arr.get("order_image", ""), key=f"pi_ord_{p['id']}"):
+                    st.caption("No order image")
             with c2:
-                st.markdown(f"**Distributor:** {d.get('distributor','')}")
-                st.markdown(f"**Arrangement:** {d.get('arrangement_no','')}")
-                st.markdown(f"**Picked by:** {p.get('person','')}")
-                st.markdown(f"**Time:** {p.get('start_time','')}")
-                st.markdown(f"**SKUs:** {d.get('no_sku_received','')}")
+                st.markdown(f"**🚚 Picked up ({p.get('person','')})**")
+                if not show_image(d.get("medicine_image", ""), key=f"pi_pick_{p['id']}"):
+                    st.warning("⚠️ No pickup image uploaded!")
+            if arr.get("id"):
+                meds = load_arrangement_medicines(arr["id"])
+                if meds:
+                    medicine_list_card([{"name": m.get("medicine_name", ""), "qty": m.get("quantity", "")} for m in meds],
+                                       "💊 Medicines ordered")
+            st.caption(f"Area: {arr.get('area','')} · Bill/Order ID: {arr.get('bill_order_id') or '—'} · "
+                       f"Delivery by: {d.get('delivery_by','')} · Porter: {d.get('porter_no') or '—'} · "
+                       f"Remarks: {d.get('remarks') or '—'}")
 
 def form_book_porter():
     st.subheader("🚛 Book Porter")
@@ -3146,7 +3168,7 @@ def show_user_page():
                             st.divider()
                             try:
                                 pickup_resp = supabase.table("daily_tasks").select("*").eq("task_type","Pickup").order("id", desc=True).limit(1000).execute()
-                                pickup_data = next((p for p in (pickup_resp.data or []) if p.get("details",{}).get("arrangement_no","") == arr.get("arrangement_no","")), None)
+                                pickup_data = next((p for p in (pickup_resp.data or []) if p.get("status") != "In Progress" and p.get("details",{}).get("arrangement_no","") == arr.get("arrangement_no","")), None)
                             except:
                                 pickup_data = None
                             try:
@@ -3678,7 +3700,8 @@ def show_user_page():
                 else:
                     pickup_icon = pickup_type
 
-                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | {pickup_icon} | **{status}**")
+                photo = " · 📸 pickup photo → *Pickup Images*" if arr.get("pickup_by") else ""
+                st.markdown(f"{urgency_color} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | {arr.get('area','')} | {pickup_icon} | **{status}**{photo}")
 
     # ── TEAM FORMS ───────────────────────────────────────────────────────────
     if team == "Purchase":
