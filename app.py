@@ -4772,6 +4772,44 @@ def refresh_line_status(line_id):
     supabase.table("customer_order_lines").update(upd).eq("id", line_id).execute()
 
 # ── PURCHASE: IMPORT ──────────────────────────────────────────────────────────
+CUSTOMER_ORDER_SAMPLE = pd.DataFrame([
+    {"Scheduled Date": "2026-10-01", "Order #": "ORD10231", "Customer Name": "Rahul Sharma", "Customer Phone": "9876543210",
+     "Item Name": "Dolo 650 Tablet", "Pack Size": "15 Tablet", "Qty": 2, "Rx": "No", "Unit Price": 30.5, "Line Total": 61},
+    {"Scheduled Date": "2026-10-01", "Order #": "ORD10231", "Customer Name": "Rahul Sharma", "Customer Phone": "9876543210",
+     "Item Name": "Telma 40 Tablet", "Pack Size": "30 Tablet", "Qty": 1, "Rx": "Yes", "Unit Price": 245, "Line Total": 245},
+    {"Scheduled Date": "2026-10-02", "Order #": "ORD10232", "Customer Name": "Priya Verma", "Customer Phone": "9811122233",
+     "Item Name": "Volini Gel", "Pack Size": "30 gm", "Qty": 1, "Rx": "No", "Unit Price": 150, "Line Total": 150},
+])
+
+def customer_order_template():
+    notes = pd.DataFrame({"How to fill": [
+        "One row per medicine. An order with 3 medicines = 3 rows with the same Order #.",
+        "REQUIRED columns: Order #, Item Name. All other columns are optional but recommended.",
+        "Scheduled Date: delivery date as YYYY-MM-DD (e.g. 2026-10-01).",
+        "Qty: number of strips / packs the customer ordered (blank = 1).",
+        "Pack Size: e.g. '15 Tablet', '30 gm', '100 ml' — keep it the same as the backend.",
+        "Header names can also be: Order No / Order ID, Medicine Name / Item, Pack, Quantity, Customer, Phone / Mobile, Date.",
+        "Upload one area/store per file. Re-uploading the same file is safe — only new items are added.",
+        "The 3 example rows are samples — delete them before uploading.",
+    ]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        CUSTOMER_ORDER_SAMPLE.to_excel(w, index=False, sheet_name="Customer Orders")
+        notes.to_excel(w, index=False, sheet_name="How to fill")
+        ws = w.sheets["Customer Orders"]
+        for col, width in zip("ABCDEFGHIJ", [15, 12, 18, 15, 24, 12, 6, 6, 11, 11]):
+            ws.column_dimensions[col].width = width
+        w.sheets["How to fill"].column_dimensions["A"].width = 110
+    return buf.getvalue()
+
+def show_customer_order_format(expanded=False):
+    with st.expander("📄 Sample format — how the file should look", expanded=expanded):
+        st.caption("One row per medicine · **Order #** and **Item Name** are required · date as YYYY-MM-DD · "
+                   "other columns optional. Header spelling can vary a little (e.g. Order No, Medicine Name, Quantity).")
+        st.dataframe(CUSTOMER_ORDER_SAMPLE, hide_index=True, width='stretch')
+        st.download_button("⬇️ Download sample format (Excel)", customer_order_template(), "customer-orders-format.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="imp_fmt")
+
 def form_import_orders():
     st.subheader("📥 Import Customer Orders")
     st.caption("Upload the order-schedule file from backend — one area at a time. "
@@ -4780,14 +4818,17 @@ def form_import_orders():
     up = st.file_uploader("Backend file (.xlsx or .csv)", type=["xlsx", "xls", "csv"],
                           key=f"imp_file_{st.session_state.get('imp_ver', 0)}")
     if not up:
+        show_customer_order_format(expanded=True)
         return
     try:
         lines, err = parse_backend_file(up)
     except Exception as e:
         st.error(f"Could not read file: {e}")
+        show_customer_order_format(expanded=True)
         return
     if err:
         st.error(err)
+        show_customer_order_format(expanded=True)
         return
     if not lines:
         st.warning("No item lines found in this file.")
