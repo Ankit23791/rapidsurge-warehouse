@@ -843,9 +843,11 @@ def form_add_invoice():
     except Exception as e:
         st.error(f"Could not load — run **arrangement_invoice_setup.sql** in Supabase first. ({e})")
         return
+    with st.expander("⚠️ Invoice has fewer medicines than ordered? Send them for re-order"):
+        invoice_shortage_picker("ai_bis")
     if show.startswith("⏳"):
         arrs = [a for a in arrs if not a.get("invoice_no")]
-    msg = st.session_state.pop("ai_msg", None)
+    msg = st.session_state.pop("ai_msg", None) or st.session_state.pop("bc_msg", None)
     if msg:
         st.success(msg)
     if not arrs:
@@ -1407,7 +1409,8 @@ def form_pickup():
             no_sku_received = st.number_input("No of SKUs Actually Received *", min_value=0, step=1,
                                               value=int(_to_float(arr.get("no_medicines"), 0)),
                                               key=f"pu_sku_{arr_id}")
-            st.caption("⏱️ Handover received time is saved automatically when you press Submit.")
+            st.caption("⏱️ Handover received time is saved automatically when you press Submit. "
+                       "Got fewer medicines? Write which ones in Remarks — the purchase team will re-order them.")
         st.markdown("**Porter Details (if applicable)**")
         c3, c4 = st.columns(2)
         with c3:
@@ -3965,6 +3968,12 @@ def show_user_page():
                 st.session_state.purchase_active_form = "arrangement"
                 st.rerun()
             n_inv = count_missing_invoices()
+            b_ver, b_sp, b_re = bounce_counts()
+            n_b = b_ver + b_sp + b_re
+            if st.button("🔁 Bounced / Re-order" + (f" ({n_b})" if n_b else ""), width='stretch', key="p_bounce_c",
+                type="primary" if st.session_state.purchase_active_form=="bounce_c" else "secondary"):
+                st.session_state.purchase_active_form = "bounce_c"
+                st.rerun()
             if st.button(f"🧾 Add Invoice No" + (f" ({n_inv})" if n_inv else ""), width='stretch', key="p_invoice",
                 type="primary" if st.session_state.purchase_active_form=="invoice" else "secondary"):
                 st.session_state.purchase_active_form = "invoice"
@@ -4061,6 +4070,7 @@ def show_user_page():
                 "return":      form_purchase_return,
                 "arrangement": form_arrangement,
                 "invoice":     form_add_invoice,
+                "bounce_c":    form_bounce_center,
                 "pharma":      form_pharmarack,
                 "bounce":      form_bounce_medicine,
                 "porter":      form_book_porter,
@@ -4093,9 +4103,16 @@ def show_user_page():
                 if st.button("📦 Arrangement", key="mp_arrangement", type="primary", use_container_width=True):
                     st.session_state.purchase_active_form = "arrangement"
                     st.rerun()
-            if st.button("🧾 Add Invoice No" + (f" ({n_inv})" if n_inv else ""), key="mp_invoice", use_container_width=True):
-                st.session_state.purchase_active_form = "invoice"
-                st.rerun()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🧾 Add Invoice No" + (f" ({n_inv})" if n_inv else ""), key="mp_invoice", use_container_width=True):
+                    st.session_state.purchase_active_form = "invoice"
+                    st.rerun()
+            with c2:
+                if st.button("🔁 Bounced" + (f" ({n_b})" if n_b else ""), key="mp_bounce_c", use_container_width=True,
+                             type="primary" if n_b else "secondary"):
+                    st.session_state.purchase_active_form = "bounce_c"
+                    st.rerun()
             c1,c2 = st.columns(2)
             with c1:
                 if st.button("↩️ Return", key="mp_return", use_container_width=True):
@@ -5004,9 +5021,11 @@ def refresh_line_status(line_id):
     if not als:
         return
     qty = _to_float(line.get("qty"), 0)
-    ordered = sum(_to_float(a.get("qty_ordered"), 0) for a in als)
+    # confirmed bounces (qty_bounced) are not coming -> not counted as ordered, so the item re-opens for re-order
+    eff = lambda a: max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0))
+    ordered = sum(eff(a) for a in als)
     received = sum(_to_float(a.get("qty_received"), 0) for a in als if a.get("status") != "Ordered")
-    waiting = any(a.get("status") == "Ordered" for a in als)
+    waiting = any(a.get("status") == "Ordered" and eff(a) > 0 for a in als)
     upd = {"qty_arranged": ordered, "qty_received": received}
     if ordered < qty and not line.get("remainder_note"):
         upd["status"] = "Partly Arranged"
@@ -5275,7 +5294,16 @@ def arrangement_line_picker():
             st.info("No pending customer items for this date.")
             return link_area, []
         now = now_ist()
-        open_lines = sorted(open_lines, key=lambda l: (l.get("scheduled_date") or "9999",
+        bounced = {}
+        try:
+            for b in supabase.table("bounce_items").select("line_id,distributor,qty_missing").eq("status", "Re-order")\
+                    .in_("line_id", [l["id"] for l in open_lines]).execute().data or []:
+                bounced.setdefault(b["line_id"], []).append(b)
+        except Exception:
+            pass
+        if bounced:
+            st.warning(f"🔁 {len(bounced)} item(s) bounced by a distributor — shown at the top. Order them from another distributor.")
+        open_lines = sorted(open_lines, key=lambda l: (l["id"] not in bounced, l.get("scheduled_date") or "9999",
                                                        (due_info(l, now) or (None, 10**9))[1],
                                                        str(l.get("imported_at") or "")))
         ldf = pd.DataFrame([{
@@ -5284,6 +5312,7 @@ def arrangement_line_picker():
             "⏰": (due_info(l, now) or (age_flag(age_mins(l.get("imported_at"), now)),))[0],
             "Deliver by": (f"{_sched_label(l.get('scheduled_date'))} {l.get('delivery_time')}"
                            if l.get("delivery_time") else _sched_label(l.get("scheduled_date"))),
+            "🔁": ("bounced by " + ", ".join(sorted({b["distributor"] for b in bounced[l["id"]]}))) if l["id"] in bounced else "",
             "Order #": l.get("order_no", ""),
             "Customer": l.get("customer_name", ""),
             "Item": l.get("item_name", ""),
@@ -5293,7 +5322,7 @@ def arrangement_line_picker():
         } for l in open_lines])
         ed = st.data_editor(
             ldf, key=f"arr_link_editor_{ver}", hide_index=True, width='stretch',
-            disabled=["⏰", "Deliver by", "Order #", "Customer", "Item", "Pack", "Needed"],
+            disabled=["⏰", "Deliver by", "🔁", "Order #", "Customer", "Item", "Pack", "Needed"],
             column_config={
                 "id": None,
                 "Order?": st.column_config.CheckboxColumn("Order?", help="Tick items you are ordering from this distributor"),
@@ -5318,6 +5347,12 @@ def save_arrangement_links(arr_id, arr_no, distributor, area, picked):
             "ordered_by": st.session_state.name, "ordered_at": now_s
         }).execute()
         refresh_line_status(int(p["id"]))
+        try:
+            supabase.table("bounce_items").update({"status": "Re-ordered", "reordered_at": now_s,
+                                                   "reordered_arrangement_no": arr_no})\
+                .eq("line_id", int(p["id"])).eq("status", "Re-order").execute()
+        except Exception:
+            pass
     st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
 
 # ── STOCK: CONFIRM CUSTOMER ITEMS (inside Bill Cross Check) ───────────────────
@@ -5328,19 +5363,25 @@ def customer_items_editor(arr):
             .eq("arrangement_no", str(arr.get("arrangement_no",""))).eq("status", "Ordered").execute().data or []
     except Exception:
         return None
+    als = [a for a in als if max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0)) > 0]
     if not als:
         return None
     st.markdown(f"🧾 **Customer order items in this arrangement ({len(als)})** — change *Received* only if less arrived")
+    st.caption("Short, wrong, damaged or near-expiry: enter only the GOOD qty in *Received* and pick the Issue — "
+               "it goes to the purchase team to verify and re-order.")
     df = pd.DataFrame([{
         "id": a["id"], "line_id": a.get("line_id"),
         "Order #": a.get("order_no", ""), "Item": a.get("item_name", ""),
-        "Ordered": _to_float(a.get("qty_ordered"), 0),
-        "Received": _to_float(a.get("qty_ordered"), 0),
+        "Ordered": max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0)),
+        "Received": max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0)),
+        "Issue": "",
     } for a in als])
     return st.data_editor(df, key=f"bc_cust_{arr.get('id','')}", hide_index=True, width='stretch',
                           disabled=["Order #", "Item", "Ordered"],
                           column_config={"id": None, "line_id": None,
-                                         "Received": st.column_config.NumberColumn("Received", min_value=0, step=1)})
+                                         "Received": st.column_config.NumberColumn("Received", min_value=0, step=1),
+                                         "Issue": st.column_config.SelectboxColumn("Issue (if short)",
+                                                                                   options=[""] + BOUNCE_ISSUES)})
 
 def save_customer_receipts(ed):
     """Save received qty for each customer item: full = Received, less = Short"""
@@ -5349,6 +5390,19 @@ def save_customer_receipts(ed):
     for _, r in ed.iterrows():
         rec = _to_float(r["Received"], 0)
         status = "Received" if rec >= _to_float(r["Ordered"], 0) else "Short"
+        if status == "Short":
+            try:
+                al = supabase.table("arrangement_lines").select("*").eq("id", int(r["id"])).execute().data or [{}]
+                al = al[0]
+                _bounce_insert([{
+                    "arrangement_id": al.get("arrangement_id"), "arrangement_no": al.get("arrangement_no"),
+                    "distributor": al.get("distributor"), "area": al.get("area"), "stage": "Warehouse",
+                    "arr_line_id": int(r["id"]), "line_id": al.get("line_id"), "medicine_name": r["Item"],
+                    "order_no": r["Order #"], "qty_ordered": _to_float(r["Ordered"], 0),
+                    "qty_missing": _to_float(r["Ordered"], 0) - rec, "issue": r.get("Issue") or "Short / not given",
+                    "status": "To verify", "reported_by": st.session_state.name, "reported_at": now_s}])
+            except Exception:
+                pass                                   # bounce table not created yet -> behaves as before
         supabase.table("arrangement_lines").update({
             "qty_received": rec, "status": status,
             "received_by": st.session_state.name, "received_at": now_s
@@ -5360,6 +5414,319 @@ def save_customer_receipts(ed):
         else:
             n_short += 1
     return n_ok, n_short
+
+# ── BOUNCED / SHORT MEDICINES → PURCHASE VERIFIES → RE-ORDER ──────────────────
+# Stages: "Invoice" (purchase, direct) · "Pickup" (delivery boy got less → purchase checks photo, direct)
+#         "Warehouse" (stock reports at Bill Cross Check → purchase verifies)
+# Confirmed bounce on a customer item -> arrangement_lines.qty_bounced += qty -> the customer item re-opens
+# with only the missing qty and shows up again (🔁) in the Arrangement Order item list.
+BOUNCE_ISSUES = ["Short / not given", "Out of stock", "Not in invoice", "Wrong medicine", "Damaged",
+                 "Near expiry", "Rate issue", "Other"]
+BOUNCE_DISMISS = ["Received later", "Customer cancelled", "Found in store", "Not needed", "Stock team mistake", "Other"]
+BOUNCE_SQL = "run **bounce_setup.sql** in Supabase"
+
+def _eff_ordered(a):
+    """qty still expected from this arrangement line (ordered minus confirmed bounces)"""
+    return max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0))
+
+def _bounce_insert(rows):
+    if rows:
+        return supabase.table("bounce_items").insert(rows).execute().data or []
+    return []
+
+def apply_bounce(b):
+    """Purchase confirmed: take the missing qty off the arrangement line and re-open the customer item"""
+    if not b.get("arr_line_id"):
+        return
+    al = supabase.table("arrangement_lines").select("*").eq("id", b["arr_line_id"]).execute().data
+    if not al:
+        return
+    al = al[0]
+    newb = min(_to_float(al.get("qty_ordered"), 0), _to_float(al.get("qty_bounced"), 0) + _to_float(b.get("qty_missing"), 0))
+    supabase.table("arrangement_lines").update({"qty_bounced": newb}).eq("id", al["id"]).execute()
+    if al.get("line_id"):
+        refresh_line_status(int(al["line_id"]))
+
+def _arr_lines(arr_no):
+    return supabase.table("arrangement_lines").select("*").eq("arrangement_no", str(arr_no)).execute().data or []
+
+def bounce_editor(arr, stage, kp, direct=True):
+    """Medicines of one arrangement with a 'Missing qty' column. direct=True (purchase) -> goes for re-order now.
+    Returns number of items saved (0 if nothing saved)."""
+    try:
+        als = [a for a in _arr_lines(arr.get("arrangement_no")) if _eff_ordered(a) > 0]
+    except Exception as e:
+        st.error(f"Could not load medicines ({e})")
+        return 0
+    ver = st.session_state.get(f"{kp}_ver", 0)
+    ed = None
+    if als:
+        df = pd.DataFrame([{"id": a["id"], "Medicine": a.get("item_name", ""), "Customer order": a.get("order_no", ""),
+                            "Ordered": _eff_ordered(a), "Missing qty": 0.0, "Issue": ""} for a in als])
+        ed = st.data_editor(df, key=f"{kp}_ed_{ver}", hide_index=True, width='stretch',
+                            disabled=["Medicine", "Customer order", "Ordered"],
+                            column_config={"id": None,
+                                           "Missing qty": st.column_config.NumberColumn("Missing qty ✏️", min_value=0, step=1),
+                                           "Issue": st.column_config.SelectboxColumn("Issue", options=[""] + BOUNCE_ISSUES)})
+    else:
+        st.caption("No customer items are linked to this arrangement — type the missing medicines below.")
+    other = st.text_area("Other missing medicines (not in the list) — one per line: name - qty", key=f"{kp}_other_{ver}",
+                         placeholder="Dolo 650 Tablet - 2", height=70)
+    note = st.text_input("Note (optional)", key=f"{kp}_note_{ver}")
+    picked = [] if ed is None else [r for r in ed.to_dict("records") if _to_float(r["Missing qty"], 0) > 0]
+    extra = []
+    for ln in other.splitlines():
+        if ln.strip():
+            name, _, q = ln.rpartition(" - ") if " - " in ln else (ln, "", "1")
+            extra.append((name.strip(), _to_float(q, 1) or 1))
+    n = len(picked) + len(extra)
+    label = "🔁 Send for re-order" if direct else "📤 Report to purchase team"
+    if not st.button(f"{label} ({n})", type="primary", key=f"{kp}_go_{ver}", disabled=n == 0, width='stretch'):
+        return 0
+    by_id = {a["id"]: a for a in als}
+    bad = [r["Medicine"] for r in picked if _to_float(r["Missing qty"], 0) > r["Ordered"]]
+    if bad:
+        st.error("Missing qty is more than ordered: " + ", ".join(bad))
+        return 0
+    now_s = now_iso()
+    base = {"arrangement_id": arr.get("id"), "arrangement_no": str(arr.get("arrangement_no", "")),
+            "distributor": arr.get("distributor", ""), "area": arr.get("area", ""), "stage": stage,
+            "reported_by": st.session_state.name, "reported_at": now_s, "note": note or None,
+            "status": "Re-order" if direct else "To verify"}
+    if direct:
+        base.update({"verified_by": st.session_state.name, "verified_at": now_s})
+    rows = []
+    for r in picked:
+        a = by_id[r["id"]]
+        rows.append({**base, "arr_line_id": a["id"], "line_id": a.get("line_id"), "medicine_name": a.get("item_name", ""),
+                     "order_no": a.get("order_no", ""), "qty_ordered": r["Ordered"],
+                     "qty_missing": _to_float(r["Missing qty"], 0), "issue": r["Issue"] or "Short / not given"})
+    for name, q in extra:
+        rows.append({**base, "arr_line_id": None, "line_id": None, "medicine_name": name, "order_no": "",
+                     "qty_ordered": None, "qty_missing": q, "issue": "Short / not given"})
+    try:
+        saved = _bounce_insert(rows)
+        if direct:
+            for b in saved:
+                apply_bounce(b)
+        log_simple_task("Bounce Reported", {"arrangement_no": base["arrangement_no"], "stage": stage,
+                                            "items": str(len(rows)), "direct": "Yes" if direct else "No"})
+    except Exception as e:
+        st.error(f"Could not save — {BOUNCE_SQL}. ({e})")
+        return 0
+    st.session_state[f"{kp}_ver"] = ver + 1
+    return len(rows)
+
+def _short_pickups(days=3):
+    """Completed pickups where the delivery boy received fewer SKUs than ordered and purchase hasn't checked yet"""
+    since = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = supabase.table("daily_tasks").select("*").eq("task_type", "Pickup").gte("date", since)\
+        .order("id", desc=True).execute().data or []
+    out = []
+    for p in rows:
+        d = p.get("details") or {}
+        if p.get("status") == "In Progress" or d.get("bounce_checked") or not d.get("arrangement_no"):
+            continue
+        got, want = d.get("no_sku_received"), d.get("no_sku_ordered")
+        if str(got).strip() and str(want).strip() and _to_float(got) < _to_float(want):
+            out.append(p)
+    return out
+
+def bounce_counts():
+    """(to verify, short pickups to check, waiting re-order) — for badges"""
+    try:
+        b = supabase.table("bounce_items").select("id,status,line_id").in_("status", ["To verify", "Re-order"]).execute().data or []
+    except Exception:
+        return 0, 0, 0
+    try:
+        sp = len(_short_pickups())
+    except Exception:
+        sp = 0
+    return sum(1 for x in b if x["status"] == "To verify"), sp, sum(1 for x in b if x["status"] == "Re-order")
+
+def _mark_pickup_checked(p, n):
+    d = dict(p.get("details") or {})
+    d.update({"bounce_checked": True, "bounce_checked_by": st.session_state.name, "bounce_items": str(n)})
+    supabase.table("daily_tasks").update({"details": d}).eq("id", p["id"]).execute()
+
+def form_bounce_center():
+    st.subheader("🔁 Bounced / Short Medicines")
+    st.caption("Everything that did not come from the distributor. Confirm it here and the missing qty goes back to "
+               "**📦 Arrangement Order** (marked 🔁) to order from another distributor.")
+    try:
+        supabase.table("bounce_items").select("id").limit(1).execute()
+    except Exception as e:
+        st.error(f"Bounce table not found — {BOUNCE_SQL}. ({e})")
+        return
+    msg = st.session_state.pop("bc_msg", None)
+    if msg:
+        st.success(msg)
+    n_ver, n_sp, n_re = bounce_counts()
+    tabs = st.tabs([f"🏭 Warehouse reports ({n_ver})", f"🚚 Short pickups ({n_sp})", "🧾 Invoice shortage",
+                    f"🔁 Waiting re-order ({n_re})", "📊 Report"])
+
+    # 1) stock team reports -> verify
+    with tabs[0]:
+        rows = supabase.table("bounce_items").select("*").eq("status", "To verify").order("id").execute().data or []
+        if not rows:
+            st.success("Nothing to verify.")
+        else:
+            st.caption("Reported by the stock team at Bill Cross Check. Check the bill / stock, then confirm or dismiss.")
+            df = pd.DataFrame([{"id": b["id"], "Action": "—", "Dismiss reason": "", "Arrangement": b.get("arrangement_no"),
+                                "Distributor": b.get("distributor"), "Medicine": b.get("medicine_name"),
+                                "Customer order": b.get("order_no") or "", "Ordered": _qty_txt(b.get("qty_ordered")),
+                                "Missing": _qty_txt(b.get("qty_missing")), "Issue": b.get("issue"),
+                                "Reported by": b.get("reported_by"), "Note": b.get("note") or "",
+                                "When": (to_ist(b.get("reported_at")) or now_ist()).strftime("%d %b %I:%M %p")} for b in rows])
+            ver = st.session_state.get("bv_ver", 0)
+            ed = st.data_editor(df, key=f"bv_ed_{ver}", hide_index=True, width='stretch',
+                                disabled=[c for c in df.columns if c not in ("Action", "Dismiss reason")],
+                                column_config={"id": None,
+                                               "Action": st.column_config.SelectboxColumn(
+                                                   "Action", options=["—", "✅ Confirm → re-order", "❌ Dismiss"], required=True),
+                                               "Dismiss reason": st.column_config.SelectboxColumn("Dismiss reason", options=[""] + BOUNCE_DISMISS)})
+            chosen = [r for r in ed.to_dict("records") if r["Action"] != "—"]
+            if st.button(f"💾 Save ({len(chosen)})", type="primary", key="bv_save", disabled=not chosen, width='stretch'):
+                bad = [r["Medicine"] for r in chosen if r["Action"].startswith("❌") and not r["Dismiss reason"]]
+                if bad:
+                    st.error("Pick a dismiss reason for: " + ", ".join(bad))
+                else:
+                    by_id = {b["id"]: b for b in rows}
+                    now_s = now_iso()
+                    nc = nd = 0
+                    for r in chosen:
+                        b = by_id[r["id"]]
+                        if r["Action"].startswith("✅"):
+                            supabase.table("bounce_items").update({"status": "Re-order", "verified_by": st.session_state.name,
+                                                                   "verified_at": now_s}).eq("id", b["id"]).execute()
+                            apply_bounce(b)
+                            nc += 1
+                        else:
+                            supabase.table("bounce_items").update({"status": "Dismissed", "verified_by": st.session_state.name,
+                                                                   "verified_at": now_s, "dismiss_reason": r["Dismiss reason"]})\
+                                .eq("id", b["id"]).execute()
+                            nd += 1
+                    st.session_state["bv_ver"] = ver + 1
+                    st.session_state["bc_msg"] = f"✅ {nc} sent for re-order · {nd} dismissed"
+                    st.rerun()
+
+    # 2) short pickups -> check photo, tick missing
+    with tabs[1]:
+        try:
+            sps = _short_pickups()
+        except Exception as e:
+            st.error(f"Error: {e}")
+            sps = []
+        if not sps:
+            st.success("No short pickups to check.")
+        arr_by_no = {}
+        if sps:
+            nos = list({(p.get("details") or {}).get("arrangement_no") for p in sps})
+            arr_by_no = {a.get("arrangement_no"): a for a in
+                         (supabase.table("arrangements").select("*").in_("arrangement_no", nos).execute().data or [])}
+        for p in sps:
+            d = p.get("details") or {}
+            arr = arr_by_no.get(d.get("arrangement_no")) or {"arrangement_no": d.get("arrangement_no"),
+                                                           "distributor": d.get("distributor")}
+            with st.expander(f"⚠️ #{d.get('arrangement_no')} | {d.get('distributor','')} | {p.get('person','')} | "
+                             f"received {d.get('no_sku_received')} of {d.get('no_sku_ordered')} medicines", expanded=True):
+                if d.get("remarks"):
+                    st.info(f"💬 Delivery boy's remark: {d['remarks']}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**📋 Ordered**")
+                    if not show_image(arr.get("order_image", ""), key=f"bsp_o_{p['id']}"):
+                        st.caption("No order image")
+                with c2:
+                    st.markdown(f"**🚚 Picked up by {p.get('person','')}**")
+                    if not show_image(d.get("medicine_image", ""), key=f"bsp_p_{p['id']}"):
+                        st.caption("No pickup image")
+                st.markdown("**Enter the missing qty for medicines not received:**")
+                n = bounce_editor(arr, "Pickup", f"bsp_{p['id']}", direct=True)
+                if n:
+                    _mark_pickup_checked(p, n)
+                    st.session_state["bc_msg"] = f"✅ #{d.get('arrangement_no')}: {n} medicine(s) sent for re-order"
+                    st.rerun()
+                if st.button("👍 Checked — nothing to re-order", key=f"bsp_ok_{p['id']}"):
+                    _mark_pickup_checked(p, 0)
+                    st.rerun()
+
+    # 3) invoice shortage (purchase)
+    with tabs[2]:
+        invoice_shortage_picker("bis")
+
+    # 4) waiting re-order
+    with tabs[3]:
+        rows = supabase.table("bounce_items").select("*").eq("status", "Re-order").order("id").execute().data or []
+        if not rows:
+            st.success("Nothing waiting — all bounced medicines are re-ordered.")
+        else:
+            now = now_ist()
+            st.caption("Customer items are already back in **📦 Arrangement Order** (🔁 at the top) — they clear from here "
+                       "automatically when you tick them in a new arrangement. Medicines without a customer order: "
+                       "place the order, then mark them re-ordered here.")
+            st.dataframe(pd.DataFrame([{
+                "Medicine": b.get("medicine_name"), "Missing": _qty_txt(b.get("qty_missing")),
+                "Bounced by": b.get("distributor"), "Arrangement": b.get("arrangement_no"), "Stage": b.get("stage"),
+                "Issue": b.get("issue"), "Waiting": fmt_age(age_mins(b.get("verified_at") or b.get("reported_at"), now)),
+                "Customer order": b.get("order_no") or "— stock item —"} for b in rows]), hide_index=True, width='stretch')
+            manual = [b for b in rows if not b.get("line_id")]
+            if manual:
+                opts = {f"{b.get('medicine_name')} — {_qty_txt(b.get('qty_missing'))} (bounced by {b.get('distributor')})": b
+                        for b in manual}
+                sel = st.multiselect("Stock items you have re-ordered", list(opts), key="bre_sel")
+                new_arr = st.text_input("New arrangement no (optional)", key="bre_arr")
+                if st.button("✅ Mark re-ordered", key="bre_go", disabled=not sel):
+                    for k in sel:
+                        supabase.table("bounce_items").update({"status": "Re-ordered", "reordered_at": now_iso(),
+                                                               "reordered_arrangement_no": new_arr or None})\
+                            .eq("id", opts[k]["id"]).execute()
+                    st.rerun()
+
+    # 5) report
+    with tabs[4]:
+        days = st.selectbox("Period", [7, 30, 90], format_func=lambda d: f"Last {d} days", key="brep_days")
+        since = (now_ist() - timedelta(days=days)).isoformat()
+        rows = supabase.table("bounce_items").select("*").gte("reported_at", since).execute().data or []
+        rows = [b for b in rows if b.get("status") != "Dismissed"]
+        if not rows:
+            st.info("No bounces in this period.")
+        else:
+            df = pd.DataFrame(rows)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**By distributor**")
+                g = df.groupby("distributor").agg(Bounces=("id", "count"), Qty=("qty_missing", "sum")).sort_values("Bounces", ascending=False)
+                st.dataframe(g, width='stretch')
+            with c2:
+                st.markdown("**By stage**")
+                st.dataframe(df.groupby("stage").agg(Bounces=("id", "count")).sort_values("Bounces", ascending=False), width='stretch')
+            st.markdown("**Most bounced medicines**")
+            st.dataframe(df.groupby("medicine_name").agg(Bounces=("id", "count"),
+                                                         Distributors=("distributor", lambda x: ", ".join(sorted(set(x)))))
+                         .sort_values("Bounces", ascending=False).head(20), width='stretch')
+
+def invoice_shortage_picker(kp):
+    """Purchase: the invoice came with fewer medicines -> pick the arrangement, enter what's missing"""
+    st.caption("Invoice from the distributor has fewer medicines than you ordered? Pick the arrangement and enter the "
+               "missing qty — it goes straight back for re-order.")
+    since = (today_ist() - timedelta(days=5)).strftime("%Y-%m-%d")
+    try:
+        arrs = supabase.table("arrangements").select("*").gte("order_placed_date", since).order("id", desc=True).execute().data or []
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return
+    if not arrs:
+        st.info("No arrangements in the last 5 days.")
+        return
+    opts = {f"#{a.get('arrangement_no')} — {a.get('distributor')} — {a.get('area','')} — {arr_ref_text(a)}": a for a in arrs}
+    sel = st.selectbox("Arrangement", ["—"] + list(opts), key=f"{kp}_arr")
+    if sel == "—":
+        return
+    n = bounce_editor(opts[sel], "Invoice", f"{kp}_{opts[sel]['id']}", direct=True)
+    if n:
+        st.session_state["bc_msg"] = f"✅ {n} medicine(s) sent for re-order"
+        st.rerun()
 
 # ── ORDER TRACKER ─────────────────────────────────────────────────────────────
 LINE_ICON = {"Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
