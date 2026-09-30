@@ -696,6 +696,97 @@ def form_bounce_medicine():
                 st.error(f"Error: {e}")
 
 # ── ARRANGEMENT FORM ──────────────────────────────────────────────────────────
+# ── TARGET PICKUP TIME (arrangement → delivery boy) ───────────────────────────
+PICKUP_TARGETS = [("30 min", 30), ("1 hr", 60), ("1½ hr", 90), ("2 hr", 120), ("3 hr", 180), ("4 hr", 240),
+                  ("Custom time", None)]
+PICKUP_SQL_HINT = "run **pickup_target_setup.sql** in Supabase to turn on target pickup times"
+
+def pickup_status(arr, now=None):
+    """Target-pickup status of an arrangement -> dict or None (no target set).
+    keys: flag, late (bool), mins (left if pending / delay if done, + = late), label, target (datetime), done (bool)"""
+    t = to_ist(arr.get("target_pickup_at"))
+    if not t:
+        return None
+    now = now or now_ist()
+    done_at = to_ist(arr.get("picked_up_at"))
+    if done_at:
+        d = int((done_at - t).total_seconds() // 60)
+        if d > 0:
+            return {"flag": "🔴", "late": True, "mins": d, "done": True, "target": t,
+                    "label": f"picked {done_at.strftime('%I:%M %p')} — {fmt_age(d)} LATE"}
+        return {"flag": "✅", "late": False, "mins": d, "done": True, "target": t,
+                "label": f"picked {done_at.strftime('%I:%M %p')} — on time" + (f" ({fmt_age(-d)} early)" if d < 0 else "")}
+    left = int((t - now).total_seconds() // 60)
+    if left < 0:
+        return {"flag": "🔴", "late": True, "mins": -left, "done": False, "target": t,
+                "label": f"pick by {t.strftime('%I:%M %p')} — LATE by {fmt_age(-left)}"}
+    return {"flag": "🟡" if left <= 30 else "🟢", "late": False, "mins": -left, "done": False, "target": t,
+            "label": f"pick by {t.strftime('%I:%M %p')} — {fmt_age(left)} left"}
+
+def show_pickup_board(arrs, title="#### ⏰ Pickup targets"):
+    """Live board of Self-Pick arrangements with a target: late first, then soonest due"""
+    now = now_ist()
+    rows = []
+    for a in arrs:
+        ps = pickup_status(a, now)
+        if not ps:
+            continue
+        rows.append((a, ps))
+    if not rows:
+        return
+    pending = [(a, ps) for a, ps in rows if not ps["done"]]
+    done = [(a, ps) for a, ps in rows if ps["done"]]
+    late_now = [x for x in pending if x[1]["late"]]
+    on_time = [x for x in done if not x[1]["late"]]
+    delays = [ps["mins"] for _, ps in done if ps["late"]]
+    st.markdown(title)
+    m = st.columns(4)
+    with m[0]: st.metric("⏳ Waiting pickup", len(pending))
+    with m[1]: st.metric("🔴 Late now", len(late_now))
+    with m[2]: st.metric("✅ Picked on time", f"{len(on_time)} / {len(done)}" if done else "—")
+    with m[3]: st.metric("⌛ Avg delay (late ones)", fmt_age(sum(delays) / len(delays)) if delays else "—")
+    pending.sort(key=lambda x: -x[1]["mins"])
+    table = [{"⏰": ps["flag"], "Arrangement": f"#{a.get('arrangement_no','')}", "Distributor": a.get("distributor", ""),
+              "Area": a.get("area", ""), "Target": ps["target"].strftime("%I:%M %p"), "Status": ps["label"],
+              "Picked by": a.get("pickup_by") or ""} for a, ps in pending + sorted(done, key=lambda x: -x[1]["mins"])]
+    st.dataframe(pd.DataFrame(table), hide_index=True, width='stretch')
+
+def pickup_board_today(title="#### ⏰ Pickup targets — today"):
+    """Self-Pick arrangements placed today or still waiting from the last 2 days"""
+    try:
+        since = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+        arrs = supabase.table("arrangements").select("*").gte("order_placed_date", since).execute().data or []
+    except Exception:
+        return
+    arrs = [a for a in arrs if a.get("order_placed_date") == date_str() or a.get("status") == "Pending"]
+    show_pickup_board(arrs, title)
+
+def _pickup_target_input(fv):
+    """Target pickup widgets (inside the arrangement form)"""
+    c1, c2 = st.columns(2)
+    with c1:
+        choice = st.selectbox("⏰ Target pickup time (Self Pick) *", [n for n, _ in PICKUP_TARGETS], index=1,
+                              key=f"arr_target_{fv}",
+                              help="By when the delivery boy must pick the stock from the distributor. "
+                                   "He sees a countdown; if he is late, the delay is shown to everyone.")
+    with c2:
+        custom = st.time_input("Custom pickup time (only if 'Custom time')", value=None, step=900,
+                               key=f"arr_target_t_{fv}")
+    return choice, custom
+
+def _pickup_target_value(choice, custom):
+    """-> (datetime or None, error or None)"""
+    now = now_ist()
+    mins = dict(PICKUP_TARGETS).get(choice)
+    if mins:
+        return now + timedelta(minutes=mins), None
+    if custom is None:
+        return None, "Pick the custom pickup time (or choose 30 min / 1 hr ...)."
+    t = IST.localize(datetime.combine(now.date(), custom))
+    if t < now - timedelta(minutes=5):
+        return None, f"Custom pickup time {custom.strftime('%I:%M %p')} has already passed."
+    return t, None
+
 def form_arrangement():
     st.subheader("📋 New Arrangement Order")
     start = timer_button("arrangement_order", "Arrangement Order")
@@ -752,6 +843,7 @@ def form_arrangement():
                                             key=f"arr_nmed_{fv}_{len(picked_lines)}",
                                             help="Filled from the ticked customer items — add any extra medicines. Max 200.")
             order_time    = st.text_input("Order Time", value=time_str(), key=f"arr_time_{fv}")
+        target_choice, target_custom = _pickup_target_input(fv)
         remarks = st.text_input("Remarks", key=f"arr_remarks_{fv}")
         st.markdown("📸 **Image of Order ***")
         arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key=f"arr_upload_{fv}")
@@ -765,8 +857,12 @@ def form_arrangement():
                     f"{p.get('Item','')} {('(' + str(p.get('Pack')) + ')') if p.get('Pack') else ''}".strip()
                     + f" - {_qty_txt(min(_to_float(p.get('Order Qty'),0), _to_float(p.get('Needed'),0)))}"
                     for p in picked_lines)
+            target_at, target_err = (None, None) if pickup_type == "Distributor Delivers" \
+                else _pickup_target_value(target_choice, target_custom)
             if not no_medicines:
                 st.error("Enter No of Medicines to Pick!")
+            elif target_err:
+                st.error("⏰ " + target_err)
             elif arr_img is None:
                 st.error("⚠️ Image of order is mandatory! Please upload or take photo (just above Submit).")
             else:
@@ -780,7 +876,7 @@ def form_arrangement():
                         st.error(f"❌ Arrangement No #{arr_no} already exists! Please use a different number.")
                     else:
                         img_name = upload_image(arr_img, "arr")
-                        result = supabase.table("arrangements").insert({
+                        arr_row = {
                             "arrangement_no": arr_no,
                             "distributor": distributor,
                             "area": area,
@@ -793,7 +889,17 @@ def form_arrangement():
                             "pickup_type": pickup_type,
                             "order_image": img_name,
                             "status": "Pending"
-                        }).execute()
+                        }
+                        if target_at:
+                            arr_row["target_pickup_at"] = target_at.isoformat()
+                        try:
+                            result = supabase.table("arrangements").insert(arr_row).execute()
+                        except Exception as ins_err:
+                            if "target_pickup_at" not in str(ins_err):
+                                raise
+                            arr_row.pop("target_pickup_at", None)       # column not created yet
+                            result = supabase.table("arrangements").insert(arr_row).execute()
+                            st.warning("⏰ Arrangement saved without target pickup time — " + PICKUP_SQL_HINT)
                         arr_id = result.data[0]["id"]
                         if picked_lines:
                             save_arrangement_links(arr_id, arr_no, distributor, area, picked_lines)
@@ -831,7 +937,8 @@ def form_arrangement():
                         except:
                             pass
                         st.session_state["arr_form_ver"] = fv + 1
-                        st.success(f"✅ Arrangement #{arr_no} placed successfully!")
+                        st.success(f"✅ Arrangement #{arr_no} placed successfully!"
+                                   + (f" ⏰ Pick up by **{target_at.strftime('%I:%M %p')}**" if target_at else ""))
                         st.balloons()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -1110,12 +1217,21 @@ def form_pickup():
         st.info("No pending arrangements!")
         return
 
-    st.markdown(f"**🔴 {len(arrangements)} Pending Arrangements:**")
+    now = now_ist()
+    stat = {a["id"]: pickup_status(a, now) for a in arrangements}
+    # most urgent first: late ones (longest late on top), then soonest target, then no target
+    arrangements.sort(key=lambda a: (-(stat[a["id"]] or {"mins": -10**6})["mins"], str(a.get("order_placed_time", ""))))
+    late = [a for a in arrangements if (stat[a["id"]] or {}).get("late")]
+    if late:
+        st.error(f"🔴 **{len(late)} pickup(s) are LATE** — go to these first: "
+                 + ", ".join(f"#{a.get('arrangement_no')} ({a.get('distributor')})" for a in late))
+    st.markdown(f"**{len(arrangements)} Pending Arrangements:**")
     for arr in arrangements:
         u = arr.get("urgency")
-        icon = "🔴" if u == "Very Urgent" else "🟡" if u == "Urgent" else "🟢"
+        ps = stat[arr["id"]]
+        icon = ps["flag"] if ps else ("🔴" if u == "Very Urgent" else "🟡" if u == "Urgent" else "🟢")
         st.markdown(f"{icon} **#{arr.get('arrangement_no')}** — {arr.get('distributor')} — Area: {arr.get('area','')} "
-                    f"— Medicines: {arr.get('no_medicines','')} — {u}")
+                    f"— Medicines: {arr.get('no_medicines','')} — {u}" + (f" — ⏰ **{ps['label']}**" if ps else ""))
     st.divider()
     st.subheader("➕ Add Pickup Entry")
 
@@ -1127,6 +1243,9 @@ def form_pickup():
         return
     arr = arr_options[sel]
     arr_id, arr_no = arr["id"], arr.get("arrangement_no")
+    ps = stat[arr_id]
+    if ps:
+        (st.error if ps["late"] else st.warning if ps["flag"] == "🟡" else st.info)(f"⏰ Target: **{ps['label']}**")
 
     c1, c2, c3 = st.columns(3)
     with c1: st.info(f"📍 Area: **{arr.get('area','N/A')}**")
@@ -1213,11 +1332,18 @@ def form_pickup():
     s_dt = parse_task_time(open_task.get("start_time", ""))
     e_dt = parse_task_time(handover.strftime("%I:%M:%S %p"))
     dur = str(int(((e_dt - s_dt).total_seconds() % 86400) // 60)) if s_dt and e_dt else ""
+    target_info, target_upd = {}, {}
+    t_at = to_ist(arr.get("target_pickup_at"))
+    if t_at:
+        delay = int((handover - t_at).total_seconds() // 60)
+        target_info = {"target_pickup": t_at.strftime("%I:%M %p"), "delay_mins": str(max(0, delay)),
+                       "on_time": "Yes" if delay <= 0 else "No"}
+        target_upd = {"picked_up_at": handover.isoformat(), "pickup_delay_mins": max(0, delay)}
     try:
         supabase.table("daily_tasks").update({
             "status": "Completed", "time": time_str(),
             "end_time": handover.strftime("%I:%M:%S %p"), "duration_mins": dur,
-            "details": {
+            "details": {**target_info,
                 "distributor": distributor, "arrangement_no": str(arr_no), "arrangement_id": arr_id,
                 "delivery_by": delivery_by, "pickup_by": st.session_state.name,
                 "no_sku_received": str(no_sku_received), "no_sku_ordered": str(arr.get("no_medicines", "")),
@@ -1228,13 +1354,15 @@ def form_pickup():
         supabase.table("arrangements").update({
             "status": "Picked Up - In Transit", "pickup_by": st.session_state.name, "pickup_time": reached,
             "handover_type": delivery_by, "porter_no": porter_no, "no_sku_received": str(no_sku_received),
-        }).eq("id", arr_id).execute()
+            **target_upd}).eq("id", arr_id).execute()
     except Exception as e:
         st.error(f"Error: {e}")
         return
     st.session_state["pu_ver"] = ver + 1
     st.session_state["pu_msg"] = (f"✅ Pickup of #{arr_no} submitted — reached {reached}, "
-                                  f"handed over {handover.strftime('%I:%M %p')}")
+                                  f"handed over {handover.strftime('%I:%M %p')}"
+                                  + ((" · ✅ on time" if target_info["on_time"] == "Yes"
+                                      else f" · 🔴 {fmt_age(int(target_info['delay_mins']))} late") if target_info else ""))
     st.balloons()
     st.rerun()
 
@@ -2354,6 +2482,7 @@ def form_bill_upload_arrangement():
 
 def show_pickup_images():
     st.subheader("📸 Pickup Images from Naresh/Sandeep")
+    pickup_board_today()
     st.caption("What was ordered (order image) next to what the delivery boy picked up (his photo of medicines / bill).")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -2392,6 +2521,8 @@ def show_pickup_images():
         when = d.get("time_reached") or p.get("start_time", "")
         if d.get("time_handover"):
             when += f" → {d['time_handover']}"
+        if d.get("on_time"):
+            when += " · ✅ on time" if d["on_time"] == "Yes" else f" · 🔴 {fmt_age(int(_to_float(d.get('delay_mins'))))} late"
         title = (f"{'⚠️' if short else '📦'} #{d.get('arrangement_no') or '— no arrangement —'} | {d.get('distributor','')} | "
                  f"{p.get('person','')} | {when} | SKUs {got}/{want or '?'}")
         with st.expander(title, expanded=(i < 3)):
@@ -3675,6 +3806,7 @@ def show_user_page():
 
     # ── ARRANGEMENT PIPELINE (visible to all) ────────────────────────────────
     with st.expander("🔄 View Today's Arrangement Pipeline", expanded=False):
+        pickup_board_today()
         try:
             arr_resp = supabase.table("arrangements").select("*")\
                 .eq("order_placed_date", date_str()).execute()
@@ -5000,7 +5132,9 @@ def arrangement_line_picker():
     """Shown above the arrangement form. Returns (area, [selected rows])"""
     ver = st.session_state.get("arr_link_ver", 0)
     with st.expander("🔗 Customer order items for this distributor", expanded=True):
-        link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
         if link_area == SELECT_AREA:
             st.caption("Select an area to see its pending customer items. (Or skip this and just enter the number of medicines below.)")
             return None, []
@@ -5011,6 +5145,20 @@ def arrangement_line_picker():
             return None, []
         if not open_lines:
             st.info("No pending customer items for this area.")
+            return link_area, []
+        dates = sorted(set(l.get("scheduled_date") or "" for l in open_lines))
+        per_date = {d: sum(1 for l in open_lines if (l.get("scheduled_date") or "") == d) for d in dates}
+        with fc2:
+            pick_date = st.selectbox(
+                "Delivery date", ["All dates"] + [d for d in dates if d] + (["No date"] if "" in dates else []),
+                key=f"arr_link_date_{ver}",
+                format_func=lambda d: d if d in ("All dates", "No date") else
+                f"{_sched_label(d)} — {per_date.get(d, 0)} item(s)"
+                + (" (today)" if d == date_str() else ""))
+        if pick_date != "All dates":
+            open_lines = [l for l in open_lines if (l.get("scheduled_date") or "") == ("" if pick_date == "No date" else pick_date)]
+        if not open_lines:
+            st.info("No pending customer items for this date.")
             return link_area, []
         now = now_ist()
         open_lines = sorted(open_lines, key=lambda l: (l.get("scheduled_date") or "9999",
@@ -8455,6 +8603,7 @@ def show_admin_page():
 
     with tab2:
         st.subheader("🔄 Pipeline View")
+        pickup_board_today()
 
         pipe_type = st.radio("Select Pipeline",
             ["📦 Arrangement Orders", "🧾 Normal Orders"],
