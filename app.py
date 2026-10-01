@@ -890,11 +890,32 @@ def form_add_invoice():
         except Exception as e:
             st.error(f"Error: {e}")
 
+def _auto_start_arrangement_timer(picked_ids):
+    """Start the arrangement timer when the first medicine is ticked (once per selection, so Cancel still works)"""
+    sk = "arrangement_order_start"
+    if not picked_ids or st.session_state.get(sk):
+        return
+    if st.session_state.get("arr_autostart_for") == picked_ids:
+        return                                          # cancelled with the same selection -> don't restart
+    active, _ = get_active_timer()
+    if active and active != "arrangement_order":
+        return                                          # another task running -> timer_button shows the warning
+    st.session_state["arr_autostart_for"] = picked_ids
+    st.session_state[sk] = now_ist()
+    try:
+        r = supabase.table("daily_tasks").insert({
+            "date": date_str(), "time": time_str(), "person": st.session_state.name, "team": st.session_state.team,
+            "task_type": "Arrangement Order", "status": "In Progress",
+            "start_time": now_ist().strftime("%I:%M:%S %p"), "details": {}}).execute()
+        if r.data:
+            st.session_state["arrangement_order_task_id"] = r.data[0]["id"]
+    except Exception:
+        pass
+
 def form_arrangement():
     st.subheader("📋 New Arrangement Order")
-    start = timer_button("arrangement_order", "Arrangement Order")
-    if start is None:
-        return
+    st.caption("Decide every customer medicine here: ✅ tick to order from a distributor, or mark 🏪 In Store / "
+               "❌ Not Available. The timer starts by itself when you tick the first medicine.")
 
     AREAS = load_areas() + load_warehouses() + ["Other"]
 
@@ -908,11 +929,16 @@ def form_arrangement():
     except:
         auto_arr_no = f"ARR-{today_ist().strftime('%Y%m%d')}-001"
 
-    st.info(f"🔢 Auto Arrangement No: **{auto_arr_no}**")
-
-    # Customer order items to link (optional)
+    # Customer order items: decide each one / tick to order (optional for stock top-ups)
     link_area, picked_lines = arrangement_line_picker()
     picked_lines = [p for p in picked_lines if _to_float(p.get("Order Qty"), 0) > 0]
+    _auto_start_arrangement_timer(tuple(sorted(int(p["id"]) for p in picked_lines)))
+    if not picked_lines and not st.session_state.get("arrangement_order_start"):
+        st.caption("Ordering medicines that are not customer items (stock top-up)? Press Start below.")
+    start = timer_button("arrangement_order", "Arrangement Order")
+    if start is None:
+        return
+    st.info(f"🔢 Auto Arrangement No: **{auto_arr_no}**")
     if picked_lines:
         if st.toggle(f"📸 Show only the {len(picked_lines)} selected medicine(s) — for screenshot", key="arr_shot"):
             medicine_list_card(
@@ -3989,10 +4015,7 @@ def show_user_page():
                 type="primary" if st.session_state.purchase_active_form=="import" else "secondary"):
                 st.session_state.purchase_active_form = "import"
                 st.rerun()
-            if st.button("🧾 Pending Items", width='stretch', key="p_pending_items",
-                type="primary" if st.session_state.purchase_active_form=="pending_items" else "secondary"):
-                st.session_state.purchase_active_form = "pending_items"
-                st.rerun()
+            # 🧾 Pending Items is now part of 📦 Arrangement Order
             if st.button("📊 Order Tracker", width='stretch', key="p_tracker",
                 type="primary" if st.session_state.purchase_active_form=="tracker" else "secondary"):
                 st.session_state.purchase_active_form = "tracker"
@@ -4085,7 +4108,7 @@ def show_user_page():
                 "crosscheck":  form_bill_crosscheck,
                 "placement":   form_stock_placement,
                 "import":      form_import_orders,
-                "pending_items": form_pending_items,
+                "pending_items": form_arrangement,      # merged into Arrangement Order
                 "tracker":     show_customer_order_tracker,
                 "bills":       show_bills_register,
                 "other":       form_other_task,
@@ -4134,8 +4157,9 @@ def show_user_page():
                     st.session_state.purchase_active_form = "import"
                     st.rerun()
             with c2:
-                if st.button("🧾 Pending", key="mp_pending_items", use_container_width=True):
-                    st.session_state.purchase_active_form = "pending_items"
+                if st.button("🧾 Pending", key="mp_pending_items", use_container_width=True,
+                             help="Pending customer items are now decided inside 📦 Arrangement Order"):
+                    st.session_state.purchase_active_form = "arrangement"
                     st.rerun()
             with c3:
                 if st.button("📊 Tracker", key="mp_tracker", use_container_width=True):
@@ -4339,6 +4363,7 @@ def show_user_page():
         # Main area
         if st.session_state.stock_active_form:
             form_map = {
+                "storepick":   form_store_check,
                 "register":    form_register_entry,
                 "receive":     form_porter_receive,
                 "bills":       lambda: show_bills_register("stk_bills", default_area=st.session_state.get("work_area")),
@@ -5266,13 +5291,51 @@ def form_pending_items():
             st.error(f"Error: {e} — has delivery_time_setup.sql been run in Supabase?")
 
 # ── ARRANGEMENT FORM: pick customer lines ────────────────────────────────────
+LINE_DECISIONS = ["", "🏪 In Store", "❌ Not Available"]
+
+def save_line_decisions(decisions, time_changes, by_id, area):
+    """In Store / Not Available decisions + promised delivery times (whole order). -> (n_store, n_na)"""
+    now_s = now_iso()
+    n_store = n_na = 0
+    for order_no, t in time_changes.items():
+        supabase.table("customer_order_lines").update({"delivery_time": t}).eq("order_no", order_no).eq("removed", False).execute()
+    for line_id, dec in decisions:
+        line = by_id.get(line_id)
+        if not line:
+            continue
+        decision = "In Store" if "In Store" in dec else "Not Available"
+        if line.get("status") == "Partly Arranged":
+            supabase.table("customer_order_lines").update({
+                "remainder_note": decision, "decided_by": st.session_state.name, "decided_at": now_s}).eq("id", line_id).execute()
+            refresh_line_status(line_id)
+        else:
+            supabase.table("customer_order_lines").update({
+                "status": decision, "decided_by": st.session_state.name,
+                "decided_at": now_s, "completed_at": now_s}).eq("id", line_id).execute()
+        if decision == "In Store":
+            n_store += 1
+        else:
+            n_na += 1
+    if n_store + n_na:
+        log_simple_task("Customer Items Check", {"area": area, "lines": str(n_store + n_na),
+                                                 "in_store": str(n_store), "not_available": str(n_na)})
+    return n_store, n_na
+
 def arrangement_line_picker():
-    """Shown above the arrangement form. Returns (area, [selected rows])"""
+    """Customer items of an area: decide each one here — tick to order from this distributor, or mark In Store /
+    Not Available, and set the delivery time. Returns (area, [rows ticked to order])"""
     ver = st.session_state.get("arr_link_ver", 0)
-    with st.expander("🔗 Customer order items for this distributor", expanded=True):
+    with st.expander("🧾 Customer order items — decide each medicine here", expanded=True):
+        msg = st.session_state.pop("arr_dec_msg", None)
+        if msg:
+            st.success(msg)
         fc1, fc2 = st.columns(2)
         with fc1:
-            link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
+            a_opts = [SELECT_AREA] + load_areas()
+            last = st.session_state.get("arr_last_area")
+            link_area = st.selectbox("Area of customer orders", a_opts, key=f"arr_link_area_{ver}",
+                                     index=a_opts.index(last) if last in a_opts else 0)
+            st.session_state["arr_last_area"] = link_area
         if link_area == SELECT_AREA:
             st.caption("Select an area to see its pending customer items. (Or skip this and just enter the number of medicines below.)")
             return None, []
@@ -5282,7 +5345,7 @@ def arrangement_line_picker():
             st.warning(f"Could not load customer items ({e})")
             return None, []
         if not open_lines:
-            st.info("No pending customer items for this area.")
+            st.success("🎉 No pending customer items for this area.")
             return link_area, []
         dates = sorted(set(l.get("scheduled_date") or "" for l in open_lines))
         per_date = {d: sum(1 for l in open_lines if (l.get("scheduled_date") or "") == d) for d in dates}
@@ -5306,37 +5369,84 @@ def arrangement_line_picker():
                 bounced.setdefault(b["line_id"], []).append(b)
         except Exception:
             pass
+        m = st.columns(4)
+        with m[0]: st.metric("Pending items", len(open_lines))
+        with m[1]: st.metric("Orders", len({l.get("order_no") for l in open_lines}))
+        with m[2]: st.metric("🔴 Due ≤ 1 hr / overdue", sum(1 for l in open_lines if (due_info(l, now) or (None, 10**9))[1] <= 60))
+        with m[3]: st.metric("⏱️ No delivery time", len({l.get("order_no") for l in open_lines if not l.get("delivery_time")}))
         if bounced:
-            st.warning(f"🔁 {len(bounced)} item(s) bounced by a distributor — shown at the top. Order them from another distributor.")
+            n_store = sum(1 for bs in bounced.values() if all(b["distributor"] == "In Store (not found)" for b in bs))
+            parts = ([f"{len(bounced) - n_store} bounced by a distributor"] if len(bounced) > n_store else []) + \
+                    ([f"{n_store} not found in store"] if n_store else [])
+            st.warning(f"🔁 {' · '.join(parts)} — shown at the top. Order them from a distributor.")
         open_lines = sorted(open_lines, key=lambda l: (l["id"] not in bounced, l.get("scheduled_date") or "9999",
                                                        (due_info(l, now) or (None, 10**9))[1],
-                                                       str(l.get("imported_at") or "")))
-        ldf = pd.DataFrame([{
-            "id": l["id"],
-            "Order?": False,
-            "⏰": (due_info(l, now) or (age_flag(age_mins(l.get("imported_at"), now)),))[0],
-            "Deliver by": (f"{_sched_label(l.get('scheduled_date'))} {l.get('delivery_time')}"
-                           if l.get("delivery_time") else _sched_label(l.get("scheduled_date"))),
-            "🔁": ("bounced by " + ", ".join(sorted({b["distributor"] for b in bounced[l["id"]]}))) if l["id"] in bounced else "",
-            "Order #": l.get("order_no", ""),
-            "Customer": l.get("customer_name", ""),
-            "Item": l.get("item_name", ""),
-            "Pack": l.get("pack_size", ""),
-            "Needed": remaining_qty(l),
-            "Order Qty": remaining_qty(l),
-        } for l in open_lines])
+                                                       str(l.get("imported_at") or ""), str(l.get("order_no"))))
+        rows = []
+        for l in open_lines:
+            di = due_info(l, now)
+            rows.append({
+                "id": l["id"],
+                "Order?": False,
+                "Not ordering?": "",
+                "⏰": di[0] if di else age_flag(age_mins(l.get("imported_at"), now)),
+                "Date": _sched_label(l.get("scheduled_date")),
+                "Deliver by": l.get("delivery_time") or "",
+                "Due": di[2] if di else "",
+                "🔁": (("🔴 not found in store" if all(b["distributor"] == "In Store (not found)" for b in bounced[l["id"]])
+                    else "bounced by " + ", ".join(sorted({b["distributor"] for b in bounced[l["id"]]}))) if l["id"] in bounced else ""),
+                "Order #": l.get("order_no", ""),
+                "Customer": l.get("customer_name", ""),
+                "Item": l.get("item_name", ""),
+                "Pack": l.get("pack_size", ""),
+                "Needed": remaining_qty(l),
+                "Order Qty": remaining_qty(l),
+            })
+        ldf = pd.DataFrame(rows)
+        if not ldf["🔁"].astype(bool).any():
+            ldf = ldf.drop(columns=["🔁"])
         ed = st.data_editor(
             ldf, key=f"arr_link_editor_{ver}", hide_index=True, width='stretch',
-            disabled=["⏰", "Deliver by", "🔁", "Order #", "Customer", "Item", "Pack", "Needed"],
+            disabled=[c for c in ldf.columns if c not in ("Order?", "Not ordering?", "Deliver by", "Order Qty")],
             column_config={
                 "id": None,
                 "Order?": st.column_config.CheckboxColumn("Order?", help="Tick items you are ordering from this distributor"),
+                "Not ordering?": st.column_config.SelectboxColumn(
+                    "Not ordering?", options=LINE_DECISIONS,
+                    help="🏪 In Store = available, nothing to buy · ❌ Not Available = can't be sourced"),
+                "Deliver by": st.column_config.SelectboxColumn("Deliver by", options=DELIVERY_TIMES,
+                                                               help="Time promised to the customer (whole order)"),
                 "Order Qty": st.column_config.NumberColumn("Order Qty", min_value=0, step=1,
                                                            help="Change only if this item is split between 2 distributors"),
             })
-        picked = ed[ed["Order?"] == True].to_dict("records")
+        st.caption("⏰ with a delivery time: 🔴 due within 1 hr or overdue · 🟡 within 3 hrs · 🟢 later. Without a time: age since upload.")
+        recs = ed.to_dict("records")
+        picked = [r for r in recs if r["Order?"]]
+        decisions = [(int(r["id"]), r["Not ordering?"]) for r in recs if r["Not ordering?"]]
+        old_time = {r["id"]: r["Deliver by"] for r in rows}
+        time_changes = {}
+        for r in recs:
+            if (r["Deliver by"] or "") != (old_time.get(r["id"]) or ""):
+                time_changes[str(r["Order #"])] = r["Deliver by"] or None
+        both = [r["Item"] for r in recs if r["Order?"] and r["Not ordering?"]]
+        if both:
+            st.error("Ticked to order AND marked not ordering — pick one: " + ", ".join(both[:10]))
+            picked = []
+        if decisions or time_changes:
+            n_s = sum(1 for _, d in decisions if "In Store" in d)
+            if st.button(f"💾 Save {n_s} In Store · {len(decisions) - n_s} Not Available · {len(time_changes)} delivery time(s)",
+                         key=f"arr_dec_save_{ver}", disabled=bool(both)):
+                try:
+                    ns, nn = save_line_decisions(decisions, time_changes, {l["id"]: l for l in open_lines}, link_area)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                else:
+                    st.session_state["arr_link_ver"] = ver + 1
+                    st.session_state["arr_dec_msg"] = f"✅ Saved: {ns} In Store · {nn} Not Available · {len(time_changes)} delivery time(s)"
+                    st.rerun()
         if picked:
-            st.success(f"✅ {len(picked)} item(s) selected — they will be linked to this arrangement")
+            st.success(f"✅ {len(picked)} item(s) ticked to order — fill the arrangement form below")
+        undo_line_decisions(f"arr_u{ver}", link_area)
         return link_area, picked
 
 def save_arrangement_links(arr_id, arr_no, distributor, area, picked):
@@ -5427,7 +5537,7 @@ def save_customer_receipts(ed):
 # with only the missing qty and shows up again (🔁) in the Arrangement Order item list.
 BOUNCE_ISSUES = ["Short / not given", "Out of stock", "Not in invoice", "Wrong medicine", "Damaged",
                  "Near expiry", "Rate issue", "Other"]
-BOUNCE_DISMISS = ["Received later", "Customer cancelled", "Found in store", "Not needed", "Stock team mistake", "Other"]
+BOUNCE_DISMISS = ["Received later", "Found in store", "Customer cancelled", "Found in store", "Not needed", "Stock team mistake", "Other"]
 BOUNCE_SQL = "run **bounce_setup.sql** in Supabase"
 
 def _eff_ordered(a):
@@ -5441,6 +5551,9 @@ def _bounce_insert(rows):
 
 def apply_bounce(b):
     """Purchase confirmed: take the missing qty off the arrangement line and re-open the customer item"""
+    if b.get("stage") == "Store" and b.get("line_id"):
+        reopen_store_line(int(b["line_id"]))
+        return
     if not b.get("arr_line_id"):
         return
     al = supabase.table("arrangement_lines").select("*").eq("id", b["arr_line_id"]).execute().data
@@ -5527,12 +5640,20 @@ def _short_pickups(days=3):
     since = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = supabase.table("daily_tasks").select("*").eq("task_type", "Pickup").gte("date", since)\
         .order("id", desc=True).execute().data or []
+    rows = [p for p in rows if p.get("status") != "In Progress" and not (p.get("details") or {}).get("bounce_checked")
+            and (p.get("details") or {}).get("arrangement_no")]
+    # pickups saved before 'no_sku_ordered' existed -> use the arrangement's medicine count
+    need = list({p["details"]["arrangement_no"] for p in rows if not str(p["details"].get("no_sku_ordered") or "").strip()})
+    arr_cnt = {}
+    if need:
+        arr_cnt = {a.get("arrangement_no"): a.get("no_medicines") for a in
+                   (supabase.table("arrangements").select("arrangement_no,no_medicines").in_("arrangement_no", need).execute().data or [])}
     out = []
     for p in rows:
         d = p.get("details") or {}
-        if p.get("status") == "In Progress" or d.get("bounce_checked") or not d.get("arrangement_no"):
-            continue
-        got, want = d.get("no_sku_received"), d.get("no_sku_ordered")
+        got, want = d.get("no_sku_received"), d.get("no_sku_ordered") or arr_cnt.get(d.get("arrangement_no"))
+        if want and not d.get("no_sku_ordered"):
+            p["details"] = {**d, "no_sku_ordered": str(want)}
         if str(got).strip() and str(want).strip() and _to_float(got) < _to_float(want):
             out.append(p)
     return out
@@ -5567,7 +5688,7 @@ def form_bounce_center():
     if msg:
         st.success(msg)
     n_ver, n_sp, n_re = bounce_counts()
-    tabs = st.tabs([f"🏭 Warehouse reports ({n_ver})", f"🚚 Short pickups ({n_sp})", "🧾 Invoice shortage",
+    tabs = st.tabs([f"🏭 Stock team reports ({n_ver})", f"🚚 Short pickups ({n_sp})", "🧾 Invoice shortage",
                     f"🔁 Waiting re-order ({n_re})", "📊 Report"])
 
     # 1) stock team reports -> verify
@@ -5576,8 +5697,10 @@ def form_bounce_center():
         if not rows:
             st.success("Nothing to verify.")
         else:
-            st.caption("Reported by the stock team at Bill Cross Check. Check the bill / stock, then confirm or dismiss.")
-            df = pd.DataFrame([{"id": b["id"], "Action": "—", "Dismiss reason": "", "Arrangement": b.get("arrangement_no"),
+            st.caption("Reported by the stock team — at Bill Cross Check (short from distributor) or while picking "
+                       "In Store items (not found on the shelf). Check, then confirm (→ goes back for ordering) or dismiss.")
+            df = pd.DataFrame([{"id": b["id"], "Action": "—", "Dismiss reason": "", "Stage": "🏪 Not found in store" if b.get("stage") == "Store" else "🏭 Bill check",
+                                "Arrangement": b.get("arrangement_no") or "",
                                 "Distributor": b.get("distributor"), "Medicine": b.get("medicine_name"),
                                 "Customer order": b.get("order_no") or "", "Ordered": _qty_txt(b.get("qty_ordered")),
                                 "Missing": _qty_txt(b.get("qty_missing")), "Issue": b.get("issue"),
@@ -5610,6 +5733,8 @@ def form_bounce_center():
                             supabase.table("bounce_items").update({"status": "Dismissed", "verified_by": st.session_state.name,
                                                                    "verified_at": now_s, "dismiss_reason": r["Dismiss reason"]})\
                                 .eq("id", b["id"]).execute()
+                            if b.get("stage") == "Store" and b.get("line_id"):      # stays In Store -> stock picks again
+                                supabase.table("customer_order_lines").update({"store_check": None}).eq("id", b["line_id"]).execute()
                             nd += 1
                     st.session_state["bv_ver"] = ver + 1
                     st.session_state["bc_msg"] = f"✅ {nc} sent for re-order · {nd} dismissed"
@@ -5732,6 +5857,162 @@ def invoice_shortage_picker(kp):
     if n:
         st.session_state["bc_msg"] = f"✅ {n} medicine(s) sent for re-order"
         st.rerun()
+
+# ── IN-STORE CHECK: stock team picks / reports, purchase team decides ─────────
+STORE_SQL = "run **store_check_setup.sql** in Supabase"
+
+def _store_qty(l):
+    """qty the customer needs from our own store"""
+    if l.get("status") == "In Store":
+        return _to_float(l.get("qty"), 0)
+    return max(0.0, _to_float(l.get("qty"), 0) - _to_float(l.get("qty_arranged"), 0))   # remainder marked In Store
+
+def in_store_to_check(area=None):
+    """In Store customer items not yet checked by the stock team"""
+    q = supabase.table("customer_order_lines").select("*").eq("removed", False).is_("store_check", "null")
+    if area and area not in ("All Areas", SELECT_AREA):
+        q = q.eq("area", area)
+    rows = q.execute().data or []
+    return [l for l in rows if l.get("status") == "In Store" or
+            (l.get("status") == "Partly Arranged" and l.get("remainder_note") == "In Store")]
+
+def count_store_to_check(area=None):
+    try:
+        return len(in_store_to_check(area))
+    except Exception:
+        return 0
+
+def form_store_check():
+    st.subheader("🏪 In-Store items to pick")
+    st.caption("Customer medicines the purchase team marked **In Store**. Pick each one from the shelf: "
+               "✅ **Picked** if you have it, ❌ **Not found** if it is not there — the purchase team will then order it.")
+    area = st.selectbox("Area", ["All Areas"] + load_areas(), key="sc_area",
+                        index=(["All Areas"] + load_areas()).index(st.session_state.get("work_area"))
+                        if st.session_state.get("work_area") in load_areas() else 0)
+    try:
+        lines = in_store_to_check(area)
+    except Exception as e:
+        st.error(f"Could not load — {STORE_SQL}. ({e})")
+        return
+    msg = st.session_state.pop("sc_msg", None)
+    if msg:
+        st.success(msg)
+    if not lines:
+        st.success("🎉 Nothing to pick — every In Store item is checked.")
+        return
+    now = now_ist()
+    lines.sort(key=lambda l: (l.get("scheduled_date") or "9999", (due_info(l, now) or (None, 10**9))[1], str(l.get("order_no"))))
+    rows = [{"id": l["id"], "Result": "—", "⏰": (due_info(l, now) or (age_flag(age_mins(l.get("imported_at"), now)),))[0],
+             "Date": _sched_label(l.get("scheduled_date")), "Deliver by": l.get("delivery_time") or "",
+             "Order #": l.get("order_no", ""), "Customer": l.get("customer_name", ""), "Area": l.get("area", ""),
+             "Medicine": l.get("item_name", ""), "Pack": l.get("pack_size", ""), "Qty": _qty_txt(_store_qty(l)),
+             "Marked by": l.get("decided_by") or "", "Note": ""} for l in lines]
+    st.metric("To pick", len(rows))
+    ver = st.session_state.get("sc_ver", 0)
+    ed = st.data_editor(pd.DataFrame(rows), key=f"sc_ed_{ver}", hide_index=True, width='stretch',
+                        disabled=[c for c in rows[0] if c not in ("Result", "Note")],
+                        column_config={"id": None,
+                                       "Result": st.column_config.SelectboxColumn(
+                                           "Result", options=["—", "✅ Picked", "❌ Not found"], required=True),
+                                       "Note": st.column_config.TextColumn("Note", help="e.g. only 1 strip found, expired, damaged")})
+    chosen = [r for r in ed.to_dict("records") if r["Result"] != "—"]
+    n_nf = sum(1 for r in chosen if r["Result"].startswith("❌"))
+    if not st.button(f"💾 Save ({len(chosen) - n_nf} picked · {n_nf} not found)", type="primary", key="sc_save",
+                     disabled=not chosen, width='stretch'):
+        return
+    by_id = {l["id"]: l for l in lines}
+    now_s = now_iso()
+    try:
+        for r in chosen:
+            l = by_id[r["id"]]
+            found = r["Result"].startswith("✅")
+            supabase.table("customer_order_lines").update({
+                "store_check": "Picked" if found else "Not found", "store_checked_by": st.session_state.name,
+                "store_checked_at": now_s, "store_note": r["Note"] or None}).eq("id", l["id"]).execute()
+            if not found:
+                _bounce_insert([{
+                    "arrangement_no": "", "distributor": "In Store (not found)", "area": l.get("area"), "stage": "Store",
+                    "line_id": l["id"], "arr_line_id": None, "order_no": l.get("order_no"), "medicine_name": l.get("item_name"),
+                    "qty_ordered": _store_qty(l), "qty_missing": _store_qty(l), "issue": "Not found in store",
+                    "note": r["Note"] or None, "status": "To verify", "reported_by": st.session_state.name, "reported_at": now_s}])
+        log_simple_task("In-Store Pick Check", {"area": area, "picked": str(len(chosen) - n_nf), "not_found": str(n_nf)})
+    except Exception as e:
+        st.error(f"Could not save — {STORE_SQL} and **bounce_setup.sql**. ({e})")
+        return
+    st.session_state["sc_ver"] = ver + 1
+    st.session_state["sc_msg"] = (f"✅ Saved — {len(chosen) - n_nf} picked"
+                                  + (f" · {n_nf} not found, sent to the purchase team" if n_nf else ""))
+    st.rerun()
+
+def reopen_store_line(line_id):
+    """Purchase confirmed 'not found in store' -> the item goes back to pending to order from a distributor"""
+    l = supabase.table("customer_order_lines").select("*").eq("id", line_id).execute().data
+    if not l:
+        return
+    l = l[0]
+    if l.get("status") == "In Store":
+        supabase.table("customer_order_lines").update({"status": "Pending", "completed_at": None}).eq("id", line_id).execute()
+    elif l.get("remainder_note") == "In Store":
+        supabase.table("customer_order_lines").update({"remainder_note": None}).eq("id", line_id).execute()
+        refresh_line_status(line_id)
+
+def undo_line_decisions(kp, area):
+    """Purchase: move wrong In Store / Not Available decisions back to pending"""
+    since = (now_ist() - timedelta(days=2)).isoformat()
+    try:
+        rows = supabase.table("customer_order_lines").select("*").eq("removed", False).gte("decided_at", since)\
+            .execute().data or []
+    except Exception:
+        return
+    rows = [l for l in rows if (area in (None, "All Areas", SELECT_AREA) or l.get("area") == area) and
+            (l.get("status") in ("In Store", "Not Available") or l.get("remainder_note") in ("In Store", "Not Available"))]
+    if not rows:
+        return
+    with st.expander(f"↩️ Undo / Not found in store — {len(rows)} item(s) marked In Store / Not Available in the last 2 days"):
+        lab = lambda l: (f"{l.get('item_name')} — {l.get('order_no')} {l.get('customer_name','')} — "
+                         f"{'🏪 In Store' if 'In Store' in (l.get('status'), l.get('remainder_note')) else '❌ Not Available'}"
+                         f" by {l.get('decided_by','')}" + (f" · stock: {l.get('store_check')}" if l.get("store_check") else ""))
+        opts = {lab(l): l for l in rows}
+        back = st.multiselect("Items to move back to pending (to order from a distributor)", list(opts), key=f"{kp}_undo")
+        why = st.radio("Why?", ["↩️ Wrong click", "🔴 Not found in store (stock team told us)"], horizontal=True,
+                       key=f"{kp}_undo_why")
+        told = st.text_input("Told by (stock team person)", key=f"{kp}_undo_by") if why.startswith("🔴") else ""
+        if st.button("↩️ Move back", key=f"{kp}_undo_go", disabled=not back):
+            not_found = why.startswith("🔴")
+            bad = [k for k in back if not_found and "In Store" not in (opts[k].get("status"), opts[k].get("remainder_note"))]
+            if bad:
+                st.error("'Not found in store' is only for items marked In Store: " + "; ".join(b.split(" — ")[0] for b in bad))
+                return
+            now_s = now_iso()
+            for k in back:
+                l = opts[k]
+                if not_found:                         # recorded for the report + 🔴 flag until re-ordered
+                    try:
+                        _bounce_insert([{
+                            "arrangement_no": "", "distributor": "In Store (not found)", "area": l.get("area"),
+                            "stage": "Store", "line_id": l["id"], "arr_line_id": None, "order_no": l.get("order_no"),
+                            "medicine_name": l.get("item_name"), "qty_ordered": _store_qty(l), "qty_missing": _store_qty(l),
+                            "issue": "Not found in store", "note": (f"told by {told}" if told else None),
+                            "status": "Re-order", "reported_by": st.session_state.name, "reported_at": now_s,
+                            "verified_by": st.session_state.name, "verified_at": now_s}])
+                    except Exception:
+                        pass                          # bounce table not created yet -> still moved back
+                if l.get("status") in ("In Store", "Not Available"):
+                    upd = {"status": "Pending", "decided_by": None, "decided_at": None, "completed_at": None}
+                else:
+                    upd = {"remainder_note": None, "decided_by": None, "decided_at": None}
+                try:
+                    supabase.table("customer_order_lines").update({**upd, "store_check": None}).eq("id", l["id"]).execute()
+                except Exception:
+                    supabase.table("customer_order_lines").update(upd).eq("id", l["id"]).execute()
+                if l.get("status") not in ("In Store", "Not Available"):
+                    refresh_line_status(l["id"])
+            log_simple_task("Not Found In Store" if not_found else "Undo In Store / Not Available",
+                            {"lines": str(len(back)), "told_by": told})
+            st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
+            st.session_state["arr_dec_msg"] = (f"🔴 {len(back)} item(s) not found in store — back at the top to order"
+                                               if not_found else f"↩️ {len(back)} item(s) moved back to pending")
+            st.rerun()
 
 # ── ORDER TRACKER ─────────────────────────────────────────────────────────────
 LINE_ICON = {"Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
