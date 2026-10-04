@@ -1990,10 +1990,6 @@ def form_bill_crosscheck():
     except Exception as e:
         st.error(f"Error loading summary: {e}")
 
-    # Start timer at TOP so they dont have to scroll
-    start = timer_button("bill_crosscheck", "Bill Cross Check")
-    if start is None:
-        return
 
 
     # Load arrangements that reached warehouse
@@ -2033,7 +2029,14 @@ def form_bill_crosscheck():
         normal_orders = []
 
     if not arrangements and not normal_orders:
-        st.info("No items pending cross check!")
+        st.info("No bills pending cross check — nothing to start.")
+        if st.session_state.get("bill_crosscheck_start") or restore_timer("bill_crosscheck", "Bill Cross Check"):
+            timer_button("bill_crosscheck", "Bill Cross Check")   # a timer is running -> allow ❌ Cancel
+        return
+
+    # Start only when there is something to check
+    start = timer_button("bill_crosscheck", "Bill Cross Check")
+    if start is None:
         return
 
     # Show pending items
@@ -2211,10 +2214,6 @@ def form_bill_upload_arrangement():
     with c3:
         order_type_filter = st.selectbox("Order Type", ["All","Arrangement","Normal Order"], key="bu_type_filter")
 
-    start = timer_button("bill_upload", "Bill Upload")
-    if start is None:
-        return
-
     # Load cross checked arrangements
     try:
         two_days_ago = (bu_date - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -2252,7 +2251,14 @@ def form_bill_upload_arrangement():
         arrangements = []
 
     if not arrangements and not cross_checked_normal:
-        st.info("No items pending bill upload!")
+        st.info("No bills pending upload — nothing to start.")
+        if st.session_state.get("bill_upload_start") or restore_timer("bill_upload", "Bill Upload"):
+            timer_button("bill_upload", "Bill Upload")   # a timer is running -> allow ❌ Cancel
+        return
+
+    # Start only when there is something to upload
+    start = timer_button("bill_upload", "Bill Upload")
+    if start is None:
         return
 
     st.markdown(f"**Pending:** {len(arrangements)} Arrangements + {len(cross_checked_normal)} Normal Orders")
@@ -2265,6 +2271,29 @@ def form_bill_upload_arrangement():
         d = n.get("details",{})
         all_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
+    # Pick the bill OUTSIDE the form so distributor / bill no / items change at once when another bill is chosen
+    selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="ba_arr")
+    selected_item  = all_options[selected_label]
+    item_type      = selected_item["type"]
+    selected_data  = selected_item["data"]
+    sel_id         = selected_data.get("id", "")
+
+    if item_type == "arrangement":
+        auto_bill_no = selected_data.get("bill_order_id","")
+        auto_dist    = selected_data.get("distributor","")
+        auto_area    = selected_data.get("area","")
+        auto_items   = 0
+        auto_amount  = 0.0
+        st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}** | Type: **Arrangement**")
+    else:
+        d = selected_data.get("details",{})
+        auto_bill_no = d.get("bill_no","")
+        auto_dist    = d.get("distributor","")
+        auto_area    = d.get("area","")
+        auto_items   = int(float(d.get("no_items",0) or 0))
+        auto_amount  = float(d.get("bill_amount",0) or 0)
+        st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Type: **Normal Order**")
+
     st.markdown("📸 **Software Bill Screenshot (Mandatory)**")
     bill_img = photos_input("📷 Take photo or choose file", "ba_upload", ("jpg","jpeg","png","pdf"))
     if bill_img is None:
@@ -2272,34 +2301,17 @@ def form_bill_upload_arrangement():
     else:
         remember_photo(bill_img, "ba_upload")
         with st.form("bill_upload_arr_form", clear_on_submit=True):
-            selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="ba_arr")
-            selected_item  = all_options[selected_label]
-            item_type      = selected_item["type"]
-            selected_data  = selected_item["data"]
-
-            if item_type == "arrangement":
-                auto_bill_no = selected_data.get("bill_order_id","")
-                auto_dist    = selected_data.get("distributor","")
-                auto_area    = selected_data.get("area","")
-                auto_items   = 0
-                auto_amount  = 0.0
-                st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}** | Type: **Arrangement**")
-            else:
-                d = selected_data.get("details",{})
-                auto_bill_no = d.get("bill_no","")
-                auto_dist    = d.get("distributor","")
-                auto_area    = d.get("area","")
-                auto_items   = int(float(d.get("no_items",0) or 0))
-                auto_amount  = float(d.get("bill_amount",0) or 0)
-                st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Type: **Normal Order**")
-
             c1,c2 = st.columns(2)
             with c1:
-                bill_no   = st.text_input("Bill Number *", value=auto_bill_no)
-                bill_date = st.date_input("Bill Date")
-                bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount)
+                bill_no   = st.text_input("Bill Number *", value=auto_bill_no, key=f"ba_bill_{item_type}_{sel_id}",
+                                          disabled=(item_type == "normal"),
+                                          help="From Register Entry. Wrong number? Correct it in ✏️ Edit Entry first.")
+                bill_date = st.date_input("Bill Date", key=f"ba_date_{item_type}_{sel_id}")
+                bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount,
+                                            key=f"ba_amt_{item_type}_{sel_id}")
             with c2:
-                no_items  = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
+                no_items  = st.number_input("No of Items", min_value=0, step=1, value=auto_items,
+                                            key=f"ba_items_{item_type}_{sel_id}")
 
 
             remarks = st.text_input("Remarks")
@@ -2346,7 +2358,8 @@ def form_bill_upload_arrangement():
                                 "no_items": str(no_items),
                                 "order_type": item_type,
                                 "bill_image": img_name,
-                                "remarks": remarks
+                                "remarks": remarks,
+                                "reg_id": (selected_data.get("details") or {}).get("reg_id") if item_type == "normal" else None
                             },
                             "start_time": start.strftime("%I:%M:%S %p"),
                             "end_time": end_time,
@@ -2568,11 +2581,13 @@ def form_porter_handover():
         for b in bookings
     }
 
-    with st.form("porter_handover_form", clear_on_submit=True):
-        selected_booking_label = st.selectbox("Select Porter Booking *", list(booking_options.keys()), key="ph_select")
-        selected_booking = booking_options[selected_booking_label]
+    # choose OUTSIDE the form so the details below update at once
+    selected_booking_label = st.selectbox("Select Porter Booking *", list(booking_options.keys()), key="ph_select")
+    selected_booking = booking_options[selected_booking_label]
 
-        st.info(f"🚛 Porter: **{selected_booking.get('porter_no')}** | Vehicle: **{selected_booking.get('vehicle_no','')}** | Going to: **{selected_booking.get('delivery_point','')}**")
+    st.info(f"🚛 Porter: **{selected_booking.get('porter_no')}** | Vehicle: **{selected_booking.get('vehicle_no','')}** | Going to: **{selected_booking.get('delivery_point','')}**")
+
+    with st.form("porter_handover_form", clear_on_submit=True):
 
         c1,c2 = st.columns(2)
         with c1:
@@ -2766,9 +2781,11 @@ def form_porter_receive():
             for a in dist_arrangements
         }
 
+        # choose OUTSIDE the form so the details below update at once
+        selected_dist_label = st.selectbox("Select Arrangement *", list(dist_options.keys()), key="dr_select")
+        selected_dist_arr   = dist_options[selected_dist_label]
+
         with st.form("dist_receive_form", clear_on_submit=True):
-            selected_dist_label = st.selectbox("Select Arrangement *", list(dist_options.keys()), key="dr_select")
-            selected_dist_arr   = dist_options[selected_dist_label]
 
             c1,c2 = st.columns(2)
             with c1:
@@ -2843,11 +2860,13 @@ def form_porter_receive():
         for b in bookings
     }
 
-    with st.form("porter_receive_form", clear_on_submit=True):
-        selected_label   = st.selectbox("Select Porter *", list(booking_options.keys()), key="pr_select")
-        selected_booking = booking_options[selected_label]
+    # choose OUTSIDE the form so the details below update at once
+    selected_label   = st.selectbox("Select Porter *", list(booking_options.keys()), key="pr_select")
+    selected_booking = booking_options[selected_label]
 
-        st.info(f"Expected — Bills: **{selected_booking.get('no_bills',0)}** | Polythene: **{selected_booking.get('no_polythene',0)}**")
+    st.info(f"Expected — Bills: **{selected_booking.get('no_bills',0)}** | Polythene: **{selected_booking.get('no_polythene',0)}**")
+
+    with st.form("porter_receive_form", clear_on_submit=True):
 
         c1,c2 = st.columns(2)
         with c1:
@@ -2939,9 +2958,11 @@ def form_porter_payment():
         for b in bookings
     }
 
+    # choose OUTSIDE the form so the details below update at once
+    selected_label   = st.selectbox("Select Porter *", list(booking_options.keys()), key="pp_select")
+    selected_booking = booking_options[selected_label]
+
     with st.form("porter_payment_form", clear_on_submit=True):
-        selected_label   = st.selectbox("Select Porter *", list(booking_options.keys()), key="pp_select")
-        selected_booking = booking_options[selected_label]
 
         c1,c2 = st.columns(2)
         with c1:
