@@ -353,6 +353,44 @@ def photo_key(base):
 def remember_photo(file, base):
     st.session_state.setdefault("_photo_bases", {})[getattr(file, "file_id", id(file))] = base
 
+def photos_input(label, base, types=("jpg", "jpeg", "png")):
+    """One or more photos (e.g. a 2-page bill). Several photos are joined top-to-bottom into ONE image,
+    so everything that shows / downloads the bill image keeps working. Returns a file-like object or None."""
+    files = st.file_uploader(label + " — add every page", type=list(types), key=photo_key(base),
+                             accept_multiple_files=True,
+                             help="2-page bill? Tap again and add the next page — all pages are saved together.")
+    if not files:
+        return None
+    if len(files) == 1:
+        return files[0]
+    if any(f.name.lower().endswith(".pdf") for f in files):
+        st.error("Upload a PDF on its own, or only photos — not both together.")
+        return None
+    ids = "|".join(str(getattr(f, "file_id", f.name)) for f in files)
+    cache = st.session_state.setdefault("_joined_photos", {})
+    if ids not in cache:
+        from PIL import Image, ImageOps
+        imgs = []
+        for f in files:
+            im = ImageOps.exif_transpose(Image.open(io.BytesIO(f.getvalue()))).convert("RGB")
+            w = min(1600, im.width)
+            imgs.append(im.resize((w, int(im.height * w / im.width))))
+        W = max(i.width for i in imgs)
+        out = Image.new("RGB", (W, sum(i.height for i in imgs) + 20 * (len(imgs) - 1)), "white")
+        y = 0
+        for i in imgs:
+            out.paste(i, (0, y))
+            y += i.height + 20
+        buf = io.BytesIO()
+        out.save(buf, "JPEG", quality=85)
+        buf.seek(0)
+        buf.name = "pages.jpg"
+        buf.file_id = ids
+        cache.clear()
+        cache[ids] = buf
+    st.caption(f"✅ {len(files)} pages added — they will be saved together as one image")
+    return cache[ids]
+
 # ── LOGIN ─────────────────────────────────────────────────────────────────────
 def show_login():
     st.markdown("""
@@ -841,7 +879,7 @@ def form_bill_upload():
     if start is None:
         return
     st.markdown("📸 **Bill Image (Mandatory)**")
-    img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png","pdf"], key=photo_key("bu_upload"))
+    img = photos_input("📷 Take photo or choose file", "bu_upload", ("jpg","jpeg","png","pdf"))
     if img is None:
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
         return
@@ -1123,7 +1161,7 @@ def form_pickup():
         st.success(f"✅ Auto-filled: **{auto_dist}** | **{auto_arr}**")
 
     st.markdown("**📸 Image of Medicine Received**")
-    medicine_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("pu_upload"))
+    medicine_img = photos_input("📷 Take photo or choose file", "pu_upload", ("jpg","jpeg","png"))
     if medicine_img is None:
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
     else:
@@ -1756,7 +1794,7 @@ def form_register_entry():
 
     st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
     st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
-    invoice_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("re_upload"))
+    invoice_img = photos_input("📷 Take photo or choose file", "re_upload", ("jpg","jpeg","png"))
     if invoice_img is None:
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
     else:
@@ -2053,7 +2091,7 @@ def form_bill_crosscheck():
 
     st.markdown("📸 **Image of Physical Bill After Cross Check (Mandatory)**")
     st.caption("⚠️ Take photo of bill after you have checked and marked it — this is your proof of checking!")
-    bill_check_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("cc_img_upload"))
+    bill_check_img = photos_input("📷 Take photo or choose file", "cc_img_upload", ("jpg","jpeg","png"))
     if bill_check_img is None:
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
     else:
@@ -2233,8 +2271,7 @@ def form_bill_upload_arrangement():
         all_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
     st.markdown("📸 **Software Bill Screenshot (Mandatory)**")
-    bill_img = st.file_uploader("📷 Take photo or choose file",
-            type=["jpg","jpeg","png","pdf"], key=photo_key("ba_upload"))
+    bill_img = photos_input("📷 Take photo or choose file", "ba_upload", ("jpg","jpeg","png","pdf"))
     if bill_img is None:
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
     else:
@@ -4117,7 +4154,7 @@ def show_user_page():
                 })
 
             st.dataframe(pd.DataFrame(display_rows), width='stretch', hide_index=True)
-            st.caption("Qty = SKUs (Purchase Order) · medicines (Arrangement / Placement) · items (Register / Cross Check) · calls (Call Log)")
+            st.caption("Qty = SKUs (Purchase Order) · medicines (Arrangement) · items (Register / Cross Check) · calls (Call Log)")
             total_duration = round(total_duration, 1)
 
             # Smart Summary based on team
@@ -4241,48 +4278,33 @@ def show_user_page():
                     s1,s2,s3,s4 = st.columns(4)
                     with s1: st.metric("📒 Register Entries", f"{len(reg_rows)} | {reg_items} items")
                     with s2: st.metric("✔️ Bills Cross Checked", f"{len(cc_rows)} | {cc_items} items")
-                    with s3: st.metric("📤 Uploads | 📍 Placements", f"{len(up_rows)} | {len(place_rows)}")
+                    with s3: st.metric("📤 Bill Uploads", len(up_rows))
                     with s4: st.metric("⏱️ Avg secs/item (check)", f"{round(cc_secs/cc_items,1) if cc_items else 0} secs")
             elif team == "Stock":
-                # Calculate stock metrics
-                reg_entries   = [row for _, row in df.iterrows() if row.get("task_type") == "Register Entry"]
-                cross_checks  = [row for _, row in df.iterrows() if row.get("task_type") == "Bill Cross Check"]
-                bill_uploads  = [row for _, row in df.iterrows() if row.get("task_type") in ["Bill Upload","Bill Upload (Arrangement)"]]
-                placements    = [row for _, row in df.iterrows() if row.get("task_type") == "Stock Placement"]
-                place_checks  = [row for _, row in df.iterrows() if row.get("task_type") == "Placement Cross Check"]
-                rack_cleaning = [row for _, row in df.iterrows() if row.get("task_type") == "Rack Cleaning"]
-                inventory     = [row for _, row in df.iterrows() if row.get("task_type") == "Inventory Check"]
+                # placement is no longer done in this app -> not shown
+                rows_ = [row for _, row in df.iterrows()]
+                reg_entries   = [r for r in rows_ if r.get("task_type") == "Register Entry"]
+                cross_checks  = [r for r in rows_ if r.get("task_type") == "Bill Cross Check"]
+                bill_uploads  = [r for r in rows_ if r.get("task_type") in ("Bill Upload (Software)", "Bill Upload", "Bill Upload (Arrangement)")]
+                returns_      = [r for r in rows_ if r.get("task_type") == "Purchase Return"]
+                rack_cleaning = [r for r in rows_ if r.get("task_type") == "Rack Cleaning"]
+                inventory     = [r for r in rows_ if r.get("task_type") == "Inventory Check"]
+                n_items = lambda rs: sum(int(_to_float((r.get("details") or {}).get("no_items"), 0)) for r in rs)
+                items_received, items_checked = n_items(reg_entries), n_items(cross_checks)
+                cc_secs = sum(task_secs(r) for r in cross_checks)
 
-                # Items metrics
-                items_received = sum([int(float((row.get("details") or {}).get("no_items",0) or 0)) for row in reg_entries])
-                items_checked  = sum([int(float((row.get("details") or {}).get("no_items",0) or 0)) for row in cross_checks])
-                meds_placed    = sum([int(float((row.get("details") or {}).get("no_medicines",0) or 0)) for row in placements])
-
-                # Avg time metrics
-                cross_dur = sum([int(row.get("duration_mins",0) or 0) for row in cross_checks])
-                place_dur = sum([int(row.get("duration_mins",0) or 0) for row in placements])
-                avg_cross = round(cross_dur/items_checked, 2) if items_checked > 0 else 0
-                avg_place = round(place_dur/meds_placed, 2) if meds_placed > 0 else 0
-
-                # Issues found
-                issues = sum([1 for row in place_checks if "No" in str((row.get("details") or {}).get("placement_issues",""))])
-
-                with c2: st.metric("Total Items Handled", items_received + items_checked + meds_placed)
-                with c4: st.metric("Avg mins/Item (Check)", f"{avg_cross} mins")
+                with c2: st.metric("Total Items Handled", items_received + items_checked)
+                with c4: st.metric("⏱️ Avg secs/Item (Check)", f"{round(cc_secs / items_checked, 1) if items_checked else 0} secs")
 
                 st.divider()
-                r1,r2,r3,r4 = st.columns(4)
+                r1, r2, r3 = st.columns(3)
                 with r1: st.metric("📒 Register Entry", f"{len(reg_entries)} | {items_received} items")
                 with r2: st.metric("✔️ Bill Cross Check", f"{len(cross_checks)} | {items_checked} items")
                 with r3: st.metric("📤 Bill Upload", len(bill_uploads))
-                with r4: st.metric("📍 Stock Placed", f"{len(placements)} | {meds_placed} meds")
-
-                st.divider()
-                r5,r6,r7,r8 = st.columns(4)
-                with r5: st.metric("⏱️ Avg mins/Med (Place)", f"{avg_place} mins")
-                with r6: st.metric("🔍 Placement Checks", len(place_checks))
-                with r7: st.metric("⚠️ Issues Found", issues)
-                with r8: st.metric("🧹 Rack Cleaning", len(rack_cleaning))
+                r4, r5, r6 = st.columns(3)
+                with r4: st.metric("↩️ Purchase Return", len(returns_))
+                with r5: st.metric("🧹 Rack Cleaning", len(rack_cleaning))
+                with r6: st.metric("📊 Inventory Check", len(inventory))
             else:
                 with c2: st.metric("Total Count", total_sku)
                 with c4: st.metric("Avg/Item", f"{overall_avg} mins")
