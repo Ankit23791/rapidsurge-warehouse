@@ -331,6 +331,9 @@ def calc_actual_duration(df):
 def upload_image(file, prefix="img"):
     if file is None:
         return ""
+    base = st.session_state.get("_photo_bases", {}).pop(getattr(file, "file_id", id(file)), None)
+    if base:   # photo-first box: clear it for the next entry
+        st.session_state[base + "_v"] = st.session_state.get(base + "_v", 0) + 1
     try:
         name = f"{prefix}_{now_ist().strftime('%Y%m%d_%H%M%S')}.jpg"
         supabase.storage.from_("Images").upload(
@@ -342,6 +345,13 @@ def upload_image(file, prefix="img"):
     except Exception as e:
         st.error(f"Image upload error: {e}")
         return ""
+
+def photo_key(base):
+    """uploader key that changes after a successful save -> next entry starts with an empty photo box"""
+    return f"{base}_{st.session_state.get(base + '_v', 0)}"
+
+def remember_photo(file, base):
+    st.session_state.setdefault("_photo_bases", {})[getattr(file, "file_id", id(file))] = base
 
 # ── LOGIN ─────────────────────────────────────────────────────────────────────
 def show_login():
@@ -672,11 +682,7 @@ def form_bounce_medicine():
             no_useful   = st.number_input("No of New Useful Medicines Found", min_value=0, step=1)
         with c2:
             st.markdown("📸 **Image of Medicine List**")
-            upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="bounce_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="bounce_upload")
-        else:
-            img = st.camera_input("Take Photo", key="bounce_cam")
+        img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key="bounce_upload")
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             end_time, duration = end_timer("bounce", start)
@@ -834,6 +840,12 @@ def form_bill_upload():
     start = timer_button("bill_upload_normal", "Bill Upload")
     if start is None:
         return
+    st.markdown("📸 **Bill Image (Mandatory)**")
+    img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png","pdf"], key=photo_key("bu_upload"))
+    if img is None:
+        st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
+        return
+    remember_photo(img, "bu_upload")
     with st.form("bill_upload_form", clear_on_submit=True):
         c1,c2 = st.columns(2)
         with c1:
@@ -843,12 +855,6 @@ def form_bill_upload():
         with c2:
             delivery_by  = st.selectbox("Delivery By", ["Porter","Naresh","Sandeep","Distributor"], key="bu_del")
             order_type   = st.selectbox("Order Type", ["Regular","Arrangement"], key="bu_type")
-        st.markdown("📸 **Bill Image**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="bu_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            img = st.file_uploader("Select Image", type=["jpg","jpeg","png","pdf"], key="bu_upload")
-        else:
-            img = st.camera_input("Take Photo", key="bu_cam")
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if not bill_no:
@@ -1116,104 +1122,104 @@ def form_pickup():
     if auto_dist:
         st.success(f"✅ Auto-filled: **{auto_dist}** | **{auto_arr}**")
 
-    with st.form("pickup_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            # Show auto-filled values as text info
-            st.markdown(f"**Distributor:** {auto_dist if auto_dist else 'Select below'}")
-            distributor = st.selectbox("Change Distributor (if needed)",
-                dist_options(auto_dist),
-                index=dist_options(auto_dist).index(auto_dist) if auto_dist else 0,
-                key="pu_dist")
-            st.markdown(f"**Arrangement:** {auto_arr if auto_arr else 'Select below'}")
-            arr_select = st.selectbox("Change Arrangement (if needed)",
-                arr_keys,
-                index=arr_keys.index(auto_arr) if auto_arr in arr_keys else 0,
-                key="pu_arr")
-            delivery_by = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
-        with c2:
-            no_sku_received = st.number_input("No of SKUs Actually Received", min_value=0, step=1)
-            time_reached    = st.time_input("Time Reached Distributor", key="pu_reached")
-            time_handover   = st.time_input("Handover Received Time", key="pu_handover")
+    st.markdown("**📸 Image of Medicine Received**")
+    medicine_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("pu_upload"))
+    if medicine_img is None:
+        st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
+    else:
+        remember_photo(medicine_img, "pu_upload")
+        with st.form("pickup_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                # Show auto-filled values as text info
+                st.markdown(f"**Distributor:** {auto_dist if auto_dist else 'Select below'}")
+                distributor = st.selectbox("Change Distributor (if needed)",
+                    dist_options(auto_dist),
+                    index=dist_options(auto_dist).index(auto_dist) if auto_dist else 0,
+                    key="pu_dist")
+                st.markdown(f"**Arrangement:** {auto_arr if auto_arr else 'Select below'}")
+                arr_select = st.selectbox("Change Arrangement (if needed)",
+                    arr_keys,
+                    index=arr_keys.index(auto_arr) if auto_arr in arr_keys else 0,
+                    key="pu_arr")
+                delivery_by = st.selectbox("Delivery By", ["Self Pick","Distributor"], key="pu_delby")
+            with c2:
+                no_sku_received = st.number_input("No of SKUs Actually Received", min_value=0, step=1)
+                time_reached    = st.time_input("Time Reached Distributor", key="pu_reached")
+                time_handover   = st.time_input("Handover Received Time", key="pu_handover")
 
-        # Show invoice image if arrangement selected
-        if arr_select != "—":
-            selected_arr = arr_options[arr_select]
-            no_medicines = selected_arr.get("no_medicines", "N/A")
-            bill_id      = selected_arr.get("bill_order_id", "N/A")
-            area         = selected_arr.get("area", "N/A")
-            st.info(f"📋 Area: **{area}** | Bill/Order ID: **{bill_id}** | Medicines to Pick: **{no_medicines}**")
+            # Show invoice image if arrangement selected
+            if arr_select != "—":
+                selected_arr = arr_options[arr_select]
+                no_medicines = selected_arr.get("no_medicines", "N/A")
+                bill_id      = selected_arr.get("bill_order_id", "N/A")
+                area         = selected_arr.get("area", "N/A")
+                st.info(f"📋 Area: **{area}** | Bill/Order ID: **{bill_id}** | Medicines to Pick: **{no_medicines}**")
 
-        # Porter details
-        st.markdown("**Porter Details (if applicable)**")
-        c3, c4 = st.columns(2)
-        with c3:
-            porter_no     = st.text_input("Porter No", placeholder="Leave blank if not applicable")
-        with c4:
-            porter_pickup = st.time_input("Porter Pickup Time", key="pu_porter")
+            # Porter details
+            st.markdown("**Porter Details (if applicable)**")
+            c3, c4 = st.columns(2)
+            with c3:
+                porter_no     = st.text_input("Porter No", placeholder="Leave blank if not applicable")
+            with c4:
+                porter_pickup = st.time_input("Porter Pickup Time", key="pu_porter")
 
-        # Medicine received image
-        st.markdown("**📸 Image of Medicine Received**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="pu_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            medicine_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="pu_upload")
-        else:
-            medicine_img = st.camera_input("Take Photo", key="pu_cam")
+            # Medicine received image
 
-        remarks = st.text_input("Remarks")
+            remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
-            if not medicine_img:
-                st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
-            else:
-                arr_id = None
-                arr_no = None
-                if arr_select != "—":
-                    selected_arr = arr_options[arr_select]
-                    arr_id = selected_arr["id"]
-                    arr_no = selected_arr.get("arrangement_no")
+            if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
+                if not medicine_img:
+                    st.error("⚠️ Image of medicine received is mandatory! Please upload or take photo.")
+                else:
+                    arr_id = None
+                    arr_no = None
+                    if arr_select != "—":
+                        selected_arr = arr_options[arr_select]
+                        arr_id = selected_arr["id"]
+                        arr_no = selected_arr.get("arrangement_no")
 
-                med_img_name = upload_image(medicine_img, "pickup") if medicine_img else ""
+                    med_img_name = upload_image(medicine_img, "pickup") if medicine_img else ""
 
-                try:
-                    supabase.table("daily_tasks").insert({
-                        "date": date_str(),
-                        "time": time_str(),
-                        "person": st.session_state.name,
-                        "team": "Delivery",
-                        "task_type": "Pickup",
-                        "details": {
-                            "distributor": distributor,
-                            "arrangement_no": str(arr_no) if arr_no else "",
-                            "delivery_by": delivery_by,
-                            "pickup_by": st.session_state.name,
-                            "no_sku_received": str(no_sku_received),
-                            "time_reached": str(time_reached),
-                            "time_handover": str(time_handover),
-                            "porter_no": porter_no,
-                            "porter_pickup_time": str(porter_pickup) if porter_no else "",
-                        "medicine_image": med_img_name,
-                            "remarks": remarks
-                        },
-                        "start_time": str(time_reached),
-                        "end_time": str(time_handover),
-                    }).execute()
+                    try:
+                        supabase.table("daily_tasks").insert({
+                            "date": date_str(),
+                            "time": time_str(),
+                            "person": st.session_state.name,
+                            "team": "Delivery",
+                            "task_type": "Pickup",
+                            "details": {
+                                "distributor": distributor,
+                                "arrangement_no": str(arr_no) if arr_no else "",
+                                "delivery_by": delivery_by,
+                                "pickup_by": st.session_state.name,
+                                "no_sku_received": str(no_sku_received),
+                                "time_reached": str(time_reached),
+                                "time_handover": str(time_handover),
+                                "porter_no": porter_no,
+                                "porter_pickup_time": str(porter_pickup) if porter_no else "",
+                            "medicine_image": med_img_name,
+                                "remarks": remarks
+                            },
+                            "start_time": str(time_reached),
+                            "end_time": str(time_handover),
+                        }).execute()
 
-                    if arr_id:
-                        supabase.table("arrangements").update({
-                            "status": "Picked Up - In Transit",
-                            "pickup_by": st.session_state.name,
-                            "pickup_time": str(time_reached),
-                            "handover_type": delivery_by,
-                            "porter_no": porter_no,
-                            "no_sku_received": str(no_sku_received),
-                        }).eq("id", arr_id).execute()
+                        if arr_id:
+                            supabase.table("arrangements").update({
+                                "status": "Picked Up - In Transit",
+                                "pickup_by": st.session_state.name,
+                                "pickup_time": str(time_reached),
+                                "handover_type": delivery_by,
+                                "porter_no": porter_no,
+                                "no_sku_received": str(no_sku_received),
+                            }).eq("id", arr_id).execute()
 
-                    st.success("✅ Pickup entry submitted!")
-                    st.balloons()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                        st.success("✅ Pickup entry submitted!")
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
 # ── DELIVERY FORM ─────────────────────────────────────────────────────────────
 def form_delivery():
@@ -1429,13 +1435,8 @@ def form_stock_placement():
 
         st.divider()
         st.markdown("**📸 Photo of Placement Area**")
-        upload_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
-            key="sp_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            placement_img = st.file_uploader("Select Image",
+        placement_img = st.file_uploader("📷 Take photo or choose file",
                 type=["jpg","jpeg","png"], key="sp_upload")
-        else:
-            placement_img = st.camera_input("Take Photo", key="sp_cam")
 
         remarks = st.text_input("Remarks")
 
@@ -1753,85 +1754,85 @@ def form_register_entry():
         except Exception as e:
             st.error(f"Error: {e}")
 
-    with st.form("register_entry_form", clear_on_submit=True):
-        c1,c2 = st.columns(2)
-        with c1:
-            dist_idx    = dist_options(arr_dist).index(arr_dist) if arr_dist else 0
-            distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}")
-            bill_no     = st.text_input("Bill Number *")
-        with c2:
-            no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
-            delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key="re_delby")
-            try:
-                areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
-                area_options = [a["name"] for a in (areas_resp.data or [])]
-            except:
-                area_options = ["Gaur City","Sector 78","Indirapuram"]
-            default_re_area = 0
-            if arr_area and arr_area in area_options:
-                default_re_area = area_options.index(arr_area)
-            elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
-                default_re_area = area_options.index(st.session_state.work_area)
-            re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}")
-
-        st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
-        st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="re_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            invoice_img = st.file_uploader("Select Packet Image", type=["jpg","jpeg","png"], key="re_upload")
-        else:
-            invoice_img = st.camera_input("Take Photo of Packet", key="re_cam")
-
-        bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
-        remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
-
-        if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
-            if not bill_no or no_items == 0:
-                st.error("Fill Bill Number and No of Items!")
-            elif order_type == "Arrangement" and not arr_no:
-                st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
-            elif not invoice_img:
-                st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
-            else:
-                img_name = upload_image(invoice_img, "invoice") if invoice_img else ""
-                # Check duplicate bill number - show warning
+    st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
+    st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
+    invoice_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("re_upload"))
+    if invoice_img is None:
+        st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
+    else:
+        remember_photo(invoice_img, "re_upload")
+        with st.form("register_entry_form", clear_on_submit=True):
+            c1,c2 = st.columns(2)
+            with c1:
+                dist_idx    = dist_options(arr_dist).index(arr_dist) if arr_dist else 0
+                distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}")
+                bill_no     = st.text_input("Bill Number *")
+            with c2:
+                no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
+                delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key="re_delby")
                 try:
-                    dup_check = supabase.table("daily_tasks").select("*")\
-                        .eq("task_type", "Register Entry")\
-                        .eq("date", date_str())\
-                        .execute()
-                    existing_bills = [t.get("details",{}).get("bill_no","").strip()
-                                     for t in (dup_check.data or [])]
-                    if bill_no.strip() in existing_bills:
-                        st.warning(f"⚠️ Bill No **{bill_no}** already entered today!")
+                    areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
+                    area_options = [a["name"] for a in (areas_resp.data or [])]
                 except:
-                    pass
-                try:
-                    supabase.table("daily_tasks").insert({
-                        "date": date_str(),
-                        "time": time_str(),
-                        "person": st.session_state.name,
-                        "team": st.session_state.team,
-                        "task_type": "Register Entry",
-                        "details": {
-                            "order_type": order_type,
-                            "distributor": distributor,
-                            "bill_no": bill_no,
-                            "bill_amount": str(bill_amount),
-                            "no_items": str(no_items),
-                            "delivery_by": delivery_by,
-                            "arrangement_no": arr_no,
-                            "area": re_area,
-                            "invoice_image": img_name,
-                            "remarks": remarks
-                        },
-                        "start_time": time_str(),
-                        "end_time": time_str(),
-                    }).execute()
-                    st.success(f"✅ Register entry done! {no_items} items from {distributor} received!")
-                    st.balloons()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                    area_options = ["Gaur City","Sector 78","Indirapuram"]
+                default_re_area = 0
+                if arr_area and arr_area in area_options:
+                    default_re_area = area_options.index(arr_area)
+                elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
+                    default_re_area = area_options.index(st.session_state.work_area)
+                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}")
+
+
+            bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
+            remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
+
+            if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
+                if not bill_no or no_items == 0:
+                    st.error("Fill Bill Number and No of Items!")
+                elif order_type == "Arrangement" and not arr_no:
+                    st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
+                elif not invoice_img:
+                    st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
+                else:
+                    img_name = upload_image(invoice_img, "invoice") if invoice_img else ""
+                    # Check duplicate bill number - show warning
+                    try:
+                        dup_check = supabase.table("daily_tasks").select("*")\
+                            .eq("task_type", "Register Entry")\
+                            .eq("date", date_str())\
+                            .execute()
+                        existing_bills = [t.get("details",{}).get("bill_no","").strip()
+                                         for t in (dup_check.data or [])]
+                        if bill_no.strip() in existing_bills:
+                            st.warning(f"⚠️ Bill No **{bill_no}** already entered today!")
+                    except:
+                        pass
+                    try:
+                        supabase.table("daily_tasks").insert({
+                            "date": date_str(),
+                            "time": time_str(),
+                            "person": st.session_state.name,
+                            "team": st.session_state.team,
+                            "task_type": "Register Entry",
+                            "details": {
+                                "order_type": order_type,
+                                "distributor": distributor,
+                                "bill_no": bill_no,
+                                "bill_amount": str(bill_amount),
+                                "no_items": str(no_items),
+                                "delivery_by": delivery_by,
+                                "arrangement_no": arr_no,
+                                "area": re_area,
+                                "invoice_image": img_name,
+                                "remarks": remarks
+                            },
+                            "start_time": time_str(),
+                            "end_time": time_str(),
+                        }).execute()
+                        st.success(f"✅ Register entry done! {no_items} items from {distributor} received!")
+                        st.balloons()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
 # ── BILL CROSS CHECK & UPLOAD FORMS ──────────────────────────────────────────
 
@@ -2050,109 +2051,109 @@ def form_bill_crosscheck():
     # Customer order items linked to this arrangement -> confirm received qty here
     cust_items = customer_items_editor(selected_data) if item_type == "arrangement" else None
 
-    with st.form("bill_crosscheck_form", clear_on_submit=True):
-        bill_no = st.text_input("Bill Number", value=default_bill, key=f"bc_billno_{item_type}_{selected_data.get('id','')}")
+    st.markdown("📸 **Image of Physical Bill After Cross Check (Mandatory)**")
+    st.caption("⚠️ Take photo of bill after you have checked and marked it — this is your proof of checking!")
+    bill_check_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key=photo_key("cc_img_upload"))
+    if bill_check_img is None:
+        st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
+    else:
+        remember_photo(bill_check_img, "cc_img_upload")
+        with st.form("bill_crosscheck_form", clear_on_submit=True):
+            bill_no = st.text_input("Bill Number", value=default_bill, key=f"bc_billno_{item_type}_{selected_data.get('id','')}")
 
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            no_items     = st.number_input("No of Items Checked *", min_value=0, step=1)
-            near_expiry  = st.number_input("Near Expiry Items", min_value=0, step=1)
-            damaged      = st.number_input("Damaged Items", min_value=0, step=1)
-        with c2:
-            contra       = st.number_input("Contra Items (Wrong Medicine)", min_value=0, step=1)
-            wrong_batch  = st.number_input("Wrong Batch", min_value=0, step=1)
-            wrong_disc   = st.number_input("Wrong Discount", min_value=0, step=1)
-        with c3:
-            wrong_calc   = st.number_input("Wrong Calculation", min_value=0, step=1)
-            shortage     = st.number_input("Shortage Items", min_value=0, step=1)
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                no_items     = st.number_input("No of Items Checked *", min_value=0, step=1)
+                near_expiry  = st.number_input("Near Expiry Items", min_value=0, step=1)
+                damaged      = st.number_input("Damaged Items", min_value=0, step=1)
+            with c2:
+                contra       = st.number_input("Contra Items (Wrong Medicine)", min_value=0, step=1)
+                wrong_batch  = st.number_input("Wrong Batch", min_value=0, step=1)
+                wrong_disc   = st.number_input("Wrong Discount", min_value=0, step=1)
+            with c3:
+                wrong_calc   = st.number_input("Wrong Calculation", min_value=0, step=1)
+                shortage     = st.number_input("Shortage Items", min_value=0, step=1)
 
-        st.divider()
-        st.markdown("📸 **Image of Physical Bill After Cross Check (Mandatory)**")
-        st.caption("⚠️ Take photo of bill after you have checked and marked it — this is your proof of checking!")
-        upload_opt_cc = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="cc_img_radio", label_visibility="collapsed")
-        if upload_opt_cc == "Upload":
-            bill_check_img = st.file_uploader("Select Bill Image", type=["jpg","jpeg","png"], key="cc_img_upload")
-        else:
-            bill_check_img = st.camera_input("Take Photo of Bill", key="cc_img_cam")
+            st.divider()
 
-        st.markdown("📝 **Comments/Notes on Bill**")
-        bill_comments = st.text_area("Write any comments, notes or issues found on bill",
-            placeholder="e.g. Batch no written incorrectly, discount not matching, item substituted...")
+            st.markdown("📝 **Comments/Notes on Bill**")
+            bill_comments = st.text_area("Write any comments, notes or issues found on bill",
+                placeholder="e.g. Batch no written incorrectly, discount not matching, item substituted...")
 
-        st.markdown("---")
-        st.markdown("📹 **Video Evidence (Optional)**")
-        st.markdown("[📁 Open RapidSurge Stock Videos Folder](https://drive.google.com/drive/folders/1DbkuKSFeftMVpVFqVwcRRDssc49X9YJQ)")
-        st.caption("Record video → Upload to folder → Copy link → Paste below")
-        video_link = st.text_input("Paste Video Link", placeholder="https://drive.google.com/file/d/...")
-        remarks = st.text_input("Remarks")
+            st.markdown("---")
+            st.markdown("📹 **Video Evidence (Optional)**")
+            st.markdown("[📁 Open RapidSurge Stock Videos Folder](https://drive.google.com/drive/folders/1DbkuKSFeftMVpVFqVwcRRDssc49X9YJQ)")
+            st.caption("Record video → Upload to folder → Copy link → Paste below")
+            video_link = st.text_input("Paste Video Link", placeholder="https://drive.google.com/file/d/...")
+            remarks = st.text_input("Remarks")
 
-        if st.form_submit_button("Submit Cross Check ✅", type="primary", width='stretch'):
-            if no_items < 1:
-                st.error("Enter No of Items Checked (at least 1)!")
-                return
-            end_time, duration = end_timer("bill_crosscheck", start)
-            # Calculate avg time per item
-            avg_time = round(duration / no_items, 2) if no_items > 0 else 0
+            if st.form_submit_button("Submit Cross Check ✅", type="primary", width='stretch'):
+                if no_items < 1:
+                    st.error("Enter No of Items Checked (at least 1)!")
+                    return
+                end_time, duration = end_timer("bill_crosscheck", start)
+                # Calculate avg time per item
+                avg_time = round(duration / no_items, 2) if no_items > 0 else 0
 
-            try:
-                # Update status based on type
-                if item_type == "arrangement":
-                    supabase.table("arrangements").update({
-                        "status": "Bill Cross Checked",
-                        "cross_checked_by": st.session_state.name,
-                        "cross_check_time": end_time,
-                    }).eq("id", selected_data["id"]).execute()
-                    dist = selected_data.get("distributor","")
-                    arr_no = selected_data.get("arrangement_no","")
-                    if cust_items is not None and not cust_items.empty:
-                        n_ok, n_short = save_customer_receipts(cust_items)
-                        st.info(f"🧾 Customer items: {n_ok} received · {n_short} short")
-                else:
-                    # Mark normal order as cross checked
-                    d = selected_data.get("details",{})
-                    d["cross_checked"] = True
-                    d["cross_checked_by"] = st.session_state.name
-                    d["cross_check_time"] = end_time
-                    supabase.table("daily_tasks").update({
-                        "details": d
-                    }).eq("id", selected_data["id"]).execute()
-                    dist = d.get("distributor","")
-                    arr_no = ""
+                try:
+                    # Update status based on type
+                    if item_type == "arrangement":
+                        supabase.table("arrangements").update({
+                            "status": "Bill Cross Checked",
+                            "cross_checked_by": st.session_state.name,
+                            "cross_check_time": end_time,
+                        }).eq("id", selected_data["id"]).execute()
+                        dist = selected_data.get("distributor","")
+                        arr_no = selected_data.get("arrangement_no","")
+                        if cust_items is not None and not cust_items.empty:
+                            n_ok, n_short = save_customer_receipts(cust_items)
+                            st.info(f"🧾 Customer items: {n_ok} received · {n_short} short")
+                    else:
+                        # Mark normal order as cross checked
+                        d = selected_data.get("details",{})
+                        d["cross_checked"] = True
+                        d["cross_checked_by"] = st.session_state.name
+                        d["cross_check_time"] = end_time
+                        supabase.table("daily_tasks").update({
+                            "details": d
+                        }).eq("id", selected_data["id"]).execute()
+                        dist = d.get("distributor","")
+                        arr_no = ""
 
-                # Save to daily tasks
-                supabase.table("daily_tasks").insert({
-                    "date": date_str(), "time": time_str(),
-                    "person": st.session_state.name, "team": st.session_state.team,
-                    "task_type": "Bill Cross Check",
-                    "details": {
-                        "arrangement_no": arr_no,
-                        "bill_no": bill_no,
-                        "no_items": str(no_items),
-                        "near_expiry": str(near_expiry),
-                        "damaged": str(damaged),
-                        "contra": str(contra),
-                        "wrong_batch": str(wrong_batch),
-                        "wrong_discount": str(wrong_disc),
-                        "wrong_calculation": str(wrong_calc),
-                        "shortage": str(shortage),
-                        "avg_time_per_item": str(avg_time),
-                        "remarks": remarks,
-                        "bill_comments": bill_comments,
-                        "video_link": video_link,
-                        "bill_check_image": upload_image(bill_check_img, "bill_check") if bill_check_img else "",
-                        "area": bc_area if bc_area != "All Areas" else "",
-                        "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor","")
-                    },
-                    "start_time": start.strftime("%I:%M:%S %p"),
-                    "end_time": end_time,
-                    "duration_mins": str(duration)
-                }).execute()
+                    # Save to daily tasks
+                    supabase.table("daily_tasks").insert({
+                        "date": date_str(), "time": time_str(),
+                        "person": st.session_state.name, "team": st.session_state.team,
+                        "task_type": "Bill Cross Check",
+                        "details": {
+                            "arrangement_no": arr_no,
+                            "bill_no": bill_no,
+                            "no_items": str(no_items),
+                            "near_expiry": str(near_expiry),
+                            "damaged": str(damaged),
+                            "contra": str(contra),
+                            "wrong_batch": str(wrong_batch),
+                            "wrong_discount": str(wrong_disc),
+                            "wrong_calculation": str(wrong_calc),
+                            "shortage": str(shortage),
+                            "avg_time_per_item": str(avg_time),
+                            "remarks": remarks,
+                            "bill_comments": bill_comments,
+                            "video_link": video_link,
+                            "bill_check_image": upload_image(bill_check_img, "bill_check") if bill_check_img else "",
+                            "area": bc_area if bc_area != "All Areas" else "",
+                            "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor","")
+                        },
+                        "start_time": start.strftime("%I:%M:%S %p"),
+                        "end_time": end_time,
+                        "duration_mins": str(duration)
+                    }).execute()
 
-                st.success(f"✅ Bill Cross Check done! Avg time per item: {avg_time} mins")
-                st.balloons()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
+                    st.success(f"✅ Bill Cross Check done! Avg time per item: {avg_time} mins")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 def form_bill_upload_arrangement():
     st.subheader("📤 Bill Upload (Software Screenshot)")
@@ -2231,102 +2232,101 @@ def form_bill_upload_arrangement():
         d = n.get("details",{})
         all_options[f"NORMAL: {d.get('distributor','')} — Bill: {d.get('bill_no','')} — Items: {d.get('no_items','')}"] = {"type": "normal", "data": n}
 
-    with st.form("bill_upload_arr_form", clear_on_submit=True):
-        selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="ba_arr")
-        selected_item  = all_options[selected_label]
-        item_type      = selected_item["type"]
-        selected_data  = selected_item["data"]
+    st.markdown("📸 **Software Bill Screenshot (Mandatory)**")
+    bill_img = st.file_uploader("📷 Take photo or choose file",
+            type=["jpg","jpeg","png","pdf"], key=photo_key("ba_upload"))
+    if bill_img is None:
+        st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
+    else:
+        remember_photo(bill_img, "ba_upload")
+        with st.form("bill_upload_arr_form", clear_on_submit=True):
+            selected_label = st.selectbox("Select Item *", list(all_options.keys()), key="ba_arr")
+            selected_item  = all_options[selected_label]
+            item_type      = selected_item["type"]
+            selected_data  = selected_item["data"]
 
-        if item_type == "arrangement":
-            auto_bill_no = selected_data.get("bill_order_id","")
-            auto_dist    = selected_data.get("distributor","")
-            auto_area    = selected_data.get("area","")
-            auto_items   = 0
-            auto_amount  = 0.0
-            st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}** | Type: **Arrangement**")
-        else:
-            d = selected_data.get("details",{})
-            auto_bill_no = d.get("bill_no","")
-            auto_dist    = d.get("distributor","")
-            auto_area    = d.get("area","")
-            auto_items   = int(float(d.get("no_items",0) or 0))
-            auto_amount  = float(d.get("bill_amount",0) or 0)
-            st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Type: **Normal Order**")
-
-        c1,c2 = st.columns(2)
-        with c1:
-            bill_no   = st.text_input("Bill Number *", value=auto_bill_no)
-            bill_date = st.date_input("Bill Date")
-            bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount)
-        with c2:
-            no_items  = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
-
-        st.markdown("📸 **Software Bill Screenshot (Mandatory)**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True,
-            key="ba_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            bill_img = st.file_uploader("Select Bill Screenshot",
-                type=["jpg","jpeg","png","pdf"], key="ba_upload")
-        else:
-            bill_img = st.camera_input("Take Photo", key="ba_cam")
-
-        remarks = st.text_input("Remarks")
-
-        if st.form_submit_button("Upload Bill ✅", type="primary", width='stretch'):
-            if not bill_no:
-                st.error("Enter Bill Number!")
-            elif not bill_img:
-                st.error("⚠️ Bill screenshot is mandatory!")
+            if item_type == "arrangement":
+                auto_bill_no = selected_data.get("bill_order_id","")
+                auto_dist    = selected_data.get("distributor","")
+                auto_area    = selected_data.get("area","")
+                auto_items   = 0
+                auto_amount  = 0.0
+                st.info(f"📋 Distributor: **{auto_dist}** | Area: **{auto_area}** | Type: **Arrangement**")
             else:
-                end_time, duration = end_timer("bill_upload", start)
-                img_name = upload_image(bill_img, "bill_arr") if bill_img else ""
-                try:
-                    if item_type == "arrangement":
-                        supabase.table("arrangements").update({
-                            "status": "Bill Uploaded",
-                            "bill_uploaded_by": st.session_state.name,
-                            "bill_upload_time": time_str(),
-                            "bill_image_arr": img_name,
-                        }).eq("id", selected_data["id"]).execute()
-                        arr_no = selected_data.get("arrangement_no","")
-                        dist   = selected_data.get("distributor","")
-                    else:
-                        d = selected_data.get("details",{})
-                        d["bill_uploaded"] = True
-                        d["bill_uploaded_by"] = st.session_state.name
-                        d["bill_upload_time"] = time_str()
-                        supabase.table("daily_tasks").update({
-                            "details": d
-                        }).eq("id", selected_data["id"]).execute()
-                        arr_no = ""
-                        dist   = d.get("distributor","")
+                d = selected_data.get("details",{})
+                auto_bill_no = d.get("bill_no","")
+                auto_dist    = d.get("distributor","")
+                auto_area    = d.get("area","")
+                auto_items   = int(float(d.get("no_items",0) or 0))
+                auto_amount  = float(d.get("bill_amount",0) or 0)
+                st.info(f"📋 Distributor: **{auto_dist}** | Bill: **{auto_bill_no}** | Items: **{auto_items}** | Type: **Normal Order**")
 
-                    supabase.table("daily_tasks").insert({
-                        "date": date_str(), "time": time_str(),
-                        "person": st.session_state.name, "team": st.session_state.team,
-                        "task_type": "Bill Upload (Software)",
-                        "details": {
-                            "arrangement_no": arr_no,
-                            "distributor": dist,
-                            "bill_no": bill_no,
-                            "bill_date": str(bill_date),
-                            "bill_amount": str(bill_amt),
-                            "no_items": str(no_items),
-                            "order_type": item_type,
-                            "bill_image": img_name,
-                            "remarks": remarks
-                        },
-                        "start_time": start.strftime("%I:%M:%S %p"),
-                        "end_time": end_time,
-                        "duration_mins": str(duration),
-                        "status": "Completed"
-                    }).execute()
+            c1,c2 = st.columns(2)
+            with c1:
+                bill_no   = st.text_input("Bill Number *", value=auto_bill_no)
+                bill_date = st.date_input("Bill Date")
+                bill_amt  = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, value=auto_amount)
+            with c2:
+                no_items  = st.number_input("No of Items", min_value=0, step=1, value=auto_items)
 
-                    st.success("✅ Bill uploaded successfully!")
-                    st.balloons()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+
+            remarks = st.text_input("Remarks")
+
+            if st.form_submit_button("Upload Bill ✅", type="primary", width='stretch'):
+                if not bill_no:
+                    st.error("Enter Bill Number!")
+                elif not bill_img:
+                    st.error("⚠️ Bill screenshot is mandatory!")
+                else:
+                    end_time, duration = end_timer("bill_upload", start)
+                    img_name = upload_image(bill_img, "bill_arr") if bill_img else ""
+                    try:
+                        if item_type == "arrangement":
+                            supabase.table("arrangements").update({
+                                "status": "Bill Uploaded",
+                                "bill_uploaded_by": st.session_state.name,
+                                "bill_upload_time": time_str(),
+                                "bill_image_arr": img_name,
+                            }).eq("id", selected_data["id"]).execute()
+                            arr_no = selected_data.get("arrangement_no","")
+                            dist   = selected_data.get("distributor","")
+                        else:
+                            d = selected_data.get("details",{})
+                            d["bill_uploaded"] = True
+                            d["bill_uploaded_by"] = st.session_state.name
+                            d["bill_upload_time"] = time_str()
+                            supabase.table("daily_tasks").update({
+                                "details": d
+                            }).eq("id", selected_data["id"]).execute()
+                            arr_no = ""
+                            dist   = d.get("distributor","")
+
+                        supabase.table("daily_tasks").insert({
+                            "date": date_str(), "time": time_str(),
+                            "person": st.session_state.name, "team": st.session_state.team,
+                            "task_type": "Bill Upload (Software)",
+                            "details": {
+                                "arrangement_no": arr_no,
+                                "distributor": dist,
+                                "bill_no": bill_no,
+                                "bill_date": str(bill_date),
+                                "bill_amount": str(bill_amt),
+                                "no_items": str(no_items),
+                                "order_type": item_type,
+                                "bill_image": img_name,
+                                "remarks": remarks
+                            },
+                            "start_time": start.strftime("%I:%M:%S %p"),
+                            "end_time": end_time,
+                            "duration_mins": str(duration),
+                            "status": "Completed"
+                        }).execute()
+
+                        st.success("✅ Bill uploaded successfully!")
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
 
 def show_pickup_images():
@@ -2550,11 +2550,7 @@ def form_porter_handover():
             handover_time = st.time_input("Handover Time", key="ph_time")
 
         st.markdown("📸 **Image of Handover**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="ph_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            handover_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="ph_upload")
-        else:
-            handover_img = st.camera_input("Take Photo", key="ph_cam")
+        handover_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key="ph_upload")
 
         remarks = st.text_input("Remarks")
 
@@ -2749,12 +2745,7 @@ def form_porter_receive():
                 receive_time = st.time_input("Receive Time", key="dr_time")
 
             st.markdown("📸 **Image of Stock Received**")
-            upload_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
-                key="dr_radio", label_visibility="collapsed")
-            if upload_opt == "Upload":
-                recv_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="dr_upload")
-            else:
-                recv_img = st.camera_input("Take Photo", key="dr_cam")
+            recv_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key="dr_upload")
 
             remarks = st.text_input("Remarks", key="dr_remarks")
 
@@ -2840,13 +2831,8 @@ def form_porter_receive():
         arr_images = {}
         for arr_no in arr_nos:
             st.markdown(f"Arrangement #{arr_no}")
-            up_opt = st.radio("Select", ["Upload","Camera"], horizontal=True,
-                key=f"pr_radio_{arr_no}", label_visibility="collapsed")
-            if up_opt == "Upload":
-                img = st.file_uploader(f"Image for #{arr_no}",
+            img = st.file_uploader(f"📷 Photo for #{arr_no} — take photo or choose file",
                     type=["jpg","jpeg","png"], key=f"pr_upload_{arr_no}")
-            else:
-                img = st.camera_input(f"Photo for #{arr_no}", key=f"pr_cam_{arr_no}")
             arr_images[arr_no] = img
 
         remarks = st.text_input("Remarks")
@@ -2933,11 +2919,7 @@ def form_porter_payment():
             payment_time = st.time_input("Payment Time", key="pp_time")
 
         st.markdown("📸 **Payment Bill Image**")
-        upload_opt = st.radio("Image Option", ["Upload","Camera"], horizontal=True, key="pp_radio", label_visibility="collapsed")
-        if upload_opt == "Upload":
-            bill_img = st.file_uploader("Select Image", type=["jpg","jpeg","png"], key="pp_upload")
-        else:
-            bill_img = st.camera_input("Take Photo", key="pp_cam")
+        bill_img = st.file_uploader("📷 Take photo or choose file", type=["jpg","jpeg","png"], key="pp_upload")
 
         remarks = st.text_input("Remarks")
 
