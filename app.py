@@ -370,6 +370,7 @@ def show_login():
                 st.session_state.team = USERS[username]["team"]
                 st.session_state.role = USERS[username]["role"]
                 st.session_state.work_area = ""
+                st.session_state["fresh_login"] = True     # Stock: ask the area again after a real login
                 # Store login in URL for persistence
                 import hashlib
                 token = hashlib.md5((username + password).encode()).hexdigest()[:8]
@@ -429,17 +430,7 @@ def show_sidebar():
         # Show current work area for Stock team
         if st.session_state.team == "Stock" and st.session_state.work_area:
             st.markdown(f"📍 **Area:** {st.session_state.work_area}")
-            _lk = st.session_state.get("area_lock")
-            if not _lk:
-                if st.button("🔄 Change Area", width='stretch'):
-                    st.session_state.work_area = ""
-                    st.rerun()
-            elif area_self_fix_left(_lk):
-                if st.button(f"🔄 Change Area ({area_self_fix_left(_lk)} min)", width='stretch'):
-                    release_own_area(_lk)
-                    st.rerun()
-            else:
-                st.caption("🔒 Area locked — ask Admin / Dharmendra to change")
+            st.caption("To change area: Logout and log in again")
             st.divider()
 
                         # Pipeline buttons
@@ -2980,8 +2971,10 @@ def show_user_page():
     if team == "Stock":
         lock = get_area_lock(st.session_state.name)
         st.session_state["area_lock"] = lock
-        if lock and lock.get("area") and lock["area"] != st.session_state.work_area:
-            st.session_state.work_area = lock["area"]
+        if st.session_state.get("fresh_login") and not st.session_state.work_area:
+            pass                                            # just logged in -> choose area
+        elif lock and lock.get("area") and lock["area"] != st.session_state.work_area:
+            st.session_state.work_area = lock["area"]       # refresh / admin change
 
     # Area selection for Stock team
     if team == "Stock" and not st.session_state.work_area:
@@ -3000,9 +2993,10 @@ def show_user_page():
                 if st.button(f"📍 {area}", width='stretch', type="primary"):
                     set_area_lock(st.session_state.name, area, st.session_state.name)
                     st.session_state.work_area = area
+                    st.session_state["fresh_login"] = False
                     st.rerun()
-        st.caption(f"🔒 Your area stays fixed for {AREA_LOCK_HOURS} hours (you can change it within "
-                   f"{AREA_SELF_FIX_MINS} minutes if you tap the wrong one).")
+        st.caption("Your area stays fixed for the day, even if the page refreshes. "
+                   "To change it: Logout and log in again.")
         return
 
     c1,c2 = st.columns([4,1])
@@ -3220,10 +3214,8 @@ def show_user_page():
                     "Bills Received": len(normal_entries),
                     "Cross Check Pending": normal_cross_pending,
                     "Upload Pending": normal_upload_pending,
-                    "Placement Pending": normal_place_pending,
                     "Avg Check/SKU": f"{avg_time_per_sku(normal_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_time_per_sku(normal_upload_tasks)} mins",
-                    "Avg Place/SKU": f"{avg_time_per_sku(normal_place_tasks, 'no_medicines')} mins",
                 }]
                 st.dataframe(pd.DataFrame(normal_data), width='stretch', hide_index=True)
 
@@ -3235,10 +3227,8 @@ def show_user_page():
                     "Bills Received": len(arr_reached),
                     "Cross Check Pending": arr_cross_pend,
                     "Upload Pending": arr_upload_pend,
-                    "Placement Pending": arr_place_pend,
                     "Avg Check/SKU": f"{avg_time_per_sku(arr_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_time_per_sku(arr_upload_tasks)} mins",
-                    "Avg Place/SKU": f"{avg_time_per_sku(arr_place_tasks, 'no_medicines')} mins",
                 }]
                 st.dataframe(pd.DataFrame(arr_data), width='stretch', hide_index=True)
 
@@ -3568,10 +3558,6 @@ def show_user_page():
                 type="primary" if st.session_state.purchase_active_form=="crosscheck" else "secondary"):
                 st.session_state.purchase_active_form = "crosscheck"
                 st.rerun()
-            if st.button("📍 Stock Placement", width='stretch', key="p_placement",
-                type="primary" if st.session_state.purchase_active_form=="placement" else "secondary"):
-                st.session_state.purchase_active_form = "placement"
-                st.rerun()
             if st.button("✏️ Other", width='stretch', key="p_other",
                 type="primary" if st.session_state.purchase_active_form=="other" else "secondary"):
                 st.session_state.purchase_active_form = "other"
@@ -3687,10 +3673,6 @@ def show_user_page():
                     st.rerun()
             c1,c2 = st.columns(2)
             with c1:
-                if st.button("📍 Stock Placement", key="mp_placement", use_container_width=True):
-                    st.session_state.purchase_active_form = "placement"
-                    st.rerun()
-            with c2:
                 if st.button("✏️ Other", key="mp_other", use_container_width=True):
                     st.session_state.purchase_active_form = "other"
                     st.rerun()
@@ -3791,14 +3773,6 @@ def show_user_page():
             if st.button("📤 Bill Upload", width='stretch', key="s_upload",
                 type="primary" if st.session_state.stock_active_form=="upload" else "secondary"):
                 st.session_state.stock_active_form = "upload"
-                st.rerun()
-            if st.button("📍 Stock Placement", width='stretch', key="s_placement",
-                type="primary" if st.session_state.stock_active_form=="placement" else "secondary"):
-                st.session_state.stock_active_form = "placement"
-                st.rerun()
-            if st.button("🔍 Placement Check", width='stretch', key="s_plcheck",
-                type="primary" if st.session_state.stock_active_form=="plcheck" else "secondary"):
-                st.session_state.stock_active_form = "plcheck"
                 st.rerun()
             st.markdown("### 🔧 Other Work")
             if st.button("↩️ Purchase Return", width='stretch', key="s_return",
@@ -3925,10 +3899,8 @@ def show_user_page():
                     "Bills Received": len(normal_entries),
                     "Cross Check Pending": normal_cross_pending,
                     "Upload Pending": normal_upload_pending,
-                    "Placement Pending": normal_place_pending,
                     "Avg Check/SKU": f"{avg_sku(normal_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_sku(normal_upload_tasks)} mins",
-                    "Avg Place/SKU": f"{avg_sku(normal_place_tasks,'no_medicines')} mins",
                 }]), width='stretch', hide_index=True)
                 st.divider()
                 st.markdown("#### 📦 Arrangement Orders")
@@ -3936,10 +3908,8 @@ def show_user_page():
                     "Bills Received": len(arr_reached),
                     "Cross Check Pending": arr_cross_pend,
                     "Upload Pending": arr_upload_pend,
-                    "Placement Pending": arr_place_pend,
                     "Avg Check/SKU": f"{avg_sku(arr_cross_tasks)} mins",
                     "Avg Upload/SKU": f"{avg_sku(arr_upload_tasks)} mins",
-                    "Avg Place/SKU": f"{avg_sku(arr_place_tasks,'no_medicines')} mins",
                 }]), width='stretch', hide_index=True)
             except Exception as e:
                 st.error(f"Dashboard error: {e}")
@@ -5258,8 +5228,11 @@ def build_bill_journeys(reg_from, reg_to, later_to):
                                   "waited": (s_ - prev_end).total_seconds() if s_ and prev_end else None})
             prev_end = e_ or prev_end
         done = [s for s in rec["stages"] if s["task"]]
-        rec["next"] = next((s["label"] for s in rec["stages"] if not s["task"]), None)
+        rec["next"] = next((s["label"] for s in rec["stages"]
+                            if not s["task"] and (PLACEMENT_STEP or s["label"] != "📍 Placement")), None)
         rec["checked"], rec["uploaded"], rec["placed"] = [s.get("end") if s["task"] else None for s in rec["stages"]]
+        if not PLACEMENT_STEP and not rec["placed"]:
+            rec["placed"] = rec["uploaded"]          # journey ends at bill upload
         out.append(rec)
     return out
 
@@ -5294,7 +5267,9 @@ def _issues(task):
             out.append(f"{label} {int(n)}")
     return ", ".join(out)
 
-def show_live_pending_bills(area="All Areas", title="#### ⏳ Live — bills not yet placed"):
+PLACEMENT_STEP = False   # stock placement is done in the new billing software, not in this app
+
+def show_live_pending_bills(area="All Areas", title="#### ⏳ Live — bills not yet uploaded"):
     """Bills of the last 7 days that are not placed yet, oldest first, for one area or all"""
     from datetime import timedelta
     now_n = now_ist().replace(tzinfo=None)
@@ -5307,14 +5282,13 @@ def show_live_pending_bills(area="All Areas", title="#### ⏳ Live — bills not
     pend = [b for b in live if b["next"] and (area in ("All Areas", None) or b["d"].get("area", "") == area)]
     st.markdown(title)
     if not pend:
-        st.success("✅ No pending bills — everything that arrived is checked, uploaded and placed.")
+        st.success("✅ No pending bills — everything that arrived is checked and uploaded.")
     else:
         stage_of = {"✔️ Cross Check": "✔️ Waiting Check", "📤 Upload": "📤 Waiting Upload", "📍 Placement": "📍 Waiting Placement"}
-        m = st.columns(4)
+        m = st.columns(3)
         with m[0]: st.metric("✔️ Waiting Check", sum(1 for b in pend if b["next"] == "✔️ Cross Check"))
         with m[1]: st.metric("📤 Waiting Upload", sum(1 for b in pend if b["next"] == "📤 Upload"))
-        with m[2]: st.metric("📍 Waiting Placement", sum(1 for b in pend if b["next"] == "📍 Placement"))
-        with m[3]: st.metric("📅 From previous days", sum(1 for b in pend if b["arrived"] and b["arrived"].date() < now_n.date()))
+        with m[2]: st.metric("📅 From previous days", sum(1 for b in pend if b["arrived"] and b["arrived"].date() < now_n.date()))
         lrows = []
         for b in sorted(pend, key=lambda x: x["arrived"] or now_n):
             age = int((now_n - b["arrived"]).total_seconds() // 60) if b["arrived"] else 0
@@ -5376,7 +5350,7 @@ def show_bills_register(kp="bills", default_area=None):
         d, a = b["d"], b["arrived"]
         cc, up, pl = b["stages"]
         if not b["next"]:
-            status = "✅ Placed"
+            status = "✅ Placed" if PLACEMENT_STEP else "✅ Done"
         else:
             sw = _stage_wait_mins(b, now_n)
             status = f"{_wait_flag(sw)} " + {"✔️ Cross Check": "Waiting Check", "📤 Upload": "Waiting Upload",
@@ -5417,17 +5391,20 @@ def show_bills_register(kp="bills", default_area=None):
     with m[0]: st.metric("🧾 Bills Arrived", len(df))
     with m[1]: st.metric("💰 Total Amount", f"₹{df['Amount ₹'].sum():,.0f}")
     with m[2]: st.metric("⏱️ Avg Arrival → Upload", fmt_age(up_m.mean()) if not up_m.empty else "—")
-    with m[3]: st.metric("⏱️ Avg Arrival → Placed", fmt_age(pl_m.mean()) if not pl_m.empty else "—")
+    with m[3]: st.metric("⏱️ Avg Arrival → Placed" if PLACEMENT_STEP else "📅 Pending now",
+                         fmt_age(pl_m.mean()) if PLACEMENT_STEP and not pl_m.empty
+                         else (int(df["Current Status"].str.contains("Waiting").sum()) if not PLACEMENT_STEP else "—"))
     m = st.columns(4)
     with m[0]: st.metric("📦 Total SKUs", int(df["No of SKU"].sum()))
     with m[1]: st.metric("📅 Uploaded next day or later", int(df["_nextday"].sum()))
-    with m[2]: st.metric("✅ Fully placed", int((df["Current Status"] == "✅ Placed").sum()))
+    with m[2]: st.metric("✅ Fully placed" if PLACEMENT_STEP else "✅ Done (uploaded)",
+                         int(df["Current Status"].isin(["✅ Placed", "✅ Done"]).sum()))
     with m[3]: st.metric("⚠️ Bills with issues", int((df["Issues"] != "").sum()))
 
     show_all = st.toggle("Show extra columns (amount, entered by, start / took / wait of every stage, issues)", key=f"{kp}_all")
     base_cols = ["Arrival Date", "Arrival Time", "Bill No", "No of SKU", "Bill Type", "Distributor", "Area",
-                 "Cross Check Time", "Checked By", "Upload Time", "Uploaded By", "Placement Time", "Placed By",
-                 "Current Status", "Total Time Taken"]
+                 "Cross Check Time", "Checked By", "Upload Time", "Uploaded By"]
+    base_cols += (["Placement Time", "Placed By"] if PLACEMENT_STEP else []) + ["Current Status", "Total Time Taken"]
     full = df.drop(columns=["_up_m", "_pl_m", "_nextday"])
     st.dataframe(full if show_all else full[base_cols], hide_index=True, width='stretch')
     st.caption("Times on a later day than arrival show the date, e.g. '28 Sep 10:05 AM'. "
@@ -7517,8 +7494,7 @@ def _md_windows(kp, person, windows, wmins):
 
 
 STOCK_MENU = [
-    ("✅ Processing", [("✔️ Bill Cross Check", "crosscheck"), ("📤 Bill Upload", "upload"),
-                      ("📍 Stock Placement", "placement"), ("🔍 Placement Check", "plcheck")]),
+    ("✅ Processing", [("✔️ Bill Cross Check", "crosscheck"), ("📤 Bill Upload", "upload")]),
     ("📥 Incoming Stock", [("📒 Register Entry", "register"), ("📦 Receive Porter", "receive"),
                           ("🧾 Bills Register", "bills"), ("✏️ Edit Entry", "edit")]),
     ("🔧 Other Work", [("↩️ Purchase Return", "return"), ("🧹 Rack Cleaning", "rack"),
@@ -7531,7 +7507,6 @@ ARR_STAGE = {
     "Handed Over": "🚚 On the way", "Delivered": "🚚 On the way",
     "Reached Warehouse": "📦 Arrived — check bill",
     "Bill Cross Checked": "✔️ Checked — upload bill",
-    "Bill Uploaded": "📤 Uploaded — place stock",
 }
 
 def show_incoming_arrangements(area, full=False):
@@ -7545,12 +7520,12 @@ def show_incoming_arrangements(area, full=False):
         return
     if area and area != "All Areas":
         arrs = [a for a in arrs if a.get("area") == area]
-    open_ = [a for a in arrs if a.get("status") not in ("Stock Placed", "Completed")]
-    done_today = [a for a in arrs if a.get("status") in ("Stock Placed", "Completed")
-                  and a.get("order_placed_date") == date_str()]
+    DONE = ("Bill Uploaded", "Stock Placed", "Completed")
+    open_ = [a for a in arrs if a.get("status") not in DONE]
+    done_today = [a for a in arrs if a.get("status") in DONE and a.get("order_placed_date") == date_str()]
     st.markdown(f"#### 📦 Incoming arrangement orders — {area}")
     if not open_:
-        st.success("No arrangement orders pending." + (f" ✅ {len(done_today)} placed today." if done_today else ""))
+        st.success("No arrangement orders pending." + (f" ✅ {len(done_today)} done today." if done_today else ""))
         return
     # customer delivery deadline of the medicines in each arrangement
     now = now_ist()
@@ -7609,8 +7584,8 @@ def show_incoming_arrangements(area, full=False):
             med_rows.sort(key=lambda r: (r["_m"], r["ARR #"]))
             st.dataframe(pd.DataFrame(med_rows).drop(columns=["_m"]), hide_index=True, width='stretch')
             st.caption("🔴 due within 1 hr or overdue · 🟡 within 3 hrs · 🟢 later. Process 🔴 first.")
-    arrived = sum(1 for a in open_ if a.get("status") in ("Reached Warehouse", "Bill Cross Checked", "Bill Uploaded"))
-    st.caption(f"{len(open_)} open · {arrived} at warehouse to process · ✅ {len(done_today)} placed today")
+    arrived = sum(1 for a in open_ if a.get("status") in ("Reached Warehouse", "Bill Cross Checked"))
+    st.caption(f"{len(open_)} open · {arrived} at warehouse to process · ✅ {len(done_today)} done today")
 
 def stock_main_menu():
     """Big buttons on the main screen — works on phones where the sidebar is hidden"""
@@ -7687,17 +7662,13 @@ def show_my_performance():
             st.error(f"Error: {e}")
 
 # ── WORK AREA LOCK + REFRESH-SAFE SCREENS (mobile) ────────────────────────────
-AREA_LOCK_HOURS = 6
-AREA_SELF_FIX_MINS = 10
 FORM_KEYS = {"Stock": "stock_active_form", "Purchase": "purchase_active_form",
              "Call": "call_active_form", "Delivery": "delivery_active_form"}
 
 def get_area_lock(person):
-    """Latest area chosen by / set for this person in the last 6 hours (None if none or table missing)"""
-    from datetime import timedelta
-    since = (now_ist() - timedelta(hours=AREA_LOCK_HOURS)).isoformat()
+    """Area chosen by / set for this person today (kept until they log out and log in again)"""
     try:
-        rows = supabase.table("work_area_log").select("*").eq("person", person).gte("chosen_at", since)\
+        rows = supabase.table("work_area_log").select("*").eq("person", person).eq("date", date_str())\
             .order("chosen_at", desc=True).limit(1).execute().data or []
         return rows[0] if rows else None
     except Exception:
@@ -7710,48 +7681,13 @@ def set_area_lock(person, area, by):
     except Exception:
         pass
 
-def area_self_fix_left(lock):
-    """minutes left in which the person may still change their own pick (0 = locked)"""
-    if not lock or lock.get("set_by") != st.session_state.name:
-        return 0
-    used = age_mins(lock.get("chosen_at"))
-    return max(0, AREA_SELF_FIX_MINS - used)
-
-def release_own_area(lock):
-    try:
-        supabase.table("work_area_log").delete().eq("id", lock["id"]).execute()
-    except Exception:
-        pass
-    st.session_state.work_area = ""
-    st.session_state["area_lock"] = None
-
 def show_area_status(kp="area"):
     """📍 area line for Stock team (main screen, works on mobile)"""
-    from datetime import timedelta
     area = st.session_state.get("work_area") or ""
     lock = st.session_state.get("area_lock")
-    c1, c2 = st.columns([3, 1])
-    if lock:
-        until = (to_ist(lock.get("chosen_at")) or now_ist()) + timedelta(hours=AREA_LOCK_HOURS)
-        by = lock.get("set_by")
-        left = area_self_fix_left(lock)
-        with c1:
-            st.markdown(f"📍 **{area}** · 🔒 till {until.strftime('%I:%M %p')}"
-                        + (f" · set by {by}" if by and by != st.session_state.name else ""))
-        with c2:
-            if left and st.button(f"🔄 Change ({left} min)", key=f"{kp}_chg", width='stretch',
-                                  help="Picked the wrong area? You can change it for a few minutes after choosing"):
-                release_own_area(lock)
-                st.rerun()
-        if not left:
-            st.caption("Wrong area? Ask Admin / Dharmendra / Sachin to change it.")
-    else:
-        with c1:
-            st.markdown(f"📍 **{area}**")
-        with c2:
-            if st.button("🔄 Change", key=f"{kp}_chg", width='stretch'):
-                st.session_state.work_area = ""
-                st.rerun()
+    by = (lock or {}).get("set_by")
+    st.markdown(f"📍 **{area}**" + (f" · set by {by}" if by and by != st.session_state.name else ""))
+    st.caption("To change area: 🚪 Logout and log in again (or ask Admin / Dharmendra / Sachin).")
 
 def sync_form_with_link(team):
     """Keep the open screen in the page link so a refresh / phone reload comes back to it"""
@@ -7825,10 +7761,8 @@ def show_staff_areas(kp="sa"):
             with c2:
                 if r:
                     t = to_ist(r.get("chosen_at"))
-                    expired = t and now_ist() - t > timedelta(hours=AREA_LOCK_HOURS)
                     st.markdown(f"📍 {r.get('area')} · since {t.strftime('%I:%M %p') if t else ''}"
-                                + (f" · by {r.get('set_by')}" if r.get("set_by") != p else "")
-                                + (" · 🔓 expired" if expired else ""))
+                                + (f" · by {r.get('set_by')}" if r.get("set_by") != p else ""))
                 else:
                     st.markdown("— not chosen today")
             with c3:
