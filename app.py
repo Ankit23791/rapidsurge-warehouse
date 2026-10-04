@@ -1907,30 +1907,21 @@ def form_bill_crosscheck():
             .gte("order_placed_date", two_days_ago)\
             .execute()
 
-        # Pending normal orders (last 2 days)
+        # Pending normal bills: registered on the chosen date or the day before, not cross checked yet
         reg_pending = supabase.table("daily_tasks").select("*")\
             .eq("task_type", "Register Entry")\
-            .eq("date", bc_date.strftime("%Y-%m-%d"))\
+            .gte("date", (bc_date - timedelta(days=1)).strftime("%Y-%m-%d"))\
+            .lte("date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
-
-        # Cross checked bills
-        crossed = supabase.table("daily_tasks").select("*")\
-            .eq("task_type", "Bill Cross Check")\
-            .gte("date", two_days_ago)\
-            .execute()
-        crossed_bills = [t.get("details",{}).get("bill_no","") for t in (crossed.data or [])]
-
-        # Normal orders pending cross check
+        cc_idx = crosscheck_index((bc_date - timedelta(days=1)).strftime("%Y-%m-%d"))
         normal_pending = [t for t in (reg_pending.data or [])
-            if not t.get("details",{}).get("cross_checked")
-            and not t.get("details",{}).get("arrangement_no")      # arrangement bills are checked via their ARR
-            and t.get("details",{}).get("bill_no","") not in crossed_bills]
+            if not t.get("details",{}).get("arrangement_no")      # arrangement bills are checked via their ARR
+            and not normal_bill_checked(t, cc_idx)]
 
-        # Apply work area filter from session state
-        work_area = st.session_state.get("work_area","All Areas")
-        if work_area != "All Areas":
-            arr_pending_data = [a for a in (arr_pending.data or []) if a.get("area","") == work_area]
-            normal_pending = [t for t in normal_pending if t.get("details",{}).get("area","") == work_area]
+        # Same area as the filter above (was using the login area -> could show "no bills" wrongly)
+        if bc_area != "All Areas":
+            arr_pending_data = [a for a in (arr_pending.data or []) if a.get("area","") == bc_area]
+            normal_pending = [t for t in normal_pending if t.get("details",{}).get("area","") == bc_area]
         else:
             arr_pending_data = arr_pending.data or []
 
@@ -2029,9 +2020,10 @@ def form_bill_crosscheck():
             .lte("date", bc_date.strftime("%Y-%m-%d"))\
             .execute()
         normal_orders = normal_resp.data if normal_resp.data else []
-        # Filter out already cross checked
+        # Filter out already cross checked (same rule as the summary and the Bills Register)
+        cc_idx = crosscheck_index((bc_date - timedelta(days=1)).strftime("%Y-%m-%d"))
         normal_orders = [n for n in normal_orders
-                        if not n.get("details",{}).get("cross_checked")
+                        if not normal_bill_checked(n, cc_idx)
                         and not n.get("details",{}).get("arrangement_no")]   # arrangement bills are checked via their ARR
         # Apply area filter
         if bc_area != "All Areas":
@@ -2097,7 +2089,9 @@ def form_bill_crosscheck():
     else:
         remember_photo(bill_check_img, "cc_img_upload")
         with st.form("bill_crosscheck_form", clear_on_submit=True):
-            bill_no = st.text_input("Bill Number", value=default_bill, key=f"bc_billno_{item_type}_{selected_data.get('id','')}")
+            bill_no = st.text_input("Bill Number", value=default_bill, key=f"bc_billno_{item_type}_{selected_data.get('id','')}",
+                                    disabled=(item_type == "normal"),
+                                    help="Comes from Register Entry. Wrong number? Correct it in ✏️ Edit Entry first.")
 
             c1,c2,c3 = st.columns(3)
             with c1:
@@ -2180,7 +2174,8 @@ def form_bill_crosscheck():
                             "video_link": video_link,
                             "bill_check_image": upload_image(bill_check_img, "bill_check") if bill_check_img else "",
                             "area": bc_area if bc_area != "All Areas" else "",
-                            "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor","")
+                            "distributor": selected_data.get("distributor","") if item_type=="arrangement" else selected_data.get("details",{}).get("distributor",""),
+                            "reg_id": selected_data.get("id") if item_type == "normal" else None
                         },
                         "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time,
@@ -5192,6 +5187,23 @@ def _bill_key(d):
     return ("BILL", str((d or {}).get("bill_no", "")).strip().lower(),
             str((d or {}).get("distributor", "")).strip().lower())
 
+def crosscheck_index(since):
+    """Finished Bill Cross Check tasks since a date -> (register-entry ids, bill keys) they cover"""
+    ids, keys = set(), set()
+    for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Bill Cross Check").gte("date", since)):
+        if t.get("status") == "In Progress":
+            continue
+        d = t.get("details") or {}
+        if d.get("reg_id"):
+            ids.add(str(d["reg_id"]))
+        else:
+            keys.add(_bill_key(d))
+    return ids, keys
+
+def normal_bill_checked(reg, idx):
+    ids, keys = idx
+    return str(reg.get("id")) in ids or _bill_key(reg.get("details")) in keys
+
 def _task_dt(task, field="end_time"):
     """date + time of a task as a datetime (None if unreadable)"""
     try:
@@ -5210,7 +5222,8 @@ def build_bill_journeys(reg_from, reg_to, later_to):
     for task in sorted(later, key=lambda x: (str(x.get("date", "")), str(_task_dt(x) or ""))):
         if task.get("status") == "In Progress":
             continue
-        idx.setdefault(task.get("task_type"), {}).setdefault(_bill_key(task.get("details")), task)
+        rid = (task.get("details") or {}).get("reg_id")
+        idx.setdefault(task.get("task_type"), {}).setdefault(("REG", str(rid)) if rid else _bill_key(task.get("details")), task)
     out = []
     for r in regs:
         d = r.get("details") or {}
@@ -5220,7 +5233,7 @@ def build_bill_journeys(reg_from, reg_to, later_to):
         prev_end = arrived
         for label, ttype in [("✔️ Cross Check", "Bill Cross Check"), ("📤 Upload", "Bill Upload (Software)"),
                              ("📍 Placement", "Stock Placement")]:
-            t = idx[ttype].get(k)
+            t = idx[ttype].get(("REG", str(r.get("id")))) or idx[ttype].get(k)
             if not t:
                 rec["stages"].append({"label": label, "task": None})
                 continue
