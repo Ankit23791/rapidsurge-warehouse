@@ -756,6 +756,10 @@ def form_bounce_medicine():
 # ── ARRANGEMENT FORM ──────────────────────────────────────────────────────────
 def form_arrangement():
     st.subheader("📋 New Arrangement Order")
+    done_msg = st.session_state.pop("arr_done_msg", None)
+    if done_msg:
+        st.success(done_msg)
+        st.balloons()
     start = timer_button("arrangement_order", "Arrangement Order")
     if start is None:
         return
@@ -879,9 +883,12 @@ def form_arrangement():
                                 }).eq("id", task_resp.data[0]["id"]).execute()
                         except:
                             pass
+                        # fresh, empty form + picker for the next order
                         st.session_state["arr_form_ver"] = fv + 1
-                        st.success(f"✅ Arrangement #{arr_no} placed successfully!")
-                        st.balloons()
+                        st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
+                        st.session_state["arr_done_msg"] = (f"✅ Arrangement #{arr_no} placed — {distributor}, "
+                                                            f"{no_medicines} medicine(s). Press ▶️ Start for the next one.")
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
 
