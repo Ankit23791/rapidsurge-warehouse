@@ -6680,8 +6680,11 @@ def attendance_gate():
         else:
             st.markdown(f"### 🪖 Report for duty, {st.session_state.name}!")
             st.caption("Clock in to start today's mission.")
-        if st.button("🟢 Clock In — Report for Duty", type="primary", width='stretch', key="att_in"):
+        km_ok = km_clock_in_block() if st.session_state.team == "Delivery" else True
+        if st.button("🟢 Clock In — Report for Duty", type="primary", width='stretch', key="att_in", disabled=not km_ok):
             att_log("clock_in")
+            if st.session_state.team == "Delivery":
+                km_save_start()
             st.rerun()
         return False
 
@@ -6709,8 +6712,9 @@ def attendance_gate():
                 else:
                     att_log("break_start", btype)
                     st.rerun()
+    delivery = st.session_state.team == "Delivery"
     with c4:
-        if st.session_state.get("att_confirm_out"):
+        if st.session_state.get("att_confirm_out") and not delivery:
             if st.button("✅ Confirm Out", key="att_out_yes", type="primary", width='stretch'):
                 if active_key:
                     st.error("Finish or cancel your running task first.")
@@ -6718,9 +6722,28 @@ def attendance_gate():
                     att_log("clock_out")
                     st.session_state["att_confirm_out"] = False
                     st.rerun()
-        elif st.button("🔴 Clock Out", key="att_out", width='stretch'):
+        elif not st.session_state.get("att_confirm_out") and st.button("🔴 Clock Out", key="att_out", width='stretch'):
             st.session_state["att_confirm_out"] = True
             st.rerun()
+    if st.session_state.get("att_confirm_out") and delivery:
+        # delivery boys: end-of-day bike meter before clocking out
+        ok, saver = km_clock_out_block()
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅ Confirm Clock Out", key="att_out_yes", type="primary", width='stretch', disabled=not ok):
+                if active_key:
+                    st.error("Finish or cancel your running task first.")
+                else:
+                    if saver:
+                        saver()
+                    att_log("clock_out")
+                    st.session_state["att_confirm_out"] = False
+                    st.rerun()
+        with b2:
+            if st.button("✖️ Not now", key="att_out_no", width='stretch'):
+                st.session_state["att_confirm_out"] = False
+                st.rerun()
+        return False
     return True
 
 def _merged_secs(periods):
@@ -7377,7 +7400,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t0, t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors"])
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM"])
     with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
@@ -7387,6 +7410,7 @@ def show_manager_team_view():
     with t6: show_customer_order_tracker("mgr_trk", show_phone=True)
     with t7: show_order_sheet_report("mgr_osr")
     with t8: show_distributors_admin("mgr_dist")
+    with t9: show_delivery_km("mgr_dkm")
 
 # ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
 DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
@@ -9301,13 +9325,381 @@ def show_staff_areas(kp="sa"):
         if many:
             st.caption("🔁 Area changed several times today: " + ", ".join(many))
 
+# ── DELIVERY KM (bike meter at clock in / out + expected km from trips) ───────
+KM_MAX_DAY = 300          # more than this in a day is surely a typing mistake
+
+def km_enabled():
+    try:
+        supabase.table("km_log").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+def km_today(person, d=None):
+    rows = supabase.table("km_log").select("*").eq("person", person).eq("date", d or date_str()).execute().data or []
+    return rows[0] if rows else None
+
+def km_last_reading(person):
+    rows = supabase.table("km_log").select("date,end_km,start_km").eq("person", person).lt("date", date_str())\
+        .order("date", desc=True).limit(1).execute().data or []
+    if not rows:
+        return None
+    return rows[0].get("end_km") or rows[0].get("start_km")
+
+def km_meter_input(kp, label):
+    """Reading + meter photo. Returns (reading or None, photo or None)"""
+    st.markdown(f"**🛵 {label}**")
+    reading = st.number_input("Bike meter reading (km) *", min_value=0, step=1, value=None, key=f"{kp}_km",
+                              placeholder="e.g. 45210")
+    photo = photos_input("📷 Photo of the bike meter", f"{kp}_photo", ("jpg", "jpeg", "png"))
+    return reading, photo
+
+def km_clock_in_block():
+    """Delivery team: meter reading + photo before Clock In. Returns True when it may clock in."""
+    if not km_enabled():
+        return True
+    if km_today(st.session_state.name):
+        return True                          # morning reading already saved (came back after clock out)
+    reading, photo = km_meter_input("kmin", "Start of day — bike meter")
+    last = km_last_reading(st.session_state.name)
+    if last:
+        st.caption(f"Last reading: {int(float(last)):,} km")
+    if reading is None or photo is None:
+        st.info("Enter the meter reading and take its photo, then Clock In.")
+        return False
+    remember_photo(photo, "kmin_photo")
+    if last and reading < float(last):
+        st.warning(f"⚠️ Lower than your last reading ({int(float(last)):,} km). Check the number.")
+    st.session_state["_km_start"] = (reading, photo)
+    return True
+
+def km_save_start():
+    v = st.session_state.pop("_km_start", None)
+    if not v:
+        return
+    reading, photo = v
+    try:
+        supabase.table("km_log").insert({"person": st.session_state.name, "date": date_str(),
+                                         "start_km": float(reading), "start_photo": upload_image(photo, "km_start"),
+                                         "start_at": now_iso()}).execute()
+    except Exception as e:
+        st.error(f"Could not save meter reading: {e}")
+
+def km_clock_out_block():
+    """Delivery team: end-of-day reading before Confirm Out. Returns (ok, saver)"""
+    if not km_enabled():
+        return True, None
+    row = km_today(st.session_state.name)
+    reading, photo = km_meter_input("kmout", "End of day — bike meter")
+    start = float((row or {}).get("start_km") or 0)
+    if row and row.get("start_km") is not None:
+        st.caption(f"Start reading today: {int(start):,} km")
+    if reading is None or photo is None:
+        st.info("Enter the meter reading and take its photo to clock out.")
+        return False, None
+    remember_photo(photo, "kmout_photo")
+    if row and reading < start:
+        st.error(f"End reading is lower than this morning's ({int(start):,} km).")
+        return False, None
+    if row and reading - start > KM_MAX_DAY:
+        st.error(f"{int(reading - start)} km in one day looks wrong — check the reading.")
+        return False, None
+    def saver():
+        try:
+            data = {"end_km": float(reading), "end_photo": upload_image(photo, "km_end"), "end_at": now_iso(),
+                    "km": (float(reading) - start) if row else None}
+            if row:
+                supabase.table("km_log").update(data).eq("id", row["id"]).execute()
+            else:
+                supabase.table("km_log").insert({"person": st.session_state.name, "date": date_str(), **data}).execute()
+        except Exception as e:
+            st.error(f"Could not save meter reading: {e}")
+    if row:
+        st.success(f"Today: **{int(reading - start)} km**")
+    return True, saver
+
+# ---- routes (Dharmendra fills) ----
+def km_places():
+    return list(dict.fromkeys(load_areas() + load_warehouses() + DISTRIBUTORS))
+
+def _rk(a, b):
+    return tuple(sorted([str(a).strip().lower(), str(b).strip().lower()]))
+
+def load_routes():
+    try:
+        rows = supabase.table("route_km").select("*").execute().data or []
+    except Exception:
+        return None
+    return {_rk(r["place_a"], r["place_b"]): r for r in rows}
+
+def km_settings():
+    try:
+        rows = supabase.table("delivery_km_settings").select("*").execute().data or []
+    except Exception:
+        return {}
+    return {r["person"]: r for r in rows}
+
+def day_places(tasks):
+    """Places visited in time order, from Delivery Trips (from → to) and Pickups (distributor)"""
+    def key(t):
+        p = parse_task_time(t.get("start_time") or t.get("time"))
+        return p or datetime.max
+    seq = []
+    for t in sorted(tasks, key=key):
+        d = t.get("details") or {}
+        if t.get("task_type") == "Delivery Trip":
+            pts = [d.get("location_a"), d.get("location_b")]
+        elif t.get("task_type") == "Pickup":
+            pts = [d.get("distributor")]
+        else:
+            continue
+        for p in pts:
+            if p and p not in ("—", "") and (not seq or seq[-1] != p):
+                seq.append(p)
+    return seq
+
+def expected_km(places, routes, home_km=0):
+    km, missing = 2 * float(home_km or 0), []
+    for a, b in zip(places, places[1:]):
+        r = routes.get(_rk(a, b))
+        if r and r.get("km") is not None:
+            km += float(r["km"])
+        else:
+            missing.append((a, b))
+    return km, missing
+
+def delivery_people():
+    return sorted(u["name"] for u in (load_users() or {}).values() if u.get("team") == "Delivery")
+
+def show_route_km_admin(kp="rk"):
+    st.subheader("🗺️ Routes & KM")
+    st.caption("Distance between places (one way, km). The app adds them up from each delivery boy's trips "
+               "to get the **expected km** and compares it with his bike meter.")
+    routes = load_routes()
+    if routes is None:
+        st.error("Run delivery_km_setup.sql in Supabase first.")
+        return
+    places = km_places()
+    # rates + home distance
+    sett = km_settings()
+    people = delivery_people()
+    with st.expander("🏠 Home distance & rate per km (per delivery boy)", expanded=not sett):
+        default_rate = float((sett.get("*") or {}).get("rate_per_km") or 0)
+        df = pd.DataFrame([{"Person": p, "Home ↔ base (km, one way)": float((sett.get(p) or {}).get("home_km") or 0),
+                            "Rate ₹/km (blank = default)": (sett.get(p) or {}).get("rate_per_km")} for p in people]
+                          or [{"Person": "", "Home ↔ base (km, one way)": 0.0, "Rate ₹/km (blank = default)": None}])
+        rate = st.number_input("Default rate ₹ per km", min_value=0.0, step=0.5, value=default_rate, key=f"{kp}_rate")
+        ed = st.data_editor(df, key=f"{kp}_people", hide_index=True, width='stretch', disabled=["Person"])
+        if st.button("💾 Save rates & home distance", key=f"{kp}_psave"):
+            try:
+                supabase.table("delivery_km_settings").upsert({"person": "*", "rate_per_km": rate}, on_conflict="person").execute()
+                for r in ed.to_dict("records"):
+                    if not r["Person"]:
+                        continue
+                    rr = r["Rate ₹/km (blank = default)"]
+                    supabase.table("delivery_km_settings").upsert({
+                        "person": r["Person"], "home_km": float(r["Home ↔ base (km, one way)"] or 0),
+                        "rate_per_km": None if rr is None or pd.isna(rr) else float(rr)}, on_conflict="person").execute()
+                st.success("✅ Saved")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # routes used recently without a distance -> ready to fill
+    from datetime import timedelta
+    since = (today_ist() - timedelta(days=30)).strftime("%Y-%m-%d")
+    try:
+        tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Delivery Trip", "Pickup"]).gte("date", since))
+    except Exception:
+        tasks = []
+    used, name_of = {}, {p.strip().lower(): p for p in places}
+    for (p, d), ts in _group_tasks(tasks).items():
+        seq = day_places(ts)
+        for x in seq:
+            name_of.setdefault(x.strip().lower(), x)          # keep the spelling used in the trips
+        for a, b in zip(seq, seq[1:]):
+            used[_rk(a, b)] = used.get(_rk(a, b), 0) + 1
+    missing = [k for k in used if k not in routes]
+    places = list(dict.fromkeys(places + [name_of[k] for k in name_of]))
+    rows = [{"id": r["id"], "From": r["place_a"], "To": r["place_b"], "KM": float(r["km"] or 0),
+             "Trips (30 days)": used.get(k, 0)} for k, r in routes.items()]
+    rows += [{"id": None, "From": name_of.get(a, a), "To": name_of.get(b, b), "KM": None, "Trips (30 days)": used[(a, b)]}
+             for a, b in missing]
+    rows.sort(key=lambda r: (r["KM"] is not None, -r["Trips (30 days)"]))
+    if missing:
+        st.warning(f"⚠️ {len(missing)} route(s) used by the delivery team have no distance yet — fill the KM (shown first).")
+    df = pd.DataFrame(rows or [{"id": None, "From": "", "To": "", "KM": None, "Trips (30 days)": 0}])
+    ver = st.session_state.get(f"{kp}_ver", 0)
+    ed = st.data_editor(df, key=f"{kp}_routes_{ver}", hide_index=True, width='stretch', num_rows="dynamic",
+                        disabled=["Trips (30 days)"],
+                        column_config={"id": None,
+                                       "From": st.column_config.SelectboxColumn("From", options=places),
+                                       "To": st.column_config.SelectboxColumn("To", options=places),
+                                       "KM": st.column_config.NumberColumn("KM (one way)", min_value=0, step=0.5)})
+    st.caption("Add a row with ➕ at the bottom of the table. A → B and B → A are the same route.")
+    if st.button("💾 Save routes", type="primary", key=f"{kp}_rsave"):
+        n = 0
+        try:
+            for r in ed.to_dict("records"):
+                if not r.get("From") or not r.get("To") or r.get("KM") is None or pd.isna(r.get("KM")) or r["From"] == r["To"]:
+                    continue
+                a, b = sorted([r["From"], r["To"]], key=str.lower)
+                ex = routes.get(_rk(a, b))
+                if ex and float(ex.get("km") or 0) == float(r["KM"]):
+                    continue
+                payload = {"place_a": a, "place_b": b, "km": float(r["KM"]),
+                           "updated_by": st.session_state.name, "updated_at": now_iso()}
+                if ex:
+                    supabase.table("route_km").update(payload).eq("id", ex["id"]).execute()
+                else:
+                    supabase.table("route_km").insert(payload).execute()
+                n += 1
+            st.session_state[f"{kp}_ver"] = ver + 1
+            st.success(f"✅ {n} route(s) saved")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+def _group_tasks(tasks):
+    out = {}
+    for t in tasks:
+        if t.get("status") == "In Progress" and t.get("task_type") != "Pickup":
+            continue
+        out.setdefault((t.get("person"), t.get("date")), []).append(t)
+    return out
+
+def show_delivery_km_report(kp="dkm"):
+    from datetime import timedelta
+    st.subheader("🛵 Delivery KM & payment")
+    if not km_enabled():
+        st.error("Run delivery_km_setup.sql in Supabase first.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        rng = st.date_input("From – to", value=(today_ist().replace(day=1), today_ist()), key=f"{kp}_rng",
+                            format="DD/MM/YYYY")
+    lo, hi = (rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else (today_ist(), today_ist()))
+    with c2:
+        who = st.multiselect("Delivery boy", delivery_people(), key=f"{kp}_who", placeholder="All")
+    los, his = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+    logs = fetch_all("km_log", lambda q: q.gte("date", los).lte("date", his))
+    tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Delivery Trip", "Pickup"]).gte("date", los).lte("date", his))
+    routes = load_routes() or {}
+    sett = km_settings()
+    default_rate = float((sett.get("*") or {}).get("rate_per_km") or 0)
+    by_task = _group_tasks(tasks)
+    keys = {(l["person"], l["date"]) for l in logs} | set(by_task)
+    if who:
+        keys = {k for k in keys if k[0] in who}
+    if not keys:
+        st.info("No meter readings or trips in this period.")
+        return
+    log_of = {(l["person"], l["date"]): l for l in logs}
+    rows, all_missing = [], {}
+    for p, d in sorted(keys, key=lambda k: (k[1], k[0]), reverse=True):
+        l = log_of.get((p, d)) or {}
+        s_ = (sett.get(p) or {})
+        seq = day_places(by_task.get((p, d), []))
+        exp, missing = expected_km(seq, routes, s_.get("home_km"))
+        for m in missing:
+            all_missing[_rk(*m)] = m
+        meter = l.get("km")
+        if meter is None and l.get("end_km") is not None and l.get("start_km") is not None:
+            meter = float(l["end_km"]) - float(l["start_km"])
+        rate = float(s_.get("rate_per_km") if s_.get("rate_per_km") is not None else default_rate)
+        if not seq:
+            exp = None                                   # no trips logged -> nothing to compare
+        flag = ""
+        if meter is not None and exp and not missing:
+            diff = meter - exp
+            if diff > max(10, 0.25 * exp):
+                flag = f"⚠️ +{round(diff)} km"
+            elif diff < -max(10, 0.25 * exp):
+                flag = f"🔻 {round(diff)} km"
+        rows.append({"Date": d, "Person": p,
+                     "Start": f"{int(float(l['start_km'])):,}" if l.get("start_km") is not None else "—",
+                     "End": f"{int(float(l['end_km'])):,}" if l.get("end_km") is not None else ("⏳" if l else "—"),
+                     "Meter km": round(meter, 1) if meter is not None else None,
+                     "Trips": len(by_task.get((p, d), [])), "Expected km": round(exp, 1) if exp is not None else None,
+                     "Check": flag or ("❔ route km missing" if missing else ("✅" if meter is not None and seq
+                                                                              else ("no trips logged" if meter is not None else ""))),
+                     "Route": " → ".join(seq[:8]) + (" …" if len(seq) > 8 else ""),
+                     "Rate ₹": rate, "Amount ₹": round((meter or 0) * rate),
+                     "_id": l.get("id"), "_sp": l.get("start_photo"), "_ep": l.get("end_photo")})
+    df = pd.DataFrame(rows)
+    tot = df.groupby("Person").agg(Days=("Date", "nunique"), KM=("Meter km", "sum"), Expected=("Expected km", "sum"),
+                                   Trips=("Trips", "sum"), Amount=("Amount ₹", "sum")).reset_index()
+    tot["KM/day"] = (tot["KM"] / tot["Days"]).round(1)
+    tot["Flags"] = tot["Person"].map(lambda p: int(df[(df["Person"] == p) & df["Check"].str.startswith("⚠️")].shape[0]))
+    m = st.columns(3)
+    with m[0]: st.metric("🛵 Total km", f"{df['Meter km'].sum():,.0f}")
+    with m[1]: st.metric("💰 Total payable", f"₹{df['Amount ₹'].sum():,.0f}")
+    with m[2]: st.metric("⚠️ Days to check", int(df["Check"].str.startswith("⚠️").sum()))
+    st.markdown("**Per delivery boy**")
+    st.dataframe(tot.rename(columns={"KM": "Meter km", "Expected": "Expected km", "Amount": "Amount ₹"}),
+                 hide_index=True, width='stretch')
+    st.markdown("**Day by day**")
+    st.dataframe(df.drop(columns=["_id", "_sp", "_ep"]), hide_index=True, width='stretch')
+    st.caption("Expected km = home ↔ base both ways + distances between the places in his trips (Routes & KM). "
+               "⚠️ meter is more than 10 km and 25% above expected · 🔻 meter much lower · ❔ some route has no distance yet.")
+    if all_missing:
+        st.info(f"❔ {len(all_missing)} route(s) have no distance — fill them in 🗺️ Routes & KM.")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        tot.to_excel(w, index=False, sheet_name="Per person")
+        df.drop(columns=["_id", "_sp", "_ep"]).to_excel(w, index=False, sheet_name="Daily")
+    st.download_button("⬇️ Download Excel", buf.getvalue(), f"delivery-km-{los}-to-{his}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_dl")
+
+    with st.expander("📷 Meter photos / ✏️ correct a reading"):
+        opts = {f"{r['Date']} · {r['Person']} · {r['Start']} → {r['End']}": r for r in rows if r["_id"]}
+        if not opts:
+            st.caption("No meter readings in this period.")
+            return
+        pick = st.selectbox("Day", list(opts), key=f"{kp}_pick")
+        r = opts[pick]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Start")
+            show_image(r["_sp"], key=f"{kp}_sp_{r['_id']}") or st.caption("no photo")
+        with c2:
+            st.caption("End")
+            show_image(r["_ep"], key=f"{kp}_ep_{r['_id']}") or st.caption("no photo")
+        if st.session_state.get("role") in ("admin", "manager"):
+            with st.form(f"{kp}_fix_{r['_id']}"):
+                f1, f2 = st.columns(2)
+                with f1: s_new = st.number_input("Start km", min_value=0.0, step=1.0,
+                                                 value=float(str(r["Start"]).replace(",", "")) if r["Start"] not in ("—",) else 0.0)
+                with f2: e_new = st.number_input("End km", min_value=0.0, step=1.0,
+                                                 value=float(str(r["End"]).replace(",", "")) if r["End"] not in ("—", "⏳") else 0.0)
+                note = st.text_input("Reason for correction *")
+                if st.form_submit_button("💾 Save correction"):
+                    if not note.strip():
+                        st.error("Write the reason.")
+                    elif e_new and e_new < s_new:
+                        st.error("End is lower than start.")
+                    else:
+                        supabase.table("km_log").update({
+                            "start_km": s_new, "end_km": e_new or None, "km": (e_new - s_new) if e_new else None,
+                            "edited_by": st.session_state.name, "edit_note": note.strip()}).eq("id", r["_id"]).execute()
+                        st.success("✅ Corrected")
+                        st.rerun()
+
+def show_delivery_km(kp="dk"):
+    view = st.radio("View", ["🛵 KM & payment", "🗺️ Routes & KM"], horizontal=True, key=f"{kp}_view",
+                    label_visibility="collapsed")
+    if view.startswith("🛵"):
+        show_delivery_km_report(f"{kp}_r")
+    else:
+        show_route_km_admin(f"{kp}_rt")
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11 = st.tabs([
+    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14 = st.tabs([
         "🎯 My Day",
         "📊 Dashboard",
         "👥 All Staff Work",
@@ -9321,8 +9713,12 @@ def show_admin_page():
         "🧾 Bills Register",
         "🕐 Attendance",
         "📌 Assign Tasks",
-        "📅 Shift Planner"
+        "📅 Shift Planner",
+        "🛵 Delivery KM"
     ])
+
+    with tab14:
+        show_delivery_km("adm_dkm")
 
     with tab0:
         show_my_day("md")
