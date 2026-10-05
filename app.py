@@ -5209,10 +5209,6 @@ def arrangement_line_picker():
         if not open_lines:
             st.info("No pending customer items for this date.")
             return link_area, []
-        open_lines, sched = sched_date_filter(f"arr_link_sched_{ver}", open_lines, fc2)
-        if not open_lines:
-            st.info("No pending customer items for this scheduled date.")
-            return link_area, []
         now = now_ist()
         bounced = {}
         try:
