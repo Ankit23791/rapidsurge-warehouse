@@ -4635,6 +4635,45 @@ def _sched_label(d):
     except Exception:
         return d or ""
 
+SCHED_PRESETS = ["Overdue + Today", "Today", "Tomorrow", "Today + Tomorrow", "Overdue only",
+                 "Last 7 days", "All dates", "📅 Choose dates"]
+
+def sched_date_filter(key, lines, container=None):
+    """Quick scheduled-date filter (like a date-range picker). Returns (filtered lines, short label)."""
+    from datetime import timedelta
+    box = container or st
+    today = today_ist()
+    preset = box.selectbox("Scheduled date", SCHED_PRESETS, key=f"{key}_preset")
+    lo = hi = None                                   # inclusive YYYY-MM-DD bounds (None = open)
+    if preset == "Overdue + Today":
+        hi = today
+    elif preset == "Today":
+        lo = hi = today
+    elif preset == "Tomorrow":
+        lo = hi = today + timedelta(days=1)
+    elif preset == "Today + Tomorrow":
+        lo, hi = today, today + timedelta(days=1)
+    elif preset == "Overdue only":
+        hi = today - timedelta(days=1)
+    elif preset == "Last 7 days":
+        lo, hi = today - timedelta(days=6), today
+    elif preset == "📅 Choose dates":
+        rng = box.date_input("From – to", value=(today, today + timedelta(days=1)), key=f"{key}_range",
+                             format="DD/MM/YYYY")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            lo, hi = rng
+        elif isinstance(rng, (list, tuple)) and len(rng) == 1:
+            lo = hi = rng[0]
+        else:
+            lo = hi = rng
+    los = lo.strftime("%Y-%m-%d") if lo else None
+    his = hi.strftime("%Y-%m-%d") if hi else None
+    out = [l for l in lines
+           if (not los or (l.get("scheduled_date") or "") >= los)
+           and (not his or ((l.get("scheduled_date") or "9999") <= his))]
+    label = preset if preset != "📅 Choose dates" else f"{los}…{his}"
+    return out, label
+
 def form_pending_items():
     st.subheader("🧾 Pending Customer Items")
     st.caption("For each item: 🏪 **In Store** (available, nothing to buy) or ❌ **Not Available** (can't be sourced). "
@@ -4648,12 +4687,8 @@ def form_pending_items():
     c1, c2 = st.columns(2)
     with c1:
         area = st.selectbox("Area", ["All Areas"] + load_areas(), key="pi_area")
-    dates = sorted(set(l.get("scheduled_date") or "" for l in all_lines))
-    with c2:
-        sched = st.selectbox("Scheduled date", ["All dates"] + [d for d in dates if d], key="pi_sched",
-                             format_func=lambda d: d if d == "All dates" else _sched_label(d))
-    lines = [l for l in all_lines
-             if (area == "All Areas" or l.get("area") == area) and (sched == "All dates" or l.get("scheduled_date") == sched)]
+    lines = [l for l in all_lines if area == "All Areas" or l.get("area") == area]
+    lines, sched = sched_date_filter("pi_sched", lines, c2)
     if not lines:
         st.success("🎉 No pending customer items for this filter!")
         return
@@ -4765,12 +4800,7 @@ def arrangement_line_picker():
         if not open_lines:
             st.info("No pending customer items for this area.")
             return link_area, []
-        sched_dates = sorted(set(l.get("scheduled_date") or "" for l in open_lines) - {""})
-        with fc2:
-            sched = st.selectbox("Scheduled date", ["All dates"] + sched_dates, key=f"arr_link_sched_{ver}",
-                                 format_func=lambda d: d if d == "All dates" else _sched_label(d))
-        if sched != "All dates":
-            open_lines = [l for l in open_lines if l.get("scheduled_date") == sched]
+        open_lines, sched = sched_date_filter(f"arr_link_sched_{ver}", open_lines, fc2)
         if not open_lines:
             st.info("No pending customer items for this scheduled date.")
             return link_area, []
