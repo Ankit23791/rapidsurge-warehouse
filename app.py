@@ -391,6 +391,19 @@ def photos_input(label, base, types=("jpg", "jpeg", "png")):
     st.caption(f"✅ {len(files)} pages added — they will be saved together as one image")
     return cache[ids]
 
+def show_arrangement_medicines(arr):
+    """Medicine list of an arrangement (from the ticked customer items) for the pickup team"""
+    try:
+        meds = supabase.table("arrangement_medicines").select("medicine_name,quantity")\
+            .eq("arrangement_id", arr.get("id")).execute().data or []
+    except Exception:
+        meds = []
+    arr["_has_meds"] = bool(meds)
+    if meds:
+        st.markdown(f"**💊 Medicines to pick — #{arr.get('arrangement_no','')} ({len(meds)})**")
+        st.dataframe(pd.DataFrame([{"#": i + 1, "Medicine": m.get("medicine_name", ""), "Qty": m.get("quantity", "")}
+                                   for i, m in enumerate(meds)]), hide_index=True, width='stretch')
+
 # ── LOGIN ─────────────────────────────────────────────────────────────────────
 def show_login():
     st.markdown("""
@@ -789,7 +802,7 @@ def form_arrangement():
                                             help="Filled from the ticked customer items — add any extra medicines. Max 200.")
             order_time    = st.text_input("Order Time", value=time_str(), key=f"arr_time_{fv}")
         remarks = st.text_input("Remarks", key=f"arr_remarks_{fv}")
-        st.markdown("📸 **Image of Order ***")
+        st.markdown("📸 **Image of Order**" + (" (optional — ticked items are sent to the pickup team)" if picked_lines else " *"))
         arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key=f"arr_upload_{fv}")
 
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
@@ -803,7 +816,7 @@ def form_arrangement():
                     for p in picked_lines)
             if not no_medicines:
                 st.error("Enter No of Medicines to Pick!")
-            elif arr_img is None:
+            elif arr_img is None and not picked_lines:
                 st.error("⚠️ Image of order is mandatory! Please upload or take photo (just above Submit).")
             else:
                 # Check duplicate arrangement number
@@ -1130,6 +1143,7 @@ def form_pickup():
         with c1: st.info(f"📍 Area: **{preview_arr.get('area','N/A')}**")
         with c2: st.info(f"🧾 Bill/Order ID: **{preview_arr.get('bill_order_id','N/A')}**")
         with c3: st.info(f"💊 Medicines to Pick: **{preview_arr.get('no_medicines','N/A')}**")
+        show_arrangement_medicines(preview_arr)
         order_img = preview_arr.get("order_image","")
         if order_img and order_img.strip():
             st.markdown("**📄 Invoice Image from Purchase Team:**")
@@ -1148,7 +1162,7 @@ def form_pickup():
                 )
             except Exception as img_err:
                 st.warning(f"⚠️ Image error: {img_err}")
-        else:
+        elif not preview_arr.get("_has_meds"):
             st.warning("⚠️ No invoice image uploaded by Purchase Team for this arrangement")
 
     # Auto fill from preview
@@ -4737,7 +4751,9 @@ def arrangement_line_picker():
     """Shown above the arrangement form. Returns (area, [selected rows])"""
     ver = st.session_state.get("arr_link_ver", 0)
     with st.expander("🔗 Customer order items for this distributor", expanded=True):
-        link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            link_area = st.selectbox("Area of customer orders", [SELECT_AREA] + load_areas(), key=f"arr_link_area_{ver}")
         if link_area == SELECT_AREA:
             st.caption("Select an area to see its pending customer items. (Or skip this and just enter the number of medicines below.)")
             return None, []
@@ -4748,6 +4764,15 @@ def arrangement_line_picker():
             return None, []
         if not open_lines:
             st.info("No pending customer items for this area.")
+            return link_area, []
+        sched_dates = sorted(set(l.get("scheduled_date") or "" for l in open_lines) - {""})
+        with fc2:
+            sched = st.selectbox("Scheduled date", ["All dates"] + sched_dates, key=f"arr_link_sched_{ver}",
+                                 format_func=lambda d: d if d == "All dates" else _sched_label(d))
+        if sched != "All dates":
+            open_lines = [l for l in open_lines if l.get("scheduled_date") == sched]
+        if not open_lines:
+            st.info("No pending customer items for this scheduled date.")
             return link_area, []
         now = now_ist()
         open_lines = sorted(open_lines, key=lambda l: (l.get("scheduled_date") or "9999",
@@ -4767,7 +4792,7 @@ def arrangement_line_picker():
             "Order Qty": remaining_qty(l),
         } for l in open_lines])
         ed = st.data_editor(
-            ldf, key=f"arr_link_editor_{ver}", hide_index=True, width='stretch',
+            ldf, key=f"arr_link_editor_{ver}_{link_area}_{sched}", hide_index=True, width='stretch',
             disabled=["⏰", "Deliver by", "Order #", "Customer", "Item", "Pack", "Needed"],
             column_config={
                 "id": None,
@@ -4777,7 +4802,13 @@ def arrangement_line_picker():
             })
         picked = ed[ed["Order?"] == True].to_dict("records")
         if picked:
-            st.success(f"✅ {len(picked)} item(s) selected — they will be linked to this arrangement")
+            st.success(f"✅ {len(picked)} item(s) selected — they will be linked to this arrangement "
+                       "(no order photo needed; the pickup team sees this list)")
+            st.markdown("**🧾 Selected items only**")
+            st.dataframe(pd.DataFrame([{"Deliver by": p.get("Deliver by", ""), "Order #": p.get("Order #", ""),
+                                        "Customer": p.get("Customer", ""), "Item": p.get("Item", ""),
+                                        "Pack": p.get("Pack", ""), "Qty": _qty_txt(p.get("Order Qty"))} for p in picked]),
+                         hide_index=True, width='stretch')
         return link_area, picked
 
 def save_arrangement_links(arr_id, arr_no, distributor, area, picked):
