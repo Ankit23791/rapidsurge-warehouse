@@ -10478,19 +10478,18 @@ PLAN_ITEMS = {   # key, label, task types counted (or a special counter)
               ("upload", "📤 Bill Upload", ["Bill Upload (Software)", "Bill Upload"]),
               ("register", "📒 Register Entry", ["Register Entry"]),
               ("storepick", "🏪 In-Store Pick", "storepick")],
-    "Purchase": [("register", "📒 Register Entry", ["Register Entry"]),
-                 ("crosscheck", "✔️ Bill Cross Check", ["Bill Cross Check"]),
-                 ("arr", "📋 Arrangement Order", ["Arrangement Order", "Arrangement"]),
-                 ("po", "🛒 Purchase Order", ["Purchase Order"]),
-                 ("return", "↩️ Purchase Return", ["Purchase Return"])],
+    "Purchase": [("po", "💊 Medicines ordered — Purchase / Order Sheet", ("sum", ["Purchase Order"], "no_sku")),
+                 ("arr", "💊 Medicines ordered — Arrangement", ("sum", ["Arrangement Order", "Arrangement"], "no_medicines")),
+                 ("register", "📒 Register Entry", ["Register Entry"]),
+                 ("crosscheck", "✔️ Bill Cross Check", ["Bill Cross Check"])],
     "Call": [("calls", "📞 Calls made", "calls"),
              ("marked", "🚚 Delivery status marked", "marked")],
 }
 PLAN_HELP = {
     "crosscheck": "1 = one bill cross-checked", "upload": "1 = one bill uploaded in the software",
     "register": "1 = one distributor bill entered", "storepick": "1 = one customer medicine picked from the shelf",
-    "arr": "1 = one arrangement order placed with a distributor",
-    "po": "1 = one order sent to one distributor (call / PharmaRack / Excel / order sheet)",
+    "arr": "1 = one medicine in an arrangement order (an order of 3 medicines = 3)",
+    "po": "1 = one medicine (SKU) ordered — Purchase Order or Order Sheet (an order of 12 SKUs = 12)",
     "return": "1 = one purchase return entry", "calls": "1 = one call made (from your Call Log)",
     "marked": "1 = one customer medicine marked Delivered / Not delivered",
 }
@@ -10545,12 +10544,22 @@ def _tasks_of(person, lo_n, hi_n):
     return out
 
 
-def _count_item(how, person, tasks, lo_n, hi_n):
+def _amount(how, tasks):
+    """count / sum for an item from a list of tasks (None = needs another table)"""
     if isinstance(how, list):
         return sum(1 for t in tasks if t.get("task_type") in how)
+    if isinstance(how, tuple) and how[0] == "sum":
+        return int(sum(_to_float((t.get("details") or {}).get(how[2]), 0) for t in tasks if t.get("task_type") in how[1]))
     if how == "calls":
         return int(sum(_to_float((t.get("details") or {}).get("calls_made"), 0)
                        for t in tasks if t.get("task_type") == "Call Log"))
+    return None
+
+
+def _count_item(how, person, tasks, lo_n, hi_n):
+    n = _amount(how, tasks)
+    if n is not None:
+        return n
     col_by, col_at = {"storepick": ("store_checked_by", "store_checked_at"),
                       "marked": ("delivery_by", "delivery_at")}[how]
     try:
@@ -10573,8 +10582,14 @@ def block_progress(block, upto=None):
     hows = {k: how for k, _, how in PLAN_ITEMS.get(block.get("team"), [])}
     rows, parts = [], []
     for it in items:
-        how = hows.get(it.get("key"))
         tgt = int(it.get("target") or 0)
+        if it.get("self"):                      # "Other" work: the person tells us at the end
+            done = it.get("done")
+            rows.append((it.get("label", "Other"), tgt, done))
+            if tgt > 0 and done is not None:
+                parts.append(min(done / tgt, 1.0))
+            continue
+        how = hows.get(it.get("key"))
         done = _count_item(how, person, tasks, lo, hi) if how else 0
         rows.append((it.get("label", it.get("key")), tgt, done))
         if tgt > 0:
@@ -10629,12 +10644,7 @@ def _usual_pace(person, team):
         return {}
     out = {}
     for k, _, how in PLAN_ITEMS.get(team, []):
-        if isinstance(how, list):
-            n = sum(1 for t in rows if t.get("task_type") in how)
-        elif how == "calls":
-            n = sum(_to_float((t.get("details") or {}).get("calls_made"), 0) for t in rows if t.get("task_type") == "Call Log")
-        else:
-            n = 0
+        n = _amount(how, rows) or 0
         if n:
             out[k] = n / hours
     return out
@@ -10657,12 +10667,7 @@ def _team_pace(team):
         return {}
     out = {}
     for k, _, how in PLAN_ITEMS.get(team, []):
-        if isinstance(how, list):
-            n = sum(1 for t in rows if t.get("task_type") in how)
-        elif how == "calls":
-            n = sum(_to_float((t.get("details") or {}).get("calls_made"), 0) for t in rows if t.get("task_type") == "Call Log")
-        else:
-            n = 0
+        n = _amount(how, rows) or 0
         if n:
             out[k] = n / hours
     return out
@@ -10732,6 +10737,8 @@ def close_block(block, reason=""):
 
 
 def _bar(done, tgt):
+    if done is None:
+        return f"target **{tgt}** — you'll enter what you finished at the end" if tgt else "(no number)"
     if tgt <= 0:
         return f"{done}"
     n = min(tgt, 10)
@@ -10789,6 +10796,21 @@ def show_block_card(blk, end, overdue):
 
 
 def show_block_result(blk):
+    own = [it for it in (blk.get("items") or []) if it.get("self") and int(it.get("target") or 0) > 0 and it.get("done") is None]
+    if own:
+        st.markdown("### ✏️ How much of your other work did you finish?")
+        vals = {}
+        for i, it in enumerate(own):
+            vals[i] = st.number_input(f"{it.get('label')} (planned {it.get('target')})", 0, 1000, 0, key=f"blk_own_{blk['id']}_{i}")
+        if st.button("Next ➡️", type="primary", key="blk_own_ok"):
+            items = blk.get("items") or []
+            k = 0
+            for it in items:
+                if it in own:
+                    it["done"] = int(vals[k]); k += 1
+            supabase.table("work_blocks").update({"items": items}).eq("id", blk["id"]).execute()
+            st.rerun()
+        return False
     rows, pct = block_progress(blk, upto=block_end(blk))
     s = _naive(to_ist(blk.get("start_at")))
     icon = "🟢" if pct is None or pct >= 90 else "🟠" if pct >= 60 else "🔴"
@@ -10850,8 +10872,15 @@ def show_plan_form():
             st.warning(f"⚠️ **{label}: {n}** is too high" + (f" — realistic is about **{r}** in {hours} hr." if r else ".")
                        + " Plan honestly: your block is judged against what you plan.")
         sure = st.checkbox("Yes, I can really do this (it will be marked in my review)", key=f"blk_sure_{hours}")
-    note = st.text_input("Anything else in this block? (optional)", key="blk_note",
-                         placeholder="e.g. help Sachin with stock count")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        note = st.text_input("✏️ Other work (write it yourself)", key="blk_note",
+                             placeholder="e.g. help Sachin with stock count / call 5 distributors for rates")
+    with c2:
+        own_n = st.number_input("How many?", 0, 500, 0, key=f"blk_own_n_{hours}",
+                                help="Optional. If you set a number, you'll enter how many you finished at the end.")
+    if note.strip():
+        items.append({"key": "other", "label": "✏️ " + note.strip()[:80], "target": int(own_n), "self": True})
     c1, c2 = st.columns([2, 1])
     with c1:
         if st.button(f"🚀 Start {hours}-hour block", type="primary", width='stretch', key="blk_start",
@@ -10860,7 +10889,7 @@ def show_plan_form():
             supabase.table("work_blocks").insert({
                 "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
                 "start_at": _iso(s), "end_at": _iso(s + timedelta(hours=hours)), "hours": hours,
-                "items": items, "note": note.strip() or None, "status": "Active"}).execute()
+                "items": items, "note": None, "status": "Active"}).execute()
             st.rerun()
     with c2:
         if st.button("🚨 Urgent — plan later", width='stretch', key="blk_skip",
