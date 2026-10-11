@@ -1985,6 +1985,30 @@ def form_placement_crosscheck():
             except Exception as e:
                 st.error(f"Error: {e}")
 
+def _bill_norm(x):
+    return "".join(ch for ch in str(x or "").lower() if ch.isalnum())
+
+def find_duplicate_bill(distributor, bill_no, exclude_id=None, days=120):
+    """Same bill number from the same distributor already in Register Entry (last `days` days) -> that entry"""
+    from datetime import timedelta
+    b = _bill_norm(bill_no)
+    if not b:
+        return None
+    since = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", since)):
+        d = t.get("details") or {}
+        if t.get("id") == exclude_id:
+            continue
+        if _bill_norm(d.get("bill_no")) == b and _bill_norm(d.get("distributor")) == _bill_norm(distributor):
+            return t
+    return None
+
+def dup_bill_msg(t):
+    d = t.get("details") or {}
+    return (f"❌ Bill No **{d.get('bill_no')}** from **{d.get('distributor')}** is already entered — "
+            f"by {t.get('person','')} on {t.get('date','')} at {t.get('time','')} ({d.get('no_items','')} items). "
+            "Duplicate entry not allowed. Wrong number? Fix the old entry in ✏️ Edit Entry.")
+
 # ── REGISTER ENTRY FORM ──────────────────────────────────────────────────────
 
 def form_edit_register_entry():
@@ -2039,12 +2063,16 @@ def form_edit_register_entry():
                             key=f"ed_delby_{entry['id']}")
                     edit_reason = st.text_input("Reason for Edit *", key=f"ed_reason_{entry['id']}")
                     if st.form_submit_button("Save Changes ✅", type="primary"):
+                        dup = find_duplicate_bill(new_dist, new_bill, exclude_id=entry["id"]) if new_bill else None
                         if not edit_reason:
                             st.error("Enter reason for edit!")
+                        elif dup:
+                            st.error(dup_bill_msg(dup))
                         else:
                             try:
                                 supabase.table("daily_tasks").update({
                                     "details": {
+                                        **d,                       # keep area / ARR no / image etc.
                                         "distributor": new_dist,
                                         "bill_no": new_bill,
                                         "no_items": str(new_items),
@@ -2144,20 +2172,10 @@ def form_register_entry():
                     st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
                 elif not invoice_img:
                     st.error("⚠️ Invoice image is mandatory! Please upload or take photo.")
+                elif (dup := find_duplicate_bill(distributor, bill_no)):
+                    st.error(dup_bill_msg(dup))           # same bill + same distributor -> blocked
                 else:
                     img_name = upload_image(invoice_img, "invoice") if invoice_img else ""
-                    # Check duplicate bill number - show warning
-                    try:
-                        dup_check = supabase.table("daily_tasks").select("*")\
-                            .eq("task_type", "Register Entry")\
-                            .eq("date", date_str())\
-                            .execute()
-                        existing_bills = [t.get("details",{}).get("bill_no","").strip()
-                                         for t in (dup_check.data or [])]
-                        if bill_no.strip() in existing_bills:
-                            st.warning(f"⚠️ Bill No **{bill_no}** already entered today!")
-                    except:
-                        pass
                     try:
                         supabase.table("daily_tasks").insert({
                             "date": date_str(),
@@ -3380,6 +3398,8 @@ def show_user_page():
 
     # ── TASKS FROM ADMIN ──────────────────────────────────────────────────────
     show_my_assigned_tasks()
+    if team in ("Stock", "Delivery", "Call") and not st.session_state.get(FORM_KEYS.get(team, "")):
+        league_mini(team)
 
     # ── PIPELINE VIEW ─────────────────────────────────────────────────────────
     if team == "Stock" and st.session_state.get("show_pipeline"):
@@ -7400,7 +7420,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM"])
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
     with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
@@ -7411,6 +7431,7 @@ def show_manager_team_view():
     with t7: show_order_sheet_report("mgr_osr")
     with t8: show_distributors_admin("mgr_dist")
     with t9: show_delivery_km("mgr_dkm")
+    with t10: show_league("mgr_lg")
 
 # ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
 DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
@@ -9693,13 +9714,337 @@ def show_delivery_km(kp="dk"):
     else:
         show_route_km_admin(f"{kp}_rt")
 
+# ── 🏆 LEAGUE: warehouse (Stock) · delivery boys · call team ───────────────────
+# Each metric is scored 0-100 against the best in the league for the period, then weighted.
+LEAGUE_PERIODS = ["This week", "Last week", "This month", "Last month", "📅 Choose dates"]
+STOCK_METRICS = [  # key, label, weight, higher_is_better, unit
+    ("speed", "⏱️ Bill speed (arrival → upload)", 30, False, "min"),
+    ("sameday", "📅 Same-day upload", 20, True, "%"),
+    ("ontime", "🚚 Customer items on time", 20, True, "%"),
+    ("check", "⚡ Check speed", 15, False, "sec/item"),
+    ("quality", "✅ Quality (photos + cross check)", 15, True, "%"),
+]
+DELIVERY_METRICS = [
+    ("ontime", "⏰ Pickups on time", 50, True, "%"),
+    ("perday", "📦 Pickups per day", 30, True, ""),
+    ("kmper", "🛵 KM per pickup", 20, False, "km"),
+]
+CALL_METRICS = [
+    ("conv", "✅ Delivered (conversion)", 35, True, "%"),
+    ("speed", "⏱️ Call speed (ready → marked)", 35, False, "min"),
+    ("cph", "📞 Calls per hour", 30, True, ""),
+]
+
+def league_period(kp, container=None):
+    from datetime import timedelta
+    box = container or st
+    t = today_ist()
+    p = box.selectbox("Period", LEAGUE_PERIODS, key=f"{kp}_per")
+    if p == "This week":
+        lo, hi = t - timedelta(days=t.weekday()), t
+    elif p == "Last week":
+        hi = t - timedelta(days=t.weekday() + 1); lo = hi - timedelta(days=6)
+    elif p == "This month":
+        lo, hi = t.replace(day=1), t
+    elif p == "Last month":
+        hi = t.replace(day=1) - timedelta(days=1); lo = hi.replace(day=1)
+    else:
+        r = box.date_input("From – to", value=(t - timedelta(days=6), t), key=f"{kp}_rng", format="DD/MM/YYYY")
+        lo, hi = (r if isinstance(r, (list, tuple)) and len(r) == 2 else (t, t))
+    return lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"), p
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+def league_score(raw, metrics):
+    """raw: {name: {key: value or None}} -> {name: (score, {key: points})}"""
+    best = {}
+    for k, _, _, hib, _ in metrics:
+        vals = [v[k] for v in raw.values() if v.get(k) is not None]
+        if vals:
+            best[k] = max(vals) if hib else min(vals)
+    out = {}
+    for name, v in raw.items():
+        pts, wsum, tot = {}, 0, 0.0
+        for k, _, w, hib, _ in metrics:
+            x, b = v.get(k), best.get(k)
+            if x is None or b is None:
+                continue
+            if hib:
+                p = 100.0 * x / b if b else 100.0
+            else:
+                p = 100.0 * b / x if x else 100.0
+            pts[k] = min(100.0, p)
+            tot += pts[k] * w
+            wsum += w
+        out[name] = (round(tot / wsum, 1) if wsum else None, pts)
+    return out
+
+def _fmt_metric(v, unit):
+    if v is None:
+        return "—"
+    if unit == "%":
+        return f"{round(v)}%"
+    if unit == "min":
+        return fmt_age(int(v))
+    return f"{round(v, 1)} {unit}".strip()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def league_stock_raw(lo, hi):
+    """Per warehouse/area metrics for bills registered between lo and hi"""
+    areas = load_areas()
+    jr = build_bill_journeys(lo, hi, hi)
+    raw = {a: {"_bills": 0} for a in areas}
+    speed, same, qual = {a: [] for a in areas}, {a: [] for a in areas}, {a: [] for a in areas}
+    for b in jr:
+        a = (b["d"] or {}).get("area", "")
+        if a not in raw:
+            continue
+        raw[a]["_bills"] += 1
+        arr, up = b.get("arrived"), b.get("uploaded")
+        if arr and up and up >= arr:
+            speed[a].append((up - arr).total_seconds() / 60)
+        if arr:
+            same[a].append(1 if (up and up.date() == arr.date()) else 0)
+        cc = b["stages"][0]
+        has_reg_photo = bool((b["d"] or {}).get("invoice_image"))
+        has_cc_photo = bool(cc.get("task") and ((cc["task"].get("details") or {}).get("bill_check_image")))
+        if up:
+            qual[a].append(1 if (has_reg_photo and cc.get("task") and has_cc_photo) else 0)
+    # cross check speed (sec per item) by area
+    chk = {a: [] for a in areas}
+    for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Bill Cross Check").gte("date", lo).lte("date", hi)):
+        d = t.get("details") or {}
+        n = _to_float(d.get("no_items"), 0)
+        s = task_secs(t)
+        if d.get("area") in chk and n > 0 and s:
+            chk[d.get("area")].append(s / n)
+    # customer items received by their promised time
+    ont = {a: [] for a in areas}
+    try:
+        lines = fetch_all("customer_order_lines", lambda q: q.gte("scheduled_date", lo).lte("scheduled_date", hi))
+    except Exception:
+        lines = []
+    for l in lines:
+        a = l.get("area")
+        if a not in ont or l.get("removed") or not l.get("delivery_time"):
+            continue
+        if l.get("status") != "Received":
+            continue
+        di = due_info(l, to_ist(l.get("completed_at")) or now_ist())
+        if di:
+            ont[a].append(1 if di[1] >= 0 else 0)
+    for a in areas:
+        raw[a].update({
+            "speed": _median(speed[a]),
+            "sameday": 100.0 * sum(same[a]) / len(same[a]) if same[a] else None,
+            "ontime": 100.0 * sum(ont[a]) / len(ont[a]) if ont[a] else None,
+            "check": _median(chk[a]),
+            "quality": 100.0 * sum(qual[a]) / len(qual[a]) if qual[a] else None,
+        })
+    return {a: v for a, v in raw.items() if v["_bills"]}
+
+def _present_days(lo, hi):
+    """{person: set(dates)} from clock-ins"""
+    out = {}
+    try:
+        for e in fetch_all("attendance_log", lambda q: q.eq("event", "clock_in").gte("date", lo).lte("date", hi)):
+            out.setdefault(e.get("person"), set()).add(e.get("date"))
+    except Exception:
+        pass
+    return out
+
+def _present_hours(lo, hi):
+    """{person: hours present (clock in -> out, minus breaks)}"""
+    out = {}
+    try:
+        ev = fetch_all("attendance_log", lambda q: q.gte("date", lo).lte("date", hi))
+    except Exception:
+        return out
+    by = {}
+    for e in ev:
+        by.setdefault((e.get("person"), e.get("date")), []).append(e)
+    for (p, d), es in by.items():
+        s = att_state(sorted(es, key=lambda e: str(e.get("at"))))
+        if s["clock_in"]:
+            end = s["clock_out"] or (now_ist() if d == date_str() else s["clock_in"])
+            out[p] = out.get(p, 0) + max(0, (end - s["clock_in"]).total_seconds() - s["break_secs"]) / 3600
+    return out
+
+@st.cache_data(ttl=600, show_spinner=False)
+def league_delivery_raw(lo, hi):
+    people = delivery_people()
+    pk = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Pickup").gte("date", lo).lte("date", hi))
+          if t.get("status") != "In Progress"]
+    days = _present_days(lo, hi)
+    try:
+        kms = fetch_all("km_log", lambda q: q.gte("date", lo).lte("date", hi))
+    except Exception:
+        kms = []
+    raw = {}
+    for p in sorted(set(people) | {t.get("person") for t in pk if t.get("person")}):
+        mine = [t for t in pk if t.get("person") == p]
+        ot = [(t.get("details") or {}).get("on_time") for t in mine if (t.get("details") or {}).get("on_time")]
+        nd = len(days.get(p, set())) or len({t.get("date") for t in mine})
+        km = sum(float(k.get("km") or 0) for k in kms if k.get("person") == p and k.get("km") is not None)
+        raw[p] = {"_pickups": len(mine), "_days": nd,
+                  "ontime": 100.0 * sum(1 for x in ot if x == "Yes") / len(ot) if ot else None,
+                  "perday": len(mine) / nd if nd else None,
+                  "kmper": km / len(mine) if km and mine else None}
+    return {p: v for p, v in raw.items() if v["_pickups"] or v["_days"]}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def league_call_raw(lo, hi):
+    calls = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Call Log").gte("date", lo).lte("date", hi))
+    hours = _present_hours(lo, hi)
+    try:
+        lines = fetch_all("customer_order_lines", lambda q: q.gte("delivery_at", lo).lte("delivery_at", hi + "T23:59:59+05:30"))
+    except Exception:
+        lines = []
+    people = sorted({u["name"] for u in (load_users() or {}).values() if u.get("team") == "Call"}
+                    | {t.get("person") for t in calls if t.get("person")}
+                    | {l.get("delivery_by") for l in lines if l.get("delivery_by")})
+    # order ready time = when its last line was completed
+    ready = {}
+    for l in lines:
+        c = to_ist(l.get("completed_at"))
+        if c:
+            ready[l.get("order_no")] = max(ready.get(l.get("order_no"), c), c)
+    raw = {}
+    for p in people:
+        n_calls = sum(_to_float((t.get("details") or {}).get("calls_made"), 0) for t in calls if t.get("person") == p)
+        mine = [l for l in lines if l.get("delivery_by") == p]
+        dl = sum(1 for l in mine if l.get("delivery_status") == "Delivered")
+        nd = sum(1 for l in mine if l.get("delivery_status") == "Not Delivered")
+        waits = []
+        for o in {l.get("order_no") for l in mine}:
+            r = ready.get(o)
+            m = min((to_ist(l.get("delivery_at")) for l in mine if l.get("order_no") == o and to_ist(l.get("delivery_at"))),
+                    default=None)
+            if r and m and m >= r:
+                waits.append((m - r).total_seconds() / 60)
+        h = hours.get(p, 0)
+        raw[p] = {"_calls": int(n_calls), "_marked": dl + nd,
+                  "conv": 100.0 * dl / (dl + nd) if dl + nd else None,
+                  "speed": _median(waits),
+                  "cph": n_calls / h if h and n_calls else None}
+    return {p: v for p, v in raw.items() if v["_calls"] or v["_marked"]}
+
+def league_table(raw, metrics, name_col):
+    sc = league_score(raw, metrics)
+    order = sorted(raw, key=lambda n: -(sc[n][0] or -1))
+    medals = ["🥇", "🥈", "🥉"]
+    rows = []
+    for i, n in enumerate(order):
+        s, pts = sc[n]
+        weak = min(pts, key=pts.get) if pts else None
+        r = {"#": medals[i] if i < 3 else str(i + 1), name_col: n, "Score": s if s is not None else "—"}
+        for k, label, w, hib, unit in metrics:
+            r[label] = _fmt_metric(raw[n].get(k), unit)
+        r["Work on"] = next((l for k, l, *_ in metrics if k == weak), "") if weak and pts[weak] < 95 else "—"
+        rows.append(r)
+    return pd.DataFrame(rows), order, sc
+
+def show_league(kp="lg"):
+    st.subheader("🏆 League")
+    st.caption("Trial — scores compare everyone with the best in the league for the period (best = 100 for each metric). "
+               "Weights can be changed after the trial.")
+    c1, c2 = st.columns([2, 1])
+    with c2:
+        lo, hi, plabel = league_period(kp)
+    with c1:
+        board = st.radio("Board", ["🏬 Stock warehouses", "🛵 Delivery", "📞 Call team"], horizontal=True, key=f"{kp}_b")
+    st.caption(f"{lo} → {hi}")
+    if board.startswith("🏬"):
+        raw = league_stock_raw(lo, hi)
+        if not raw:
+            st.info("No bills in this period.")
+            return
+        df, order, sc = league_table(raw, STOCK_METRICS, "Warehouse")
+        df.insert(3, "Bills", [raw[n]["_bills"] for n in order])
+        st.dataframe(df, hide_index=True, width='stretch')
+        st.caption("Weights: " + " · ".join(f"{l} {w}%" for _, l, w, *_ in STOCK_METRICS))
+        with st.expander("💰 Prize for the winning warehouse (split by days present)"):
+            pool = st.number_input("Prize pool ₹", min_value=0, step=500, value=3000, key=f"{kp}_pool")
+            win = order[0]
+            days = _present_days(lo, hi)
+            staff = {}
+            try:
+                for r in fetch_all("work_area_log", lambda q: q.gte("date", lo).lte("date", hi)):
+                    if r.get("area") == win and r.get("date") in days.get(r.get("person"), set()):
+                        staff.setdefault(r.get("person"), set()).add(r.get("date"))
+            except Exception:
+                pass
+            if not staff:
+                st.caption(f"🥇 {win} — no staff area records for this period (needs 📍 area selection).")
+            else:
+                tot = sum(len(v) for v in staff.values())
+                pay = pd.DataFrame([{"Person": p, "Days in " + win: len(d), "Share ₹": round(pool * len(d) / tot)}
+                                    for p, d in sorted(staff.items(), key=lambda kv: -len(kv[1]))])
+                st.markdown(f"**🥇 {win}** — ₹{pool:,} shared by {len(staff)} people")
+                st.dataframe(pay, hide_index=True, width='stretch')
+    else:
+        is_del = board.startswith("🛵")
+        raw = league_delivery_raw(lo, hi) if is_del else league_call_raw(lo, hi)
+        metrics = DELIVERY_METRICS if is_del else CALL_METRICS
+        if not raw:
+            st.info("No activity in this period.")
+            return
+        df, order, sc = league_table(raw, metrics, "Person")
+        if is_del:
+            df.insert(3, "Pickups", [raw[n]["_pickups"] for n in order])
+        else:
+            df.insert(3, "Calls", [raw[n]["_calls"] for n in order])
+            df.insert(4, "Orders marked", [raw[n]["_marked"] for n in order])
+        st.dataframe(df, hide_index=True, width='stretch')
+        st.caption("Weights: " + " · ".join(f"{l} {w}%" for _, l, w, *_ in metrics))
+        prize = st.number_input("Prize for #1 ₹", min_value=0, step=100, value=1000, key=f"{kp}_p_{board[:2]}")
+        st.markdown(f"🥇 **{order[0]}** — ₹{prize:,}")
+
+def league_mini(team):
+    """Small live board on the team's home screen (this week)"""
+    from datetime import timedelta
+    t = today_ist()
+    lo, hi = (t - timedelta(days=t.weekday())).strftime("%Y-%m-%d"), t.strftime("%Y-%m-%d")
+    try:
+        if team == "Stock":
+            raw, metrics, me = league_stock_raw(lo, hi), STOCK_METRICS, st.session_state.get("work_area")
+        elif team == "Delivery":
+            raw, metrics, me = league_delivery_raw(lo, hi), DELIVERY_METRICS, st.session_state.name
+        elif team == "Call":
+            raw, metrics, me = league_call_raw(lo, hi), CALL_METRICS, st.session_state.name
+        else:
+            return
+    except Exception:
+        return
+    if len(raw) < 2:
+        return
+    sc = league_score(raw, metrics)
+    order = sorted(raw, key=lambda n: -(sc[n][0] or -1))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{medals[i] if i < 3 else i + 1} {'**' if n == me else ''}{n}{'**' if n == me else ''} — {sc[n][0]}"
+             for i, n in enumerate(order)]
+    tip = ""
+    if me in sc and sc[me][1]:
+        weak = min(sc[me][1], key=sc[me][1].get)
+        if sc[me][1][weak] < 95:
+            tip = "  ·  your weakest: " + next(l for k, l, *_ in metrics if k == weak)
+    with st.expander("🏆 League — this week: " + " · ".join(lines[:3]) , expanded=False):
+        st.markdown("\n\n".join(lines))
+        if tip:
+            st.caption(tip.strip(" ·"))
+
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
     st.divider()
 
-    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14 = st.tabs([
+    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15 = st.tabs([
         "🎯 My Day",
         "📊 Dashboard",
         "👥 All Staff Work",
@@ -9714,8 +10059,12 @@ def show_admin_page():
         "🕐 Attendance",
         "📌 Assign Tasks",
         "📅 Shift Planner",
-        "🛵 Delivery KM"
+        "🛵 Delivery KM",
+        "🏆 League"
     ])
+
+    with tab15:
+        show_league("adm_lg")
 
     with tab14:
         show_delivery_km("adm_dkm")
