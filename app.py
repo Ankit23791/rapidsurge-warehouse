@@ -4934,11 +4934,14 @@ def import_order_lines(lines, area):
             "qty_changed": qty_changed, "removed": removed, "wrong_area": wrong_area}
 
 def get_open_lines(area=None):
-    q = supabase.table("customer_order_lines").select("*")\
-        .in_("status", OPEN_LINE_STATUSES).eq("removed", False)
-    if area and area not in ("All Areas", SELECT_AREA):
-        q = q.eq("area", area)
-    return q.order("imported_at").order("order_no").execute().data or []
+    """all open customer lines — paged, because Supabase returns max 1000 rows per request
+    (with 1000+ open lines the newest ones were silently missing)"""
+    def build(q):
+        q = q.in_("status", OPEN_LINE_STATUSES).eq("removed", False)
+        if area and area not in ("All Areas", SELECT_AREA):
+            q = q.eq("area", area)
+        return q.order("imported_at").order("order_no").order("id")
+    return fetch_all("customer_order_lines", build)
 
 def remaining_qty(line):
     return max(0.0, _to_float(line.get("qty"), 0) - _to_float(line.get("qty_arranged"), 0))
@@ -5081,18 +5084,20 @@ def _sched_label(d):
     except Exception:
         return d or ""
 
-SCHED_PRESETS = ["Overdue + Today", "Today", "Tomorrow", "Today + Tomorrow", "Overdue only",
+SCHED_PRESETS = ["Overdue + Today", "Last 3 days + Today", "Today", "Tomorrow", "Today + Tomorrow", "Overdue only",
                  "Last 7 days", "All dates", "📅 Choose dates"]
 
-def sched_date_filter(key, lines, container=None):
+def sched_date_filter(key, lines, container=None, default="Overdue + Today"):
     """Quick scheduled-date filter (like a date-range picker). Returns (filtered lines, short label)."""
     from datetime import timedelta
     box = container or st
     today = today_ist()
-    preset = box.selectbox("Scheduled date", SCHED_PRESETS, key=f"{key}_preset")
+    preset = box.selectbox("Scheduled date", SCHED_PRESETS, index=SCHED_PRESETS.index(default), key=f"{key}_preset")
     lo = hi = None                                   # inclusive YYYY-MM-DD bounds (None = open)
     if preset == "Overdue + Today":
         hi = today
+    elif preset == "Last 3 days + Today":
+        lo, hi = today - timedelta(days=3), today
     elif preset == "Today":
         lo = hi = today
     elif preset == "Tomorrow":
@@ -5942,7 +5947,7 @@ def undo_line_decisions(kp, area):
             st.rerun()
 
 # ── ORDER TRACKER ─────────────────────────────────────────────────────────────
-LINE_ICON = {"Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
+LINE_ICON = {"Closed": "🧹 Closed (old)", "Pending": "⏳ Pending", "Partly Arranged": "📦 Part-arranged", "Arranged": "📦 Arranged",
              "In Store": "🏪 In Store", "Received": "✅ Received", "Short": "⚠️ Short",
              "Not Available": "❌ Not Available"}
 
@@ -10680,15 +10685,20 @@ def _team_pace(team):
     return out
 
 
+def _need_order_lines():
+    """customer medicines that still have to be ordered from a distributor"""
+    return [l for l in get_open_lines(None)
+            if l.get("remainder_note") not in ("In Store", "Not Available") and remaining_qty(l) > 0]
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def purchase_pending():
-    """what is waiting for the purchase team right now"""
+    """what is waiting for the purchase team right now (default view: overdue + today)"""
     out = {}
-    lo = (today_ist() - timedelta(days=3)).strftime("%Y-%m-%d")
-    hi = (today_ist() + timedelta(days=1)).strftime("%Y-%m-%d")
     try:
-        rows = fetch_all("customer_order_lines", lambda q: q.eq("status", "Pending").gte("scheduled_date", lo).lte("scheduled_date", hi))
-        out["arr"] = sum(1 for l in rows if not l.get("removed"))
+        today = date_str()
+        lo3 = (today_ist() - timedelta(days=3)).strftime("%Y-%m-%d")
+        out["arr"] = sum(1 for l in _need_order_lines() if lo3 <= (l.get("scheduled_date") or "") <= today)
     except Exception:
         pass
     try:
@@ -10700,7 +10710,80 @@ def purchase_pending():
     return out
 
 
-PENDING_TXT = {"arr": "{} customer medicines need to be ordered", "po": "{} order-sheet medicines need to be ordered",
+def pending_view(team, key, area):
+    """📦 View & filter the pending work behind a plan line"""
+    if key == "arr":
+        try:
+            lines = _need_order_lines()
+        except Exception as e:
+            st.caption(f"Could not load ({e})"); return
+        c1, c2 = st.columns(2)
+        with c1:
+            ar = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"pv_{key}_area")
+        lines = [l for l in lines if ar == "All Areas" or l.get("area") == ar]
+        lines, lbl = sched_date_filter(f"pv_{key}", lines, c2, default="Last 3 days + Today")
+        now = now_ist()
+        rows = []
+        for l in lines:
+            di = due_info(l, now)
+            rows.append({"": di[0] if di else "", "Medicine": l.get("item_name", ""),
+                         "Qty": remaining_qty(l), "Customer": l.get("customer_name") or "",
+                         "Area": l.get("area", ""), "Date": _sched_label(l.get("scheduled_date")),
+                         "Deliver by": (f"{l.get('delivery_time')} · {di[2]}" if di else (l.get("delivery_time") or "")),
+                         "_m": di[1] if di else 10 ** 9})
+        over = sum(1 for l in lines if (l.get("scheduled_date") or "9999") < date_str())
+        st.markdown(f"**{len(rows)} medicines need to be ordered** ({lbl}"
+                    + (f" · {over} overdue" if over else "") + ")")
+        if rows:
+            rows.sort(key=lambda r: (r["_m"], r["Date"]))
+            st.dataframe(pd.DataFrame(rows).drop(columns=["_m"]), hide_index=True, width='stretch', height=min(400, 38 + 35 * len(rows)))
+    elif key == "po":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            d = st.date_input("Sheet date", value=today_ist(), key=f"pv_{key}_d", format="DD/MM/YYYY")
+        with c2:
+            ar = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"pv_{key}_area")
+        try:
+            rows = [l for l in fetch_all("order_sheet_lines", lambda q: q.eq("sheet_date", d.strftime("%Y-%m-%d")).eq("status", "Pending"))
+                    if not l.get("superseded_by") and (ar == "All Areas" or l.get("area") == ar)]
+        except Exception as e:
+            st.caption(f"Could not load ({e})"); return
+        rounds = sorted({r.get("round") for r in rows if r.get("round") is not None})
+        with c3:
+            rd = st.selectbox("Round", ["All"] + [str(r) for r in rounds], key=f"pv_{key}_rd")
+        rows = [r for r in rows if rd == "All" or str(r.get("round")) == rd]
+        st.markdown(f"**{len(rows)} order-sheet medicines need to be ordered**")
+        if rows:
+            st.dataframe(pd.DataFrame([{"Medicine": r.get("item_name", ""), "Pack": r.get("pack_size", ""),
+                                        "Order qty": r.get("order_qty"), "Area": r.get("area", ""),
+                                        "Round": r.get("round")} for r in rows]),
+                         hide_index=True, width='stretch', height=min(400, 38 + 35 * len(rows)))
+        else:
+            st.caption("Nothing pending on this sheet. Phone / PharmaRack orders also count in this line.")
+    elif key in ("crosscheck", "upload"):
+        lo = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+        ar = area if team == "Stock" and area else st.selectbox("Area", ["All Areas"] + load_areas(), key=f"pv_{key}_area")
+        rows = []
+        try:
+            for b in build_bill_journeys(lo, date_str(), date_str()):
+                d = b["d"] or {}
+                if ar and ar != "All Areas" and d.get("area") != ar:
+                    continue
+                cc = b["stages"][0].get("task")
+                if (key == "crosscheck" and not cc) or (key == "upload" and cc and not b.get("uploaded")):
+                    arr = b.get("arrived")
+                    rows.append({"Bill no": d.get("bill_no", ""), "Distributor": d.get("distributor", ""),
+                                 "Items": d.get("no_items", ""), "Area": d.get("area", ""),
+                                 "Arrived": arr.strftime("%d %b %I:%M %p") if arr else "",
+                                 "Waiting": fmt_age(int((now_ist() - arr).total_seconds() // 60)) if arr else ""})
+        except Exception as e:
+            st.caption(f"Could not load ({e})"); return
+        st.markdown(f"**{len(rows)} bills waiting**" + (f" in {ar}" if ar and ar != "All Areas" else ""))
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch', height=min(400, 38 + 35 * len(rows)))
+
+
+PENDING_TXT = {"arr": "{} customer medicines need to be ordered (last 3 days + today)", "po": "{} order-sheet medicines need to be ordered",
                "crosscheck": "{} bills waiting for cross check", "upload": "{} bills waiting for upload",
                "storepick": "{} medicines to pick from the shelf"}
 
@@ -10844,41 +10927,24 @@ def show_plan_form():
     hrs = st.radio("Block", [f"{h} hour" + ("s" if h > 1 else "") for h in BLOCK_HOURS],
                    horizontal=True, key="blk_hrs")
     hours = int(hrs.split()[0])
-    pace = _usual_pace(me, team)
-    tpace = _team_pace(team)
     pend = stock_pending(area) if team == "Stock" else purchase_pending() if team == "Purchase" else {}
-    items, too_high = [], []
+    items = []
     for key, label, _ in PLAN_ITEMS.get(team, []):
-        p, tp = pace.get(key), tpace.get(key)
-        real = (p or tp or 0) * hours                 # realistic number for this block
-        sugg = int(round(real)) if real >= 0.5 else 0
-        if key != "po" and pend.get(key) is not None and sugg:   # PO can also be phone orders -> no cap
-            sugg = min(sugg, pend[key])
         hint = [PLAN_HELP.get(key, "")]
         if pend.get(key):
             hint.append("📦 " + PENDING_TXT.get(key, "{} pending").format(pend[key]))
-        if p:
-            hint.append(f"your usual ≈ {max(1, round(p * hours))} in {hours} hr")
-        elif tp:
-            hint.append(f"team usual ≈ {max(1, round(tp * hours))} in {hours} hr")
         c1, c2 = st.columns([3, 1])
         with c1:
             st.markdown(f"**{label}**  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(h for h in hint if h)}</span>",
                         unsafe_allow_html=True)
         with c2:
-            n = st.number_input(label, 0, 500, sugg, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
-        limit = max(3 * real, real + 3) if real else PLAN_MAX_PER_HR * hours
-        if n > limit:
-            too_high.append((label, n, max(1, round(real)) if real else None))
+            n = st.number_input(label, 0, 500, 0, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
+        if key in ("arr", "po", "crosscheck", "upload"):
+            with st.expander("📦 View & filter pending" + (" (date, area)" if key == "arr" else "")):
+                pending_view(team, key, area)
         if n > 0:
-            items.append({"key": key, "label": label, "target": int(n),
-                          **({"over": True, "usual": round(real, 1)} if n > limit else {})})
+            items.append({"key": key, "label": label, "target": int(n)})
     sure = True
-    if too_high:
-        for label, n, r in too_high:
-            st.warning(f"⚠️ **{label}: {n}** is too high" + (f" — realistic is about **{r}** in {hours} hr." if r else ".")
-                       + " Plan honestly: your block is judged against what you plan.")
-        sure = st.checkbox("Yes, I can really do this (it will be marked in my review)", key=f"blk_sure_{hours}")
     c1, c2 = st.columns([3, 1])
     with c1:
         note = st.text_input("✏️ Other work (write it yourself)", key="blk_note",
@@ -11201,6 +11267,85 @@ def show_review_history(kp):
                      hide_index=True, width='stretch')
 
 
+
+# ── CLOSE OLD PENDING CUSTOMER MEDICINES (admin clean-up) ────────────────────
+def show_close_old_lines(kp="col"):
+    with st.expander("🧹 Close old pending medicines (clean-up)"):
+        st.caption("Old customer medicines that were never marked In Store / Not Available / Arranged make the "
+                   "pending lists and the team's plan counts wrong. Closing keeps them in history (status 🧹 Closed) "
+                   "and they can be reopened with Undo.")
+        c1, c2 = st.columns(2)
+        with c1:
+            days = st.number_input("Older than (days)", 1, 365, 7, key=f"{kp}_days",
+                                   help="By scheduled date. 7 = everything scheduled before " +
+                                        (today_ist() - timedelta(days=7)).strftime("%d %b"))
+        with c2:
+            area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+        cut = (today_ist() - timedelta(days=int(days))).strftime("%Y-%m-%d")
+        try:
+            lines = [l for l in get_open_lines(None if area == "All Areas" else area)
+                     if l.get("status") == "Pending" and l.get("scheduled_date") and l["scheduled_date"] < cut]
+        except Exception as e:
+            st.error(f"Could not load ({e})")
+            return
+        no_date = 0
+        try:
+            no_date = sum(1 for l in get_open_lines(None if area == "All Areas" else area)
+                          if l.get("status") == "Pending" and not l.get("scheduled_date"))
+        except Exception:
+            pass
+        if not lines:
+            st.success(f"✅ No pending medicines scheduled before {_sched_label(cut)}.")
+        else:
+            dates = sorted(l.get("scheduled_date") for l in lines)
+            by_area = {}
+            for l in lines:
+                by_area[l.get("area") or "—"] = by_area.get(l.get("area") or "—", 0) + 1
+            st.markdown(f"**{len(lines)} pending medicines** scheduled {_sched_label(dates[0])} – {_sched_label(dates[-1])} · "
+                        + " · ".join(f"{a}: {n}" for a, n in sorted(by_area.items())))
+            st.dataframe(pd.DataFrame([{"Date": _sched_label(l.get("scheduled_date")), "Order": l.get("order_no", ""),
+                                        "Medicine": l.get("item_name", ""), "Customer": l.get("customer_name") or "",
+                                        "Area": l.get("area", "")} for l in lines[:300]]),
+                         hide_index=True, width='stretch', height=250)
+            st.caption("Only ⏳ Pending medicines are closed. Part-arranged ones (already ordered) are left alone.")
+            ok = st.checkbox(f"Yes, close these {len(lines)} medicines", key=f"{kp}_ok")
+            if st.button(f"🧹 Close {len(lines)} old medicines", type="primary", disabled=not ok, key=f"{kp}_go"):
+                note = f"Auto-closed {date_str()} by {st.session_state.name} (scheduled before {cut})"
+                try:
+                    for part in _chunks([l["id"] for l in lines], 100):
+                        supabase.table("customer_order_lines").update({
+                            "status": "Closed", "remainder_note": note, "decided_by": st.session_state.name,
+                            "decided_at": now_iso()}).in_("id", part).eq("status", "Pending").execute()
+                    log_simple_task("Close Old Pending Medicines", {"lines": str(len(lines)), "before": cut, "area": area})
+                    st.success(f"✅ Closed {len(lines)} medicines.")
+                    purchase_pending.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not close: {e}")
+        if no_date:
+            st.caption(f"ℹ️ {no_date} pending medicine(s) have no scheduled date — they are not touched.")
+        # undo the latest clean-ups
+        try:
+            closed = fetch_all("customer_order_lines", lambda q: q.eq("status", "Closed"))
+        except Exception:
+            closed = []
+        batches = {}
+        for l in closed:
+            batches.setdefault(l.get("remainder_note") or "", []).append(l["id"])
+        if batches:
+            st.markdown("**↩️ Undo a clean-up**")
+            for note, ids in sorted(batches.items(), reverse=True)[:5]:
+                c1, c2 = st.columns([4, 1])
+                c1.caption(f"{note} — {len(ids)} medicines")
+                if c2.button("Reopen", key=f"{kp}_undo_{abs(hash(note))}"):
+                    for part in _chunks(ids, 100):
+                        supabase.table("customer_order_lines").update({
+                            "status": "Pending", "remainder_note": None, "decided_by": None, "decided_at": None
+                        }).in_("id", part).eq("status", "Closed").execute()
+                    purchase_pending.clear()
+                    st.rerun()
+
+
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
@@ -11265,6 +11410,7 @@ def show_admin_page():
         show_attendance_admin("adm_att")
 
     with tab7:
+        show_close_old_lines("adm_col")
         show_customer_order_tracker("adm", show_phone=True)
 
     with tab8:
