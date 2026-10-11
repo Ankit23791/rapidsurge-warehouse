@@ -10486,6 +10486,15 @@ PLAN_ITEMS = {   # key, label, task types counted (or a special counter)
     "Call": [("calls", "📞 Calls made", "calls"),
              ("marked", "🚚 Delivery status marked", "marked")],
 }
+PLAN_HELP = {
+    "crosscheck": "1 = one bill cross-checked", "upload": "1 = one bill uploaded in the software",
+    "register": "1 = one distributor bill entered", "storepick": "1 = one customer medicine picked from the shelf",
+    "arr": "1 = one arrangement order placed with a distributor",
+    "po": "1 = one order sent to one distributor (call / PharmaRack / Excel / order sheet)",
+    "return": "1 = one purchase return entry", "calls": "1 = one call made (from your Call Log)",
+    "marked": "1 = one customer medicine marked Delivered / Not delivered",
+}
+PLAN_MAX_PER_HR = 30          # no history at all -> anything above this per hour is surely a typo
 REVIEW_SLOTS = [("mid", "1:30 PM", (13, 30)), ("eve", "5:30 PM", (17, 30)), ("night", "8:00 PM", (20, 0))]
 RATINGS = {"green": "🟢 On track", "orange": "🟠 Needs push", "red": "🔴 Problem"}
 
@@ -10631,6 +10640,59 @@ def _usual_pace(person, team):
     return out
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _team_pace(team):
+    """{item key: per person-hour} for a whole team over the last 7 days"""
+    lo = (today_ist() - timedelta(days=7)).strftime("%Y-%m-%d")
+    hi = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+    users = load_users() or {}
+    members = {u.get("name") for u in users.values() if u.get("team") == team}
+    hours = sum(h for p, h in _present_hours(lo, hi).items() if p in members)
+    if hours < 4:
+        return {}
+    try:
+        rows = [t for t in fetch_all("daily_tasks", lambda q: q.eq("team", team).gte("date", lo).lte("date", hi))
+                if t.get("status") != "In Progress" and t.get("person") in members]
+    except Exception:
+        return {}
+    out = {}
+    for k, _, how in PLAN_ITEMS.get(team, []):
+        if isinstance(how, list):
+            n = sum(1 for t in rows if t.get("task_type") in how)
+        elif how == "calls":
+            n = sum(_to_float((t.get("details") or {}).get("calls_made"), 0) for t in rows if t.get("task_type") == "Call Log")
+        else:
+            n = 0
+        if n:
+            out[k] = n / hours
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def purchase_pending():
+    """what is waiting for the purchase team right now"""
+    out = {}
+    lo = (today_ist() - timedelta(days=3)).strftime("%Y-%m-%d")
+    hi = (today_ist() + timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        rows = fetch_all("customer_order_lines", lambda q: q.eq("status", "Pending").gte("scheduled_date", lo).lte("scheduled_date", hi))
+        out["arr"] = sum(1 for l in rows if not l.get("removed"))
+    except Exception:
+        pass
+    try:
+        rows = fetch_all("order_sheet_lines", lambda q: q.eq("sheet_date", date_str()).eq("status", "Pending"))
+        out["po"] = sum(1 for l in rows if not l.get("superseded_by"))
+    except Exception:
+        pass
+    out["crosscheck"] = stock_pending("All Areas").get("crosscheck", 0)
+    return out
+
+
+PENDING_TXT = {"arr": "{} customer medicines waiting for an order", "po": "{} order-sheet items not ordered yet",
+               "crosscheck": "{} bills waiting for cross check", "upload": "{} bills waiting for upload",
+               "storepick": "{} medicines to pick from the shelf"}
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def stock_pending(area):
     """bills waiting for cross check / upload in an area (today + yesterday)"""
@@ -10754,32 +10816,46 @@ def show_plan_form():
                    horizontal=True, key="blk_hrs")
     hours = int(hrs.split()[0])
     pace = _usual_pace(me, team)
-    pend = stock_pending(area) if team == "Stock" else {}
-    items = []
+    tpace = _team_pace(team)
+    pend = stock_pending(area) if team == "Stock" else purchase_pending() if team == "Purchase" else {}
+    items, too_high = [], []
     for key, label, _ in PLAN_ITEMS.get(team, []):
-        p = pace.get(key)
-        sugg = int(round(p * hours)) if p else 0
-        hint = []
-        if key in pend and pend[key]:
-            hint.append(f"{pend[key]} pending")
-        if p:
-            hint.append(f"your usual ≈ {sugg} in {hours} hr")
-        if key in pend and pend[key] and sugg:
+        p, tp = pace.get(key), tpace.get(key)
+        real = (p or tp or 0) * hours                 # realistic number for this block
+        sugg = int(round(real)) if real >= 0.5 else 0
+        if pend.get(key) is not None and sugg:
             sugg = min(sugg, pend[key])
+        hint = [PLAN_HELP.get(key, "")]
+        if pend.get(key):
+            hint.append("📦 " + PENDING_TXT.get(key, "{} pending").format(pend[key]))
+        if p:
+            hint.append(f"your usual ≈ {max(1, round(p * hours))} in {hours} hr")
+        elif tp:
+            hint.append(f"team usual ≈ {max(1, round(tp * hours))} in {hours} hr")
         c1, c2 = st.columns([3, 1])
         with c1:
-            st.markdown(f"**{label}**" + (f"  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(hint)}</span>"
-                                          if hint else ""), unsafe_allow_html=True)
+            st.markdown(f"**{label}**  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(h for h in hint if h)}</span>",
+                        unsafe_allow_html=True)
         with c2:
             n = st.number_input(label, 0, 500, sugg, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
+        limit = max(3 * real, real + 3) if real else PLAN_MAX_PER_HR * hours
+        if n > limit:
+            too_high.append((label, n, max(1, round(real)) if real else None))
         if n > 0:
-            items.append({"key": key, "label": label, "target": int(n)})
+            items.append({"key": key, "label": label, "target": int(n),
+                          **({"over": True, "usual": round(real, 1)} if n > limit else {})})
+    sure = True
+    if too_high:
+        for label, n, r in too_high:
+            st.warning(f"⚠️ **{label}: {n}** is too high" + (f" — realistic is about **{r}** in {hours} hr." if r else ".")
+                       + " Plan honestly: your block is judged against what you plan.")
+        sure = st.checkbox("Yes, I can really do this (it will be marked in my review)", key=f"blk_sure_{hours}")
     note = st.text_input("Anything else in this block? (optional)", key="blk_note",
                          placeholder="e.g. help Sachin with stock count")
     c1, c2 = st.columns([2, 1])
     with c1:
         if st.button(f"🚀 Start {hours}-hour block", type="primary", width='stretch', key="blk_start",
-                     disabled=not items and not note.strip()):
+                     disabled=(not items and not note.strip()) or not sure):
             s = _now_n()
             supabase.table("work_blocks").insert({
                 "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
@@ -10896,6 +10972,8 @@ def review_facts(person, team, area, slot_key, day):
             "gaps": _idle_gaps(tasks, lo, hi, person) if hi > lo else [],
             "plans": plans, "skips": skips, "hit": round(sum(pcts) / len(pcts)) if pcts else None,
             "reasons": [b.get("reason") for b in plans if b.get("reason")],
+            "over": [f"{it.get('label')} {it.get('target')} (usual ≈ {it.get('usual')})"
+                     for b in plans for it in (b.get("items") or []) if it.get("over")],
             "rate": rows_now / worked_h if worked_h >= 0.5 else None, "rate7": pace7 or None,
             "pending": stock_pending(area) if team == "Stock" else {},
             "clock_out": out_t}
@@ -11004,6 +11082,8 @@ def review_card(u, f, slot_key, slot_label, day, kp):
                 f"{a.strftime('%I:%M')}–{b.strftime('%I:%M %p')} ({fmt_age(m)})" for a, b, m in f["gaps"]))
         if f["reasons"]:
             st.markdown("🗒️ **Their reasons:** " + "; ".join(f["reasons"]))
+        if f.get("over"):
+            st.markdown("⚠️ **Planned above realistic:** " + "; ".join(f["over"]))
         pend = {k: v for k, v in (f.get("pending") or {}).items() if v}
         if pend and slot_key != "day":
             st.markdown("📦 **Pending in area:** " + ", ".join(f"{k} {v}" for k, v in pend.items()))
