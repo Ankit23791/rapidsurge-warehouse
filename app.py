@@ -10478,8 +10478,8 @@ PLAN_ITEMS = {   # key, label, task types counted (or a special counter)
               ("upload", "📤 Bill Upload", ["Bill Upload (Software)", "Bill Upload"]),
               ("register", "📒 Register Entry", ["Register Entry"]),
               ("storepick", "🏪 In-Store Pick", "storepick")],
-    "Purchase": [("po", "💊 Medicines ordered — Purchase / Order Sheet", ("sum", ["Purchase Order"], "no_sku")),
-                 ("arr", "💊 Medicines ordered — Arrangement", ("sum", ["Arrangement Order", "Arrangement"], "no_medicines")),
+    "Purchase": [("po", "💊 Medicines to order — Purchase / Order Sheet", ("sum", ["Purchase Order"], "no_sku")),
+                 ("arr", "💊 Medicines to order — Arrangement", ("sum", ["Arrangement Order", "Arrangement"], "no_medicines")),
                  ("register", "📒 Register Entry", ["Register Entry"]),
                  ("crosscheck", "✔️ Bill Cross Check", ["Bill Cross Check"])],
     "Call": [("calls", "📞 Calls made", "calls"),
@@ -10488,8 +10488,8 @@ PLAN_ITEMS = {   # key, label, task types counted (or a special counter)
 PLAN_HELP = {
     "crosscheck": "1 = one bill cross-checked", "upload": "1 = one bill uploaded in the software",
     "register": "1 = one distributor bill entered", "storepick": "1 = one customer medicine picked from the shelf",
-    "arr": "1 = one medicine in an arrangement order (an order of 3 medicines = 3)",
-    "po": "1 = one medicine (SKU) ordered — Purchase Order or Order Sheet (an order of 12 SKUs = 12)",
+    "arr": "How many medicines you will order through arrangement orders (an order of 3 medicines = 3)",
+    "po": "How many medicines (SKUs) you will order — Purchase Order or Order Sheet (an order of 12 SKUs = 12)",
     "return": "1 = one purchase return entry", "calls": "1 = one call made (from your Call Log)",
     "marked": "1 = one customer medicine marked Delivered / Not delivered",
 }
@@ -10634,13 +10634,15 @@ def _usual_pace(person, team):
     """{item key: per hour} from the last 7 days (excluding today)"""
     lo = (today_ist() - timedelta(days=7)).strftime("%Y-%m-%d")
     hi = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
-    hours = _present_hours(lo, hi).get(person, 0)
-    if hours < 2:
-        return {}
     try:
         rows = [t for t in fetch_all("daily_tasks", lambda q: q.eq("person", person).gte("date", lo).lte("date", hi))
                 if t.get("status") != "In Progress"]
     except Exception:
+        return {}
+    hours = max(_present_hours(lo, hi).get(person, 0), 0)
+    if hours < 2:                                   # no clock-in history -> 8 h per day with tasks
+        hours = 8 * len({t.get("date") for t in rows})
+    if hours < 2:
         return {}
     out = {}
     for k, _, how in PLAN_ITEMS.get(team, []):
@@ -10657,13 +10659,18 @@ def _team_pace(team):
     hi = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
     users = load_users() or {}
     members = {u.get("name") for u in users.values() if u.get("team") == team}
-    hours = sum(h for p, h in _present_hours(lo, hi).items() if p in members)
-    if hours < 4:
-        return {}
     try:
         rows = [t for t in fetch_all("daily_tasks", lambda q: q.eq("team", team).gte("date", lo).lte("date", hi))
                 if t.get("status") != "In Progress" and t.get("person") in members]
     except Exception:
+        return {}
+    ph = _present_hours(lo, hi)
+    hours, days_by = 0, {}
+    for t in rows:
+        days_by.setdefault(t.get("person"), set()).add(t.get("date"))
+    for p, ds in days_by.items():
+        hours += ph.get(p) if ph.get(p, 0) >= 2 else 8 * len(ds)
+    if hours < 4:
         return {}
     out = {}
     for k, _, how in PLAN_ITEMS.get(team, []):
@@ -10693,7 +10700,7 @@ def purchase_pending():
     return out
 
 
-PENDING_TXT = {"arr": "{} customer medicines waiting for an order", "po": "{} order-sheet items not ordered yet",
+PENDING_TXT = {"arr": "{} customer medicines need to be ordered", "po": "{} order-sheet medicines need to be ordered",
                "crosscheck": "{} bills waiting for cross check", "upload": "{} bills waiting for upload",
                "storepick": "{} medicines to pick from the shelf"}
 
@@ -10845,7 +10852,7 @@ def show_plan_form():
         p, tp = pace.get(key), tpace.get(key)
         real = (p or tp or 0) * hours                 # realistic number for this block
         sugg = int(round(real)) if real >= 0.5 else 0
-        if pend.get(key) is not None and sugg:
+        if key != "po" and pend.get(key) is not None and sugg:   # PO can also be phone orders -> no cap
             sugg = min(sugg, pend[key])
         hint = [PLAN_HELP.get(key, "")]
         if pend.get(key):
