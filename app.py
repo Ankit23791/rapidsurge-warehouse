@@ -217,21 +217,36 @@ def load_areas():
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
+def _load_users_cached():
+    # raises on a database error -> a failure is NOT cached (it used to cache {} = nobody could log in)
+    resp = supabase.table("app_users").select("*").eq("active", True).execute()
+    users = {}
+    for u in resp.data or []:
+        users[str(u["username"]).strip()] = {
+            "password": u["password"],
+            "name": u["name"],
+            "team": u["team"],
+            "role": u["role"],
+            "phone": u.get("phone") or ""
+        }
+    return users
+
 def load_users():
     try:
-        resp = supabase.table("app_users").select("*").eq("active", True).execute()
-        users = {}
-        for u in resp.data:
-            users[u["username"]] = {
-                "password": u["password"],
-                "name": u["name"],
-                "team": u["team"],
-                "role": u["role"],
-                "phone": u.get("phone") or ""
-            }
-        return users
-    except:
+        return _load_users_cached()
+    except Exception as e:
+        st.session_state["_users_err"] = str(e)
         return {}
+load_users.clear = _load_users_cached.clear
+
+def find_user(username, users=None):
+    """Username match that ignores capital letters and spaces at the ends (phones add them)"""
+    users = users if users is not None else load_users()
+    u = str(username or "").strip()
+    if u in users:
+        return u
+    low = {k.lower(): k for k in users}
+    return low.get(u.lower())
 
 USERS = load_users()
 
@@ -424,17 +439,30 @@ def show_login():
         username = st.text_input("👤 Username", placeholder="Enter username")
         password = st.text_input("🔒 Password", type="password", placeholder="Enter password")
         if st.button("🚀 Login", width='stretch', type="primary"):
-            if username in USERS and USERS[username]["password"] == password:
+            USERS_NOW = load_users()                       # fresh list (new users / changed passwords)
+            uname = find_user(username, USERS_NOW)
+            if not USERS_NOW:
+                st.error("⚠️ Can't reach the database right now — this is not your password. "
+                         "Wait a minute and try again. If it continues, tell Ankit.")
+                st.stop()
+            if not uname:
+                st.error("❌ Username not found — check the spelling, or ask Ankit if your user is active.")
+                st.stop()
+            if str(USERS_NOW[uname]["password"]) != str(password).strip() and str(USERS_NOW[uname]["password"]) != str(password):
+                st.error("❌ Wrong password.")
+                st.stop()
+            username = uname
+            if True:
                 st.session_state.logged_in = True
                 st.session_state.username = username
-                st.session_state.name = USERS[username]["name"]
-                st.session_state.team = USERS[username]["team"]
-                st.session_state.role = USERS[username]["role"]
+                st.session_state.name = USERS_NOW[username]["name"]
+                st.session_state.team = USERS_NOW[username]["team"]
+                st.session_state.role = USERS_NOW[username]["role"]
                 st.session_state.work_area = ""
                 st.session_state["fresh_login"] = True     # Stock: ask the area again after a real login
                 # Store login in URL for persistence
                 import hashlib
-                token = hashlib.md5((username + password).encode()).hexdigest()[:8]
+                token = hashlib.md5((username + str(USERS_NOW[username]["password"])).encode()).hexdigest()[:8]
                 st.query_params["u"] = username
                 st.query_params["t"] = token
                 st.rerun()
