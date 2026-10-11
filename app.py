@@ -343,6 +343,22 @@ def calc_actual_duration(df):
     except:
         return 0
 
+def compress_image(raw, fname=""):
+    """Phone photos are 2-5 MB; store them at max 1600 px, JPEG quality 70 (~150-300 KB, still readable).
+    PDFs and anything that is not an image are stored as they are."""
+    if str(fname).lower().endswith(".pdf") or raw[:4] == b"%PDF":
+        return raw, "application/pdf", "pdf"
+    try:
+        from PIL import Image, ImageOps
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        im.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=70, optimize=True)
+        out = buf.getvalue()
+        return (out if len(out) < len(raw) else raw), "image/jpeg", "jpg"
+    except Exception:
+        return raw, "image/jpeg", "jpg"
+
 def upload_image(file, prefix="img"):
     if file is None:
         return ""
@@ -350,11 +366,13 @@ def upload_image(file, prefix="img"):
     if base:   # photo-first box: clear it for the next entry
         st.session_state[base + "_v"] = st.session_state.get(base + "_v", 0) + 1
     try:
-        name = f"{prefix}_{now_ist().strftime('%Y%m%d_%H%M%S')}.jpg"
+        import uuid
+        data, ctype, ext = compress_image(file.getbuffer().tobytes(), getattr(file, "name", ""))
+        name = f"{prefix}_{now_ist().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.{ext}"
         supabase.storage.from_("Images").upload(
             path=name,
-            file=file.getbuffer().tobytes(),
-            file_options={"content-type": "image/jpeg"}
+            file=data,
+            file_options={"content-type": ctype}
         )
         return name
     except Exception as e:
@@ -444,6 +462,9 @@ def show_login():
             if not USERS_NOW:
                 st.error("⚠️ Can't reach the database right now — this is not your password. "
                          "Wait a minute and try again. If it continues, tell Ankit.")
+                err = st.session_state.get("_users_err", "")
+                if err:
+                    st.caption(f"Technical detail (send this to Ankit): {err[:300]}")
                 st.stop()
             if not uname:
                 st.error("❌ Username not found — check the spelling, or ask Ankit if your user is active.")
@@ -1375,7 +1396,7 @@ def form_call_log():
                 st.error(f"Error: {e}")
 
 # ── PICKUP FORM ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, max_entries=300, show_spinner=False)
 def load_image_bytes(name):
     """Download an image from Supabase storage once and reuse it (images never change)"""
     return supabase.storage.from_("Images").download(name.strip())
@@ -1390,7 +1411,11 @@ def show_image(name, caption="", key="", width='stretch'):
             st.download_button("🔍 Download to zoom", data, file_name=f"{key}.jpg", mime="image/jpeg", key=f"dl_{key}")
         return True
     except Exception as e:
-        st.warning(f"⚠️ Image error: {e}")
+        note = removed_photo_note(name)
+        if note:
+            st.info(note)
+        else:
+            st.warning(f"⚠️ Image error: {e}")
         return False
 
 def load_arrangement_medicines(arr_id):
@@ -3414,6 +3439,7 @@ def show_user_page():
 
     # ── MANAGER: switch between own work and team view ───────────────────────
     if st.session_state.get("role") == "manager":
+        pending_reviews_banner()
         mode = st.radio("View", ["🧑‍💼 My Work", "👥 Team View"], horizontal=True,
                         key="mgr_mode", label_visibility="collapsed")
         if mode == "👥 Team View":
@@ -3422,6 +3448,11 @@ def show_user_page():
 
     # ── ATTENDANCE: clock in first; no tasks while on a break ────────────────
     if not attendance_gate():
+        return
+
+    # ── REVIEW COMMENTS + 🎯 PLAN THE NEXT 1–2 HOURS (compulsory for Stock / Purchase / Call) ──
+    show_my_reviews()
+    if not block_gate():
         return
 
     # ── TASKS FROM ADMIN ──────────────────────────────────────────────────────
@@ -7448,7 +7479,8 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
+    t11, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["🔎 Reviews", "👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
+    with t11: show_reviews("mgr_rv")
     with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
     with t2: show_full_day_picker("mgr_fd")
@@ -10067,13 +10099,1007 @@ def league_mini(team):
             st.caption(tip.strip(" ·"))
 
 # ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📦 PHOTO ARCHIVE — weekly ZIP download + safe cleanup (keeps Supabase under 1 GB)
+#   A photo is deleted from Supabase ONLY when it is older than N days (default 7)
+#   AND admin has confirmed the ZIP containing it was saved.
+#   Records (bill no, amount, person, timings, league) are never deleted.
+# ══════════════════════════════════════════════════════════════════════════════
+import json
+STORAGE_LIMIT_GB = 1.0
+PHOTO_TABLES = [            # (table, date column, kind of date) — rows are scanned for photo file names
+    ("daily_tasks", "date", "text"),
+    ("arrangements", "created_at", "ts"),
+    ("porter_bookings", "created_at", "ts"),
+    ("km_log", "date", "text"),
+]
+_PHOTO_KIND = {"bill_check": "Bill check", "bill_arr": "Bill upload", "bill": "Bill", "arr": "Arrangement order",
+               "pickup": "Pickup medicines", "placement": "Placement", "invoice": "Invoice", "handover": "Porter handover",
+               "dist_recv": "Received from distributor", "receipt": "Porter receipt", "payment": "Payment",
+               "bounce": "Bounce study", "km_start": "KM start", "km_end": "KM end"}
+_FILE_RE = re.compile(r"[A-Za-z0-9_\-]+\.(?:jpg|jpeg|png|pdf)", re.I)
+_NAME_TS = re.compile(r"^(.*?)_(\d{8})_(\d{6})")
+
+
+def get_app_setting(key, default=None):
+    try:
+        r = supabase.table("app_settings").select("value").eq("key", key).execute().data
+        return r[0]["value"] if r else default
+    except Exception:
+        return default
+
+
+def set_app_setting(key, value):
+    supabase.table("app_settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
+
+
+def photo_keep_days():
+    try:
+        return max(1, int(float(get_app_setting("photo_keep_days", 7))))
+    except Exception:
+        return 7
+
+
+def _photo_info_from_name(name, created_at=""):
+    """prefix + photo date/time from the file name (bill_20261005_104233_ab12.jpg); falls back to storage time"""
+    m = _NAME_TS.match(name)
+    if m:
+        prefix, d, t = m.groups()
+        try:
+            dt = datetime.strptime(d + t, "%Y%m%d%H%M%S")
+            return prefix, dt.strftime("%Y-%m-%d"), dt.strftime("%I-%M%p").lower()
+        except ValueError:
+            pass
+    prefix = name.split("_")[0] if "_" in name else "photo"
+    try:
+        dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).astimezone(IST)
+        return prefix, dt.strftime("%Y-%m-%d"), dt.strftime("%I-%M%p").lower()
+    except Exception:
+        return prefix, "unknown-date", ""
+
+
+def _kind_of(prefix):
+    if prefix.startswith("receipt"):
+        return "Porter receipt"
+    return _PHOTO_KIND.get(prefix, prefix.replace("_", " ").title())
+
+
+def _list_storage_raw():
+    """every file in the Images bucket: [{name, size, created_at}] (raises on error)"""
+    out, offset = [], 0
+    bucket = supabase.storage.from_("Images")
+    while True:
+        batch = bucket.list("", {"limit": 1000, "offset": offset, "sortBy": {"column": "name", "order": "asc"}}) or []
+        for f in batch:
+            if f.get("id") is None:          # a folder, not a file
+                continue
+            meta = f.get("metadata") or {}
+            out.append({"name": f["name"], "size": int(meta.get("size") or 0), "created_at": f.get("created_at", "")})
+        if len(batch) < 1000:
+            return out
+        offset += 1000
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _list_storage_cached():
+    return _list_storage_raw()
+
+
+def list_storage_files():
+    try:
+        return _list_storage_cached(), ""
+    except Exception as e:
+        return [], str(e)
+list_storage_files.clear = _list_storage_cached.clear
+
+
+def load_photo_archive():
+    """{name: row} of photos already saved in a ZIP"""
+    rows, offset = {}, 0
+    try:
+        while True:
+            batch = supabase.table("photo_archive").select("*").range(offset, offset + 999).execute().data or []
+            for r in batch:
+                rows[r["name"]] = r
+            if len(batch) < 1000:
+                return rows
+            offset += 1000
+    except Exception:
+        return rows
+
+
+def _pick(row, *keys):
+    det = row.get("details") if isinstance(row.get("details"), dict) else {}
+    for k in keys:
+        v = row.get(k) or det.get(k)
+        if v not in (None, "", "None"):
+            return str(v)
+    return ""
+
+
+def photo_index(names, d_from, d_to):
+    """file name -> who / what / where, by scanning the rows of the days around the photos"""
+    want, found = set(names), {}
+    lo = (d_from - timedelta(days=3)).strftime("%Y-%m-%d")
+    hi = (d_to + timedelta(days=10)).strftime("%Y-%m-%d")
+    for table, col, kind in PHOTO_TABLES:
+        rows, offset = [], 0
+        try:
+            while True:
+                q = supabase.table(table).select("*")
+                q = q.gte(col, lo).lte(col, hi + ("T23:59:59" if kind == "ts" else ""))
+                batch = q.range(offset, offset + 999).execute().data or []
+                rows += batch
+                if len(batch) < 1000:
+                    break
+                offset += 1000
+        except Exception:
+            try:     # table without that date column -> latest rows
+                rows = supabase.table(table).select("*").order("id", desc=True).limit(3000).execute().data or []
+            except Exception:
+                continue
+        for r in rows:
+            blob = json.dumps(r, default=str)
+            hits = [n for n in set(_FILE_RE.findall(blob)) if n in want]
+            if not hits:
+                continue
+            info = {
+                "Person": _pick(r, "person", "order_by", "picked_by", "handover_by", "received_by", "booked_by", "uploaded_by"),
+                "Team": _pick(r, "team"),
+                "Task": _pick(r, "task_type") or table.replace("_", " ").title(),
+                "Area": _pick(r, "work_area", "area", "warehouse"),
+                "Distributor": _pick(r, "distributor", "distributor_name"),
+                "Bill / Invoice no": _pick(r, "bill_no", "bill_number", "invoice_no", "bill_order_id"),
+                "Arrangement no": _pick(r, "arrangement_no", "arr_no"),
+                "Amount": _pick(r, "amount", "bill_amount", "total_amount"),
+                "Record": f"{table} #{r.get('id', '')}",
+            }
+            for n in hits:
+                if n not in found or not found[n]["Person"]:
+                    found[n] = info
+    return found
+
+
+def _safe(s, n=30):
+    s = re.sub(r"[^A-Za-z0-9\-]+", "-", str(s or "")).strip("-")
+    return s[:n]
+
+
+def build_photo_zip(files, d_from, d_to, progress=None):
+    """ZIP: <date>/<Area>_<Person>_<Kind>_<Bill>_<time>.jpg  +  photo_index.xlsx"""
+    import zipfile
+    idx = photo_index([f["name"] for f in files], d_from, d_to)
+    buf, rows, used = io.BytesIO(), [], set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:     # JPEGs don't shrink further; store = fast
+        for i, f in enumerate(files):
+            name = f["name"]
+            prefix, day, tm = _photo_info_from_name(name, f.get("created_at"))
+            info = idx.get(name, {})
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else "jpg"
+            parts = [_safe(info.get("Area"), 12), _safe(info.get("Person"), 20), _safe(_kind_of(prefix), 25),
+                     _safe(info.get("Bill / Invoice no") or info.get("Arrangement no"), 20), tm]
+            base = "_".join(p for p in parts if p) or _safe(name, 40)
+            fn, k = f"{day}/{base}.{ext}", 2
+            while fn in used:
+                fn, k = f"{day}/{base}_{k}.{ext}", k + 1
+            used.add(fn)
+            status = "Saved"
+            try:
+                data = supabase.storage.from_("Images").download(name)
+                if ext != "pdf":
+                    data, _, _ = compress_image(data, name)     # old full-size photos shrink here too
+                z.writestr(fn, data)
+            except Exception as e:
+                status = f"Could not download: {e}"
+            rows.append({"Date": day, "Time": tm.replace("-", ":"), "Photo of": _kind_of(prefix),
+                         "Person": info.get("Person", ""), "Team": info.get("Team", ""), "Task": info.get("Task", ""),
+                         "Area": info.get("Area", ""), "Distributor": info.get("Distributor", ""),
+                         "Bill / Invoice no": info.get("Bill / Invoice no", ""), "Arrangement no": info.get("Arrangement no", ""),
+                         "Amount": info.get("Amount", ""), "File in ZIP": fn if status == "Saved" else "",
+                         "Original name": name, "Record": info.get("Record", "not linked"), "Status": status})
+            if progress:
+                progress.progress((i + 1) / max(len(files), 1), text=f"Packing photo {i + 1} of {len(files)}")
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
+            pd.DataFrame(rows).to_excel(w, index=False, sheet_name="Photos")
+        z.writestr("photo_index.xlsx", xbuf.getvalue())
+    ok = [r["Original name"] for r in rows if r["Status"] == "Saved"]
+    return buf.getvalue(), ok, rows
+
+
+def cleanup_old_photos(force=False):
+    """delete photos older than keep-days that are saved in a ZIP. Runs once a day (first admin visit)."""
+    today = date_str()
+    if not force and get_app_setting("photo_cleanup_last") == today:
+        return None
+    keep = photo_keep_days()
+    cutoff = (today_ist() - timedelta(days=keep)).strftime("%Y-%m-%d")
+    arch = load_photo_archive()
+    files, err = list_storage_files()
+    if err:
+        return f"Cleanup skipped — storage not reachable ({err})"
+    todo = []
+    for f in files:
+        a = arch.get(f["name"])
+        if not a or a.get("deleted_at"):
+            continue
+        _, day, _ = _photo_info_from_name(f["name"], f.get("created_at"))
+        if day != "unknown-date" and day < cutoff:
+            todo.append(f["name"])
+    done = 0
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
+        try:
+            supabase.storage.from_("Images").remove(chunk)
+            supabase.table("photo_archive").update({"deleted_at": now_iso()}).in_("name", chunk).execute()
+            done += len(chunk)
+        except Exception as e:
+            return f"Cleanup stopped after {done} photos: {e}"
+    try:
+        set_app_setting("photo_cleanup_last", today)
+    except Exception:
+        pass
+    if done:
+        list_storage_files.clear()
+    return f"🧹 Removed {done} saved photo(s) older than {keep} days" if done else ""
+
+
+def removed_photo_note(name):
+    """'saved in ZIP …' text if this photo was archived and deleted, else ''"""
+    try:
+        r = supabase.table("photo_archive").select("zip_name,deleted_at").eq("name", str(name).strip()).execute().data
+        if r and r[0].get("deleted_at"):
+            return f"📷 Photo removed from the app after {photo_keep_days()} days — it is saved in **{r[0].get('zip_name', 'the weekly ZIP')}** (see photo_index.xlsx)."
+    except Exception:
+        pass
+    return ""
+
+
+def show_photo_archive(kp="ph"):
+    st.subheader("📦 Photos — weekly download & cleanup")
+    files, err = list_storage_files()
+    if err:
+        st.error("⚠️ Can't read photo storage right now (Supabase may be restricted).")
+        st.caption(f"Technical detail: {err}")
+        return
+    arch = load_photo_archive()
+    total = sum(f["size"] for f in files) / 1024 ** 3
+    pct = total / STORAGE_LIMIT_GB
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Photo storage", f"{total:.2f} GB", f"of {STORAGE_LIMIT_GB:.0f} GB free plan", delta_color="off")
+    pending = [f for f in files if f["name"] not in arch]
+    c2.metric("Not yet downloaded", len(pending))
+    c3.metric("Keep photos for", f"{photo_keep_days()} days")
+    st.progress(min(pct, 1.0), text=f"{pct * 100:.0f}% used (database is separate)")
+    if pct >= 0.8:
+        st.error("🔴 Storage almost full — download the ZIP and run cleanup now, or Supabase will block the app.")
+    elif pct >= 0.6:
+        st.warning("🟠 Storage above 60% — download this week's ZIP soon.")
+    if st.button("🔄 Refresh storage numbers", key=f"{kp}_rf"):
+        list_storage_files.clear()
+        st.rerun()
+
+    st.markdown("#### 1️⃣ Download photos")
+    if not pending:
+        st.success("✅ Every photo is already saved in a ZIP.")
+    else:
+        days = sorted({_photo_info_from_name(f["name"], f.get("created_at"))[1] for f in pending} - {"unknown-date"})
+        first = datetime.strptime(days[0], "%Y-%m-%d").date() if days else today_ist()
+        st.caption(f"Oldest photo not downloaded yet: **{first.strftime('%d %b %Y')}**. "
+                   "Tip: save the ZIP inside your Google Drive folder on the computer — it goes to Drive by itself.")
+        rng = st.date_input("Photos from – to", value=(first, min(first + timedelta(days=6), today_ist())),
+                            max_value=today_ist(), key=f"{kp}_rng", format="DD/MM/YYYY")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            d_from, d_to = rng
+            sel = [f for f in pending
+                   if d_from.strftime("%Y-%m-%d") <= _photo_info_from_name(f["name"], f.get("created_at"))[1] <= d_to.strftime("%Y-%m-%d")]
+            if d_from <= first:     # undated old files ride along with the first ZIP
+                sel += [f for f in pending if _photo_info_from_name(f["name"], f.get("created_at"))[1] == "unknown-date"]
+            mb = sum(f["size"] for f in sel) / 1024 ** 2
+            st.write(f"**{len(sel)} photos** ({mb:.0f} MB in storage — the ZIP will be smaller)")
+            if len(sel) > 2500:
+                st.warning("That is a lot of photos for one ZIP — pick fewer days so the app doesn't run out of memory.")
+            if sel and st.button(f"📦 Prepare ZIP ({len(sel)} photos)", type="primary", key=f"{kp}_mk"):
+                bar = st.progress(0.0, text="Starting…")
+                data, ok, rows = build_photo_zip(sel, d_from, d_to, bar)
+                zname = f"RapidSurge_photos_{d_from.strftime('%d%b')}-{d_to.strftime('%d%b%Y')}.zip"
+                st.session_state[f"{kp}_zip"] = {"data": data, "ok": ok, "name": zname,
+                                                 "bad": len(rows) - len(ok), "linked": sum(1 for r in rows if r["Record"] != "not linked")}
+                bar.empty()
+        z = st.session_state.get(f"{kp}_zip")
+        if z:
+            st.success(f"ZIP ready: **{len(z['ok'])} photos**, {len(z['data']) / 1024 ** 2:.1f} MB — "
+                       f"{z['linked']} linked to a person/bill.")
+            if z["bad"]:
+                st.warning(f"{z['bad']} photo(s) could not be downloaded — they stay in the app and are not marked saved.")
+            st.download_button("⬇️ Download ZIP", z["data"], file_name=z["name"], mime="application/zip",
+                               key=f"{kp}_dl", type="primary")
+            st.markdown("#### 2️⃣ Confirm it is saved")
+            st.caption("Open the ZIP on your computer once. Only after you confirm can these photos be cleaned up later.")
+            ok_box = st.checkbox("✅ I opened the ZIP and it is saved on my computer / Google Drive", key=f"{kp}_ok")
+            if st.button("Mark these photos as saved", disabled=not ok_box, key=f"{kp}_mark"):
+                try:
+                    recs = [{"name": n, "zip_name": z["name"], "archived_at": now_iso(),
+                             "archived_by": st.session_state.name} for n in z["ok"]]
+                    for i in range(0, len(recs), 500):
+                        supabase.table("photo_archive").upsert(recs[i:i + 500], on_conflict="name").execute()
+                    st.session_state.pop(f"{kp}_zip", None)
+                    st.success(f"✅ {len(recs)} photos marked as saved. They will be removed from the app "
+                               f"once they are older than {photo_keep_days()} days.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not mark photos: {e} — did you run photo_archive_setup.sql?")
+
+    st.markdown("#### 3️⃣ Cleanup")
+    keep = photo_keep_days()
+    cutoff = (today_ist() - timedelta(days=keep)).strftime("%Y-%m-%d")
+    ready = [f for f in files if f["name"] in arch and not arch[f["name"]].get("deleted_at")
+             and _photo_info_from_name(f["name"], f.get("created_at"))[1] < cutoff]
+    waiting = [f for f in files if f["name"] not in arch
+               and _photo_info_from_name(f["name"], f.get("created_at"))[1] < cutoff]
+    st.write(f"Ready to remove (saved + older than {keep} days): **{len(ready)}** "
+             f"({sum(f['size'] for f in ready) / 1024 ** 2:.0f} MB)")
+    if waiting:
+        st.info(f"{len(waiting)} photo(s) are older than {keep} days but NOT downloaded yet — they are kept until you save them.")
+    st.caption("Cleanup also runs by itself once a day when admin opens the app.")
+    if ready and st.button(f"🧹 Remove {len(ready)} saved photos now", key=f"{kp}_cl"):
+        msg = cleanup_old_photos(force=True)
+        st.success(msg or "Nothing to remove.")
+        st.rerun()
+
+    with st.expander("⚙️ Settings"):
+        nd = st.number_input("Keep photos in the app for (days)", 1, 90, keep, key=f"{kp}_kd",
+                             help="Photos stay viewable in the app this long, even after you download them.")
+        if st.button("Save", key=f"{kp}_sv"):
+            try:
+                set_app_setting("photo_keep_days", int(nd))
+                st.success("Saved")
+            except Exception as e:
+                st.error(f"Could not save: {e} — did you run photo_archive_setup.sql?")
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🎯 WORK BLOCKS (plan the next 1–2 hours) + 🔎 REVIEWS (1:30 PM · 5:30 PM · 8 PM · full day)
+#   Teams: Stock, Purchase, Call (Delivery later). Managers / admin are not asked to plan.
+#   Progress is counted automatically from tasks the person finishes during the block.
+# ══════════════════════════════════════════════════════════════════════════════
+BLOCK_TEAMS = ("Stock", "Purchase", "Call")
+BLOCK_HOURS = (1, 2)
+BLOCK_SKIP_MINS = 20
+BLOCK_REASONS = ["Waiting for bills / stock", "Called for other work", "Phone / app issue",
+                 "Customer urgent work", "Planned too much", "Other"]
+_OTHER_TYPES = ["Other", "Other Task", "Purchase Return", "Rack Cleaning", "Inventory Check", "Inventory",
+                "Porter Receipt", "Distributor Delivery Receipt", "Order Import", "Order Sheet Upload",
+                "PharmaRack Search", "Medicine Search", "Bounce Medicine Study", "Assigned Task"]
+PLAN_ITEMS = {   # key, label, task types counted (or a special counter)
+    "Stock": [("crosscheck", "✔️ Bill Cross Check", ["Bill Cross Check"]),
+              ("upload", "📤 Bill Upload", ["Bill Upload (Software)", "Bill Upload"]),
+              ("register", "📒 Register Entry", ["Register Entry"]),
+              ("storepick", "🏪 In-Store Pick", "storepick")],
+    "Purchase": [("register", "📒 Register Entry", ["Register Entry"]),
+                 ("crosscheck", "✔️ Bill Cross Check", ["Bill Cross Check"]),
+                 ("arr", "📋 Arrangement Order", ["Arrangement Order", "Arrangement"]),
+                 ("po", "🛒 Purchase Order", ["Purchase Order"]),
+                 ("return", "↩️ Purchase Return", ["Purchase Return"])],
+    "Call": [("calls", "📞 Calls made", "calls"),
+             ("marked", "🚚 Delivery status marked", "marked")],
+}
+REVIEW_SLOTS = [("mid", "1:30 PM", (13, 30)), ("eve", "5:30 PM", (17, 30)), ("night", "8:00 PM", (20, 0))]
+RATINGS = {"green": "🟢 On track", "orange": "🟠 Needs push", "red": "🔴 Problem"}
+
+
+def _naive(dt):
+    """any datetime -> naive IST (so DB times and task times compare safely)"""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None):
+        return dt.astimezone(IST).replace(tzinfo=None)
+    return dt
+
+
+def _now_n():
+    return _naive(now_ist())
+
+
+def _iso(dt_naive):
+    return IST.localize(dt_naive).isoformat()
+
+
+def is_planner(user_team=None, role=None):
+    team = user_team if user_team is not None else st.session_state.get("team")
+    role = role if role is not None else st.session_state.get("role")
+    return team in BLOCK_TEAMS and role not in ("admin", "manager")
+
+
+def is_reviewer():
+    return st.session_state.get("role") in ("admin", "manager")
+
+
+# ── counting what was done ────────────────────────────────────────────────────
+def _tasks_of(person, lo_n, hi_n):
+    """finished tasks of a person between two naive-IST datetimes"""
+    days = sorted({lo_n.strftime("%Y-%m-%d"), hi_n.strftime("%Y-%m-%d")})
+    try:
+        rows = fetch_all("daily_tasks", lambda q: q.eq("person", person).gte("date", days[0]).lte("date", days[-1]))
+    except Exception:
+        return []
+    out = []
+    for t in rows:
+        if t.get("status") == "In Progress":
+            continue
+        when = _naive(_task_dt(t, "end_time")) or _naive(to_ist(t.get("created_at")))
+        if when and lo_n <= when <= hi_n:
+            t["_when"] = when
+            out.append(t)
+    return out
+
+
+def _count_item(how, person, tasks, lo_n, hi_n):
+    if isinstance(how, list):
+        return sum(1 for t in tasks if t.get("task_type") in how)
+    if how == "calls":
+        return int(sum(_to_float((t.get("details") or {}).get("calls_made"), 0)
+                       for t in tasks if t.get("task_type") == "Call Log"))
+    col_by, col_at = {"storepick": ("store_checked_by", "store_checked_at"),
+                      "marked": ("delivery_by", "delivery_at")}[how]
+    try:
+        rows = supabase.table("customer_order_lines").select(f"{col_by},{col_at}").eq(col_by, person)\
+            .gte(col_at, _iso(lo_n)).lte(col_at, _iso(hi_n)).execute().data or []
+    except Exception:
+        return 0
+    return len(rows)
+
+
+def block_progress(block, upto=None):
+    """[(label, target, done)], percent (None if nothing countable)"""
+    lo = _naive(to_ist(block.get("start_at")))
+    hi = upto or min(_now_n(), block_end(block))
+    items = block.get("items") or []
+    if not lo or not items:
+        return [], None
+    person = block.get("person")
+    tasks = _tasks_of(person, lo, hi)
+    hows = {k: how for k, _, how in PLAN_ITEMS.get(block.get("team"), [])}
+    rows, parts = [], []
+    for it in items:
+        how = hows.get(it.get("key"))
+        tgt = int(it.get("target") or 0)
+        done = _count_item(how, person, tasks, lo, hi) if how else 0
+        rows.append((it.get("label", it.get("key")), tgt, done))
+        if tgt > 0:
+            parts.append(min(done / tgt, 1.0))
+    return rows, (round(100 * sum(parts) / len(parts)) if parts else None)
+
+
+def _break_secs_between(person, lo_n, hi_n):
+    """seconds on break between two times (breaks don't eat into a block)"""
+    try:
+        ev = supabase.table("attendance_log").select("event,at").eq("person", person)\
+            .eq("date", lo_n.strftime("%Y-%m-%d")).order("at").execute().data or []
+    except Exception:
+        return 0
+    tot, start = 0, None
+    for e in ev:
+        t = _naive(to_ist(e.get("at")))
+        if e.get("event") == "break_start":
+            start = t
+        elif e.get("event") in ("break_end", "clock_out") and start:
+            a, b = max(start, lo_n), min(t, hi_n)
+            tot += max(0, (b - a).total_seconds())
+            start = None
+    if start:
+        a, b = max(start, lo_n), hi_n
+        tot += max(0, (b - a).total_seconds())
+    return tot
+
+
+def block_end(block):
+    """planned end + any break taken inside the block"""
+    s = _naive(to_ist(block.get("start_at")))
+    e = _naive(to_ist(block.get("end_at")))
+    if not s or not e:
+        return _now_n()
+    if block.get("kind") == "skip":
+        return e
+    return e + timedelta(seconds=_break_secs_between(block.get("person"), s, e + timedelta(hours=3)))
+
+
+def _usual_pace(person, team):
+    """{item key: per hour} from the last 7 days (excluding today)"""
+    lo = (today_ist() - timedelta(days=7)).strftime("%Y-%m-%d")
+    hi = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+    hours = _present_hours(lo, hi).get(person, 0)
+    if hours < 2:
+        return {}
+    try:
+        rows = [t for t in fetch_all("daily_tasks", lambda q: q.eq("person", person).gte("date", lo).lte("date", hi))
+                if t.get("status") != "In Progress"]
+    except Exception:
+        return {}
+    out = {}
+    for k, _, how in PLAN_ITEMS.get(team, []):
+        if isinstance(how, list):
+            n = sum(1 for t in rows if t.get("task_type") in how)
+        elif how == "calls":
+            n = sum(_to_float((t.get("details") or {}).get("calls_made"), 0) for t in rows if t.get("task_type") == "Call Log")
+        else:
+            n = 0
+        if n:
+            out[k] = n / hours
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def stock_pending(area):
+    """bills waiting for cross check / upload in an area (today + yesterday)"""
+    lo = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+    out = {"crosscheck": 0, "upload": 0}
+    try:
+        for b in build_bill_journeys(lo, date_str(), date_str()):
+            if area and area != "All Areas" and (b["d"] or {}).get("area") != area:
+                continue
+            cc = b["stages"][0].get("task")
+            if not cc:
+                out["crosscheck"] += 1
+            elif not b.get("uploaded"):
+                out["upload"] += 1
+    except Exception:
+        pass
+    try:
+        out["storepick"] = count_store_to_check(area)
+    except Exception:
+        pass
+    return out
+
+
+# ── storage ───────────────────────────────────────────────────────────────────
+def my_open_block(person):
+    rows = supabase.table("work_blocks").select("*").eq("person", person).eq("date", date_str())\
+        .eq("status", "Active").order("id", desc=True).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def close_block(block, reason=""):
+    rows, pct = block_progress(block, upto=block_end(block))
+    supabase.table("work_blocks").update({
+        "status": "Done", "result_pct": pct, "reason": reason or None, "closed_at": now_iso(),
+        "result": [{"label": l, "target": t, "done": d} for l, t, d in rows],
+    }).eq("id", block["id"]).execute()
+
+
+def _bar(done, tgt):
+    if tgt <= 0:
+        return f"{done}"
+    n = min(tgt, 10)
+    filled = min(n, round(n * done / tgt))
+    return "✅" * filled + "⬜" * (n - filled) + f"  **{done} / {tgt}**"
+
+
+# ── team member: plan screen + progress card ──────────────────────────────────
+def block_gate():
+    """True = the person may work now. Shows the plan screen / result when needed."""
+    if not is_planner():
+        return True
+    me = st.session_state.name
+    try:
+        blk = my_open_block(me)
+    except Exception:
+        return True                      # tables not created yet -> never block work
+    running, _ = get_active_timer()
+    now = _now_n()
+    if blk:
+        end = block_end(blk)
+        if now < end or running:         # never interrupt a running task
+            show_block_card(blk, end, running and now >= end)
+            return True
+        # block finished -> result
+        if blk.get("kind") == "skip":
+            close_block(blk)
+            st.rerun()
+        return show_block_result(blk)
+    if running:
+        st.warning("🎯 Plan your next hour as soon as this task is done.")
+        return True
+    show_plan_form()
+    return False
+
+
+def show_block_card(blk, end, overdue):
+    rows, pct = block_progress(blk)
+    left = int((end - _now_n()).total_seconds() // 60)
+    s = _naive(to_ist(blk.get("start_at")))
+    if blk.get("kind") == "skip":
+        st.warning(f"🚨 Urgent work — planning skipped. Plan your next block in **{max(left, 0)} min**.")
+        return
+    head = (f"🎯 **My block {s.strftime('%I:%M')}–{end.strftime('%I:%M %p')}** · "
+            + (f"⏳ {left} min left" if left > 0 else "⏰ time up — finish this task, then see your result"))
+    with st.container(border=True):
+        st.markdown(head + (f" · **{pct}%** done" if pct is not None else ""))
+        for label, tgt, done in rows:
+            st.markdown(f"{label}: {_bar(done, tgt)}")
+        if blk.get("note"):
+            st.caption(f"📝 {blk['note']}")
+        if not overdue and st.button("🏁 End block early & plan next", key="blk_end_early"):
+            supabase.table("work_blocks").update({"end_at": _iso(_now_n())}).eq("id", blk["id"]).execute()
+            st.rerun()
+
+
+def show_block_result(blk):
+    rows, pct = block_progress(blk, upto=block_end(blk))
+    s = _naive(to_ist(blk.get("start_at")))
+    icon = "🟢" if pct is None or pct >= 90 else "🟠" if pct >= 60 else "🔴"
+    st.markdown(f"### {icon} Block {s.strftime('%I:%M %p')} finished" + (f" — **{pct}%** done" if pct is not None else ""))
+    for label, tgt, done in rows:
+        st.markdown(f"{label}: {_bar(done, tgt)}")
+    reason = ""
+    if pct is not None and pct < 80:
+        reason = st.radio("What slowed you down?", BLOCK_REASONS, index=None, key="blk_reason")
+        if reason == "Other":
+            reason = "Other: " + st.text_input("Write in short", key="blk_reason_txt")
+    if st.button("✅ Save & plan next block", type="primary", width='stretch', key="blk_close",
+                 disabled=(pct is not None and pct < 80 and not reason)):
+        close_block(blk, reason)
+        st.rerun()
+    return False
+
+
+def show_plan_form():
+    me, team = st.session_state.name, st.session_state.team
+    area = st.session_state.get("work_area") or ""
+    st.markdown("### 🎯 Plan your next block")
+    st.caption("Takes 30 seconds. Your progress fills in by itself as you finish tasks.")
+    hrs = st.radio("Block", [f"{h} hour" + ("s" if h > 1 else "") for h in BLOCK_HOURS],
+                   horizontal=True, key="blk_hrs")
+    hours = int(hrs.split()[0])
+    pace = _usual_pace(me, team)
+    pend = stock_pending(area) if team == "Stock" else {}
+    items = []
+    for key, label, _ in PLAN_ITEMS.get(team, []):
+        p = pace.get(key)
+        sugg = int(round(p * hours)) if p else 0
+        hint = []
+        if key in pend and pend[key]:
+            hint.append(f"{pend[key]} pending")
+        if p:
+            hint.append(f"your usual ≈ {sugg} in {hours} hr")
+        if key in pend and pend[key] and sugg:
+            sugg = min(sugg, pend[key])
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(f"**{label}**" + (f"  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(hint)}</span>"
+                                          if hint else ""), unsafe_allow_html=True)
+        with c2:
+            n = st.number_input(label, 0, 500, sugg, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
+        if n > 0:
+            items.append({"key": key, "label": label, "target": int(n)})
+    note = st.text_input("Anything else in this block? (optional)", key="blk_note",
+                         placeholder="e.g. help Sachin with stock count")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if st.button(f"🚀 Start {hours}-hour block", type="primary", width='stretch', key="blk_start",
+                     disabled=not items and not note.strip()):
+            s = _now_n()
+            supabase.table("work_blocks").insert({
+                "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
+                "start_at": _iso(s), "end_at": _iso(s + timedelta(hours=hours)), "hours": hours,
+                "items": items, "note": note.strip() or None, "status": "Active"}).execute()
+            st.rerun()
+    with c2:
+        if st.button("🚨 Urgent — plan later", width='stretch', key="blk_skip",
+                     help=f"Start urgent work now; you'll be asked to plan in {BLOCK_SKIP_MINS} min. Shown in your review."):
+            s = _now_n()
+            supabase.table("work_blocks").insert({
+                "person": me, "team": team, "area": area, "date": date_str(), "kind": "skip",
+                "start_at": _iso(s), "end_at": _iso(s + timedelta(minutes=BLOCK_SKIP_MINS)), "hours": 0,
+                "items": [], "status": "Active"}).execute()
+            st.rerun()
+    if not items and not note.strip():
+        st.caption("Set at least one number (or write what you'll do) to start.")
+
+
+def show_my_reviews():
+    """team member: unseen review comments on the home screen"""
+    try:
+        rows = supabase.table("work_reviews").select("*").eq("person", st.session_state.name)\
+            .is_("seen_at", "null").order("id", desc=True).limit(3).execute().data or []
+    except Exception:
+        return
+    for r in rows:
+        with st.container(border=True):
+            st.markdown(f"**🔎 {r.get('slot_label', 'Review')}** — {RATINGS.get(r.get('rating'), '')} · by {r.get('reviewer', '')}")
+            if r.get("comment"):
+                st.markdown(f"💬 {r['comment']}")
+            if st.button("✅ Seen", key=f"rv_seen_{r['id']}"):
+                supabase.table("work_reviews").update({"seen_at": now_iso()}).eq("id", r["id"]).execute()
+                st.rerun()
+
+
+# ── reviewer side ─────────────────────────────────────────────────────────────
+def reviewees():
+    users = load_users() or {}
+    return sorted([u for u in users.values() if u.get("active", True) is not False
+                   and is_planner(u.get("team"), u.get("role"))], key=lambda u: (u.get("team", ""), u.get("name", "")))
+
+
+def _slot_window(slot_key, day):
+    """(start, end) naive IST for a review slot on a day"""
+    d0 = datetime.combine(day, datetime.min.time())
+    if slot_key == "day":
+        return d0, d0 + timedelta(hours=23, minutes=59)
+    marks = [d0.replace(hour=h, minute=m) for _, _, (h, m) in REVIEW_SLOTS]
+    i = [k for k, _, _ in REVIEW_SLOTS].index(slot_key)
+    return (marks[i - 1] if i else d0), marks[i]
+
+
+def _idle_gaps(tasks, lo, hi, person, min_gap=30):
+    """[(from, to, mins)] with no task activity (breaks removed)"""
+    spans = []
+    for t in tasks:
+        e = t.get("_when")
+        s = _naive(_task_dt(t, "start_time")) or e
+        if e:
+            spans.append((min(s, e), e))
+    spans.sort()
+    gaps, cur = [], lo
+    for s, e in spans + [(hi, hi)]:
+        if s > cur:
+            mins = int(((s - cur).total_seconds() - _break_secs_between(person, cur, s)) // 60)
+            if mins >= min_gap:
+                gaps.append((cur, s, mins))
+        cur = max(cur, e)
+    return gaps
+
+
+def review_facts(person, team, area, slot_key, day):
+    lo, hi = _slot_window(slot_key, day)
+    hi = min(hi, _now_n())
+    try:
+        ev = supabase.table("attendance_log").select("*").eq("person", person)\
+            .eq("date", day.strftime("%Y-%m-%d")).order("at").execute().data or []
+    except Exception:
+        ev = []
+    stt = att_state(ev)
+    cin = _naive(stt["clock_in"])
+    if not cin or cin > hi:
+        return {"present": False}
+    lo = max(lo, cin)
+    out_t = _naive(stt["clock_out"])
+    if out_t and out_t > lo:
+        hi = min(hi, out_t)
+    tasks = _tasks_of(person, lo, hi) if hi > lo else []
+    by = {}
+    for t in tasks:
+        by.setdefault(t.get("task_type", ""), []).append(t)
+    try:
+        blocks = supabase.table("work_blocks").select("*").eq("person", person)\
+            .eq("date", day.strftime("%Y-%m-%d")).order("id").execute().data or []
+    except Exception:
+        blocks = []
+    blocks = [b for b in blocks if lo - timedelta(hours=2) <= (_naive(to_ist(b.get("start_at"))) or lo) <= hi]
+    plans = [b for b in blocks if b.get("kind") == "plan"]
+    skips = [b for b in blocks if b.get("kind") == "skip"]
+    pcts = []
+    for b in plans:
+        p = b.get("result_pct")
+        if p is None and b.get("status") == "Active":
+            _, p = block_progress(b)
+        if p is not None:
+            pcts.append(float(p))
+    worked_h = max(0.0, ((hi - lo).total_seconds() - _break_secs_between(person, lo, hi)) / 3600)
+    pace7 = sum(_usual_pace(person, team).values())
+    rows_now = sum(1 for t in tasks if t.get("task_type") != "Call Log") + sum(
+        _to_float((t.get("details") or {}).get("calls_made"), 0) for t in tasks if t.get("task_type") == "Call Log")
+    return {"present": True, "lo": lo, "hi": hi, "tasks": by, "n": len(tasks),
+            "mins": int(sum(task_secs(t) for t in tasks) // 60),
+            "gaps": _idle_gaps(tasks, lo, hi, person) if hi > lo else [],
+            "plans": plans, "skips": skips, "hit": round(sum(pcts) / len(pcts)) if pcts else None,
+            "reasons": [b.get("reason") for b in plans if b.get("reason")],
+            "rate": rows_now / worked_h if worked_h >= 0.5 else None, "rate7": pace7 or None,
+            "pending": stock_pending(area) if team == "Stock" else {},
+            "clock_out": out_t}
+
+
+def _review_row(person, slot_key, day):
+    rows = supabase.table("work_reviews").select("*").eq("person", person).eq("date", day.strftime("%Y-%m-%d"))\
+        .eq("slot", slot_key).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def pending_reviews_banner():
+    """reminder for admin / managers when a review time has passed"""
+    if not is_reviewer():
+        return
+    try:
+        now = _now_n()
+        today = today_ist()
+        due = [(k, lbl) for k, lbl, (h, m) in REVIEW_SLOTS if now >= now.replace(hour=h, minute=m, second=0)]
+        msgs = []
+        people = [u["name"] for u in reviewees()]
+        done = supabase.table("work_reviews").select("person,slot,date").in_("date", [
+            today.strftime("%Y-%m-%d"), (today - timedelta(days=1)).strftime("%Y-%m-%d")]).execute().data or []
+        done_set = {(r["person"], r["slot"], r["date"]) for r in done}
+        present = {e.get("person") for e in (supabase.table("attendance_log").select("person,date")
+                   .eq("event", "clock_in").in_("date", [today.strftime("%Y-%m-%d"),
+                   (today - timedelta(days=1)).strftime("%Y-%m-%d")]).execute().data or [])
+                   if e.get("date") == today.strftime("%Y-%m-%d")}
+        if due:
+            k, lbl = due[-1]
+            left = [p for p in people if p in present and (p, k, today.strftime("%Y-%m-%d")) not in done_set]
+            if left:
+                msgs.append(f"⏰ **{lbl} review** pending for {len(left)}: {', '.join(left[:6])}{'…' if len(left) > 6 else ''}")
+        yd = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        y_present = {e.get("person") for e in (supabase.table("attendance_log").select("person,date")
+                     .eq("event", "clock_in").eq("date", yd).execute().data or [])}
+        y_left = [p for p in people if p in y_present and (p, "day", yd) not in done_set]
+        if y_left:
+            msgs.append(f"📅 **Yesterday's full-day review** pending for {len(y_left)}")
+        if msgs:
+            st.warning("  \n".join(msgs) + "  \n→ open the **🔎 Reviews** tab")
+    except Exception:
+        pass
+
+
+def show_reviews(kp="rv"):
+    st.subheader("🔎 Team Reviews")
+    tab_a, tab_b = st.tabs(["✍️ Review now", "📈 History"])
+    with tab_b:
+        show_review_history(kp + "_h")
+    with tab_a:
+        now = _now_n()
+        opts = [(k, f"Today {lbl}") for k, lbl, _ in REVIEW_SLOTS] + [("day", "Yesterday — full day")]
+        due = [i for i, (k, _, (h, m)) in enumerate(REVIEW_SLOTS) if now >= now.replace(hour=h, minute=m, second=0)]
+        default = due[-1] if due else (3 if now.hour < 12 else 0)
+        pick = st.radio("Review", [o[1] for o in opts], index=default, horizontal=True, key=f"{kp}_slot")
+        slot_key = dict((b, a) for a, b in opts)[pick]
+        day = today_ist() - timedelta(days=1) if slot_key == "day" else today_ist()
+        lo, hi = _slot_window(slot_key, day)
+        st.caption(f"Covers **{lo.strftime('%I:%M %p')} – {min(hi, now).strftime('%I:%M %p')}** "
+                   f"({day.strftime('%d %b')}). Only people who clocked in are shown.")
+        teams = sorted({u.get("team") for u in reviewees()})
+        tf = st.radio("Team", ["All"] + teams, horizontal=True, key=f"{kp}_team")
+        shown = 0
+        for u in reviewees():
+            if tf != "All" and u.get("team") != tf:
+                continue
+            f = review_facts(u["name"], u.get("team"), _person_area(u["name"], day), slot_key, day)
+            if not f.get("present"):
+                continue
+            shown += 1
+            review_card(u, f, slot_key, pick, day, kp)
+        if not shown:
+            st.info("Nobody from these teams clocked in for this period.")
+
+
+def _person_area(person, day):
+    try:
+        r = supabase.table("work_area_log").select("area").eq("person", person).eq("date", day.strftime("%Y-%m-%d"))\
+            .order("chosen_at", desc=True).limit(1).execute().data or []
+        return r[0]["area"] if r else ""
+    except Exception:
+        return ""
+
+
+def review_card(u, f, slot_key, slot_label, day, kp):
+    p = u["name"]
+    old = _review_row(p, slot_key, day)
+    badge = f" · {RATINGS[old['rating']]} by {old.get('reviewer')}" + (" · 👀 seen" if old.get("seen_at") else "") if old else ""
+    with st.expander(f"{'✅' if old else '⏳'} **{p}** · {u.get('team')}{badge}", expanded=not old):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tasks done", f["n"])
+        c2.metric("Time on tasks", fmt_age(f["mins"]))
+        c3.metric("Plan hit", f"{f['hit']}%" if f["hit"] is not None else "—",
+                  f"{len(f['plans'])} block(s)" + (f" · {len(f['skips'])} skipped" if f["skips"] else ""), delta_color="off")
+        if f["rate"] is not None and f["rate7"]:
+            ratio = f["rate"] / f["rate7"]
+            c4.metric("Speed vs usual", f"{ratio * 100:.0f}%", "faster" if ratio >= 1 else "slower",
+                      delta_color="normal" if ratio >= 1 else "inverse")
+        else:
+            c4.metric("Speed vs usual", "—")
+        if f["tasks"]:
+            st.markdown(" · ".join(f"{k} **×{len(v)}**" for k, v in sorted(f["tasks"].items(), key=lambda x: -len(x[1]))))
+        if f["gaps"]:
+            st.markdown("⚠️ **No activity:** " + ", ".join(
+                f"{a.strftime('%I:%M')}–{b.strftime('%I:%M %p')} ({fmt_age(m)})" for a, b, m in f["gaps"]))
+        if f["reasons"]:
+            st.markdown("🗒️ **Their reasons:** " + "; ".join(f["reasons"]))
+        pend = {k: v for k, v in (f.get("pending") or {}).items() if v}
+        if pend and slot_key != "day":
+            st.markdown("📦 **Pending in area:** " + ", ".join(f"{k} {v}" for k, v in pend.items()))
+        if f.get("clock_out"):
+            st.caption(f"Clocked out {f['clock_out'].strftime('%I:%M %p')}")
+        with st.form(f"{kp}_f_{p}_{slot_key}"):
+            keys = list(RATINGS)
+            rating = st.radio("Rating", keys, format_func=RATINGS.get, horizontal=True,
+                              index=keys.index(old["rating"]) if old else None, key=f"{kp}_r_{p}_{slot_key}")
+            comment = st.text_input("Comment (they will see it)", value=(old or {}).get("comment") or "",
+                                    key=f"{kp}_c_{p}_{slot_key}", placeholder="e.g. Finish 5 pending cross checks before 3 PM")
+            mk_task = st.checkbox("📌 Also make the comment a task for them (due today)", key=f"{kp}_t_{p}_{slot_key}")
+            if st.form_submit_button("💾 Save review", type="primary"):
+                if not rating:
+                    st.error("Pick a rating.")
+                else:
+                    rec = {"person": p, "team": u.get("team"), "date": day.strftime("%Y-%m-%d"), "slot": slot_key,
+                           "slot_label": slot_label, "rating": rating, "comment": comment.strip() or None,
+                           "reviewer": st.session_state.name, "reviewed_at": now_iso(),
+                           "facts": {"tasks": f["n"], "mins": f["mins"], "hit": f["hit"], "blocks": len(f["plans"]),
+                                     "skips": len(f["skips"]), "idle_mins": sum(m for *_, m in f["gaps"])}}
+                    if not old or old.get("rating") != rating or (old.get("comment") or "") != (comment.strip() or ""):
+                        rec["seen_at"] = None
+                    try:
+                        supabase.table("work_reviews").upsert(rec, on_conflict="person,date,slot").execute()
+                        if mk_task and comment.strip():
+                            supabase.table("assigned_tasks").insert({
+                                "title": comment.strip()[:120], "details": f"From {slot_label} review",
+                                "assigned_to": p, "team": u.get("team"), "due_date": date_str(),
+                                "priority": "Urgent" if rating == "red" else "Normal", "status": "Pending",
+                                "is_template": False, "active": True, "assigned_by": st.session_state.name,
+                                "assigned_at": now_iso()}).execute()
+                        st.success("Saved")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save: {e} — did you run review_setup.sql?")
+
+
+def show_review_history(kp):
+    days = st.radio("Period", ["Last 7 days", "Last 30 days"], horizontal=True, key=f"{kp}_p")
+    lo = (today_ist() - timedelta(days=7 if days.startswith("Last 7") else 30)).strftime("%Y-%m-%d")
+    try:
+        revs = fetch_all("work_reviews", lambda q: q.gte("date", lo))
+        blocks = fetch_all("work_blocks", lambda q: q.gte("date", lo))
+    except Exception as e:
+        st.info(f"No reviews yet ({e})")
+        return
+    people = sorted({r["person"] for r in revs} | {b["person"] for b in blocks})
+    rows = []
+    for p in people:
+        rv = [r for r in revs if r["person"] == p]
+        bl = [b for b in blocks if b["person"] == p and b.get("kind") == "plan" and b.get("result_pct") is not None]
+        sk = [b for b in blocks if b["person"] == p and b.get("kind") == "skip"]
+        rs = [b.get("reason") for b in blocks if b["person"] == p and b.get("reason")]
+        top = max(set(rs), key=rs.count) if rs else ""
+        rows.append({"Person": p, "🟢": sum(r["rating"] == "green" for r in rv), "🟠": sum(r["rating"] == "orange" for r in rv),
+                     "🔴": sum(r["rating"] == "red" for r in rv),
+                     "Plan hit %": round(sum(float(b["result_pct"]) for b in bl) / len(bl)) if bl else None,
+                     "Blocks": len(bl), "Skipped": len(sk), "Top reason": top,
+                     "Seen": f"{sum(1 for r in rv if r.get('seen_at'))}/{len(rv)}" if rv else ""})
+    if not rows:
+        st.info("No reviews or blocks yet.")
+        return
+    df = pd.DataFrame(rows).sort_values(["🔴", "🟠"], ascending=False)
+    st.dataframe(df, hide_index=True, width='stretch')
+    flag = [r["Person"] for r in rows if r["🔴"] >= 2]
+    if flag:
+        st.error("🔴 Repeated problems: " + ", ".join(flag))
+    reasons = [b.get("reason") for b in blocks if b.get("reason")]
+    if reasons:
+        st.markdown("**What slows the team (block reasons):**")
+        s = pd.Series([r.split(":")[0] for r in reasons]).value_counts()
+        st.bar_chart(s)
+    with st.expander("All review comments"):
+        st.dataframe(pd.DataFrame([{"Date": r["date"], "Slot": r.get("slot_label"), "Person": r["person"],
+                                    "Rating": RATINGS.get(r["rating"]), "Comment": r.get("comment"),
+                                    "By": r.get("reviewer"), "Seen": "✅" if r.get("seen_at") else ""}
+                                   for r in sorted(revs, key=lambda r: (r["date"], str(r.get("reviewed_at"))), reverse=True)]),
+                     hide_index=True, width='stretch')
+
+
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
+    try:
+        _cl = cleanup_old_photos()          # once a day: remove photos that are saved in a ZIP and older than N days
+        if _cl:
+            st.toast(_cl)
+    except Exception:
+        pass
+    pending_reviews_banner()
     st.divider()
 
-    tab0, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15 = st.tabs([
+    tab0, tab17, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15, tab16 = st.tabs([
         "🎯 My Day",
+        "🔎 Reviews",
         "📊 Dashboard",
         "👥 All Staff Work",
         "🔄 Pipeline",
@@ -10088,8 +11114,15 @@ def show_admin_page():
         "📌 Assign Tasks",
         "📅 Shift Planner",
         "🛵 Delivery KM",
-        "🏆 League"
+        "🏆 League",
+        "📦 Photos"
     ])
+
+    with tab17:
+        show_reviews("adm_rv")
+
+    with tab16:
+        show_photo_archive("adm_ph")
 
     with tab15:
         show_league("adm_lg")
@@ -10469,7 +11502,7 @@ def show_admin_page():
                                     st.divider()
                                     st.markdown("**📸 Invoice Image:**")
                                     try:
-                                        img_data = supabase.storage.from_("Images").download(img_name)
+                                        img_data = load_image_bytes(img_name)
                                         from PIL import Image
                                         import io as io_mod
                                         pil_img = Image.open(io_mod.BytesIO(img_data))
@@ -10482,7 +11515,7 @@ def show_admin_page():
                                             key=f"dl_inv_{r['Bill No']}"
                                         )
                                     except:
-                                        st.warning("Image not available")
+                                        st.info(removed_photo_note(img_name) or "Image not available")
 
                     buf = io.BytesIO()
                     with pd.ExcelWriter(buf, engine="openpyxl") as w:
