@@ -2288,8 +2288,12 @@ def show_arrival_button():
         b1, b2 = st.columns(2)
         with b1:
             if st.button("✅ Save arrival", type="primary", width='stretch', key="arr_in_save",
-                         disabled=photo is None or (dist == "Other" and not other.strip())):
-                name = upload_image(photo, "arrival")
+                         disabled=photo is None):
+                name = None
+                if dist == "Other" and not other.strip():
+                    st.error("Write the distributor name.")
+                else:
+                    name = upload_image(photo, "arrival")
                 if name:
                     try:
                         supabase.table("bill_arrivals").insert({
@@ -7116,8 +7120,10 @@ def clock_out_panel(s, active_key):
         card, hand = day_card_form(s)
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Clock out", key="att_out_yes", type="primary", width='stretch', disabled=not hand):
-                if active_key:
+            if st.button("✅ Clock out", key="att_out_yes", type="primary", width='stretch'):
+                if not hand:
+                    st.error("Write a handover note (or tick 'Nothing pending') first.")
+                elif active_key:
                     st.error("Finish or cancel your running task first.")
                 else:
                     att_log("clock_out")
@@ -7194,7 +7200,10 @@ def attendance_gate():
             st.markdown(f"### 🪖 Report for duty, {st.session_state.name}!")
             st.caption("Clock in to start today's mission.")
         km_ok = km_clock_in_block() if st.session_state.team == "Delivery" else True
-        if st.button("🟢 Clock In — Report for Duty", type="primary", width='stretch', key="att_in", disabled=not km_ok):
+        if st.button("🟢 Clock In — Report for Duty", type="primary", width='stretch', key="att_in"):
+            if not km_ok:
+                st.error("Enter the bike meter reading and photo first.")
+                st.stop()
             att_log("clock_in")
             if st.session_state.team == "Delivery":
                 km_save_start()
@@ -7238,13 +7247,17 @@ def attendance_gate():
         # delivery boys: end-of-day bike meter before clocking out
         ok, saver = km_clock_out_block()
         card, hand = day_card_form(s)
-        ok = ok and bool(hand)
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Confirm Clock Out", key="att_out_yes", type="primary", width='stretch', disabled=not ok):
-                if active_key:
+            if st.button("✅ Confirm Clock Out", key="att_out_yes", type="primary", width='stretch'):
+                if not ok:
+                    st.error("Enter the bike meter reading and photo first.")
+                elif active_key:
                     st.error("Finish or cancel your running task first.")
                 else:
+                    if not hand:
+                        st.error("Write a handover note (or tick 'Nothing pending') first.")
+                        st.stop()
                     if saver:
                         saver()
                     att_log("clock_out")
@@ -11377,10 +11390,12 @@ def show_block_result(blk):
         reason = st.radio("What slowed you down?", BLOCK_REASONS, index=None, key="blk_reason")
         if reason == "Other":
             reason = "Other: " + st.text_input("Write in short", key="blk_reason_txt")
-    if st.button("✅ Save & plan next block", type="primary", width='stretch', key="blk_close",
-                 disabled=(pct is not None and pct < 80 and not reason)):
-        close_block(blk, reason)
-        st.rerun()
+    if st.button("✅ Save & plan next block", type="primary", width='stretch', key="blk_close"):
+        if pct is not None and pct < 80 and (not reason or reason.strip() == "Other:"):
+            st.error("Pick what slowed you down first.")
+        else:
+            close_block(blk, reason)
+            st.rerun()
     return False
 
 
@@ -11393,57 +11408,62 @@ def show_plan_form():
                    horizontal=True, key="blk_hrs")
     hours = int(hrs.split()[0])
     pend = stock_pending(area) if team == "Stock" else purchase_pending() if team == "Purchase" else {}
-    items = []
-    for key, label, _ in PLAN_ITEMS.get(team, []):
-        hint = [PLAN_HELP.get(key, "")]
-        if pend.get(key):
-            hint.append("📦 " + PENDING_TXT.get(key, "{} pending").format(pend[key]))
+    msg = st.session_state.pop("blk_form_err", None)
+    # one form = one tap: every number is saved together with the Start button
+    with st.form(f"blk_form_{hours}", border=True):
+        nums = {}
+        for key, label, _ in PLAN_ITEMS.get(team, []):
+            hint = [PLAN_HELP.get(key, "")]
+            if pend.get(key):
+                hint.append("📦 " + PENDING_TXT.get(key, "{} pending").format(pend[key]))
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.markdown(f"**{label}**  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(h for h in hint if h)}</span>",
+                            unsafe_allow_html=True)
+            with c2:
+                nums[(key, label)] = st.number_input(label, 0, 500, 0, key=f"blk_n_{key}_{hours}",
+                                                     label_visibility="collapsed")
         c1, c2 = st.columns([3, 1])
         with c1:
-            st.markdown(f"**{label}**  \n<span style='font-size:0.85em;opacity:0.7'>{' · '.join(h for h in hint if h)}</span>",
-                        unsafe_allow_html=True)
+            note = st.text_input("✏️ Other work (write it yourself)", key="blk_note",
+                                 placeholder="e.g. help Sachin with stock count / call 5 distributors for rates")
         with c2:
-            n = st.number_input(label, 0, 500, 0, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
-        if key in ("arr", "po", "crosscheck", "upload"):
-            if st.toggle("📦 View & filter pending" + (" (date, area)" if key == "arr" else ""), key=f"pv_on_{key}"):
+            own_n = st.number_input("How many?", 0, 500, 0, key=f"blk_own_n_{hours}",
+                                    help="Optional. If you set a number, you'll enter how many you finished at the end.")
+        if msg:
+            st.error(msg)
+        go = st.form_submit_button(f"🚀 Start {hours}-hour block", type="primary", width='stretch')
+    if go:
+        items = [{"key": k, "label": l, "target": int(n)} for (k, l), n in nums.items() if n > 0]
+        if note.strip():
+            items.append({"key": "other", "label": "✏️ " + note.strip()[:80], "target": int(own_n), "self": True})
+        if not items:
+            st.session_state["blk_form_err"] = "Set at least one number (or write what you'll do) to start."
+            st.rerun()
+        s = _now_n()
+        supabase.table("work_blocks").insert({
+            "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
+            "start_at": _iso(s), "end_at": _iso(s + timedelta(hours=hours)), "hours": hours,
+            "items": items, "note": None, "status": "Active"}).execute()
+        _blk_reset()
+        st.rerun()
+    if st.button("🚨 Urgent — plan later", width='stretch', key="blk_skip",
+                 help=f"Start urgent work now; you'll be asked to plan in {BLOCK_SKIP_MINS} min. Shown in your review."):
+        s = _now_n()
+        supabase.table("work_blocks").insert({
+            "person": me, "team": team, "area": area, "date": date_str(), "kind": "skip",
+            "start_at": _iso(s), "end_at": _iso(s + timedelta(minutes=BLOCK_SKIP_MINS)), "hours": 0,
+            "items": [], "status": "Active"}).execute()
+        _blk_reset()
+        st.rerun()
+    # pending work lists (outside the form so the filters work)
+    keys = [(k, l) for k, l, _ in PLAN_ITEMS.get(team, []) if k in ("arr", "po", "crosscheck", "upload")]
+    if keys:
+        st.markdown("**📦 Pending work** — open to see the list")
+        for key, label in keys:
+            if st.toggle(f"{label}" + (" (date, area filter)" if key == "arr" else ""), key=f"pv_on_{key}"):
                 with st.container(border=True):
                     pending_view(team, key, area)
-        if n > 0:
-            items.append({"key": key, "label": label, "target": int(n)})
-    sure = True
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        note = st.text_input("✏️ Other work (write it yourself)", key="blk_note",
-                             placeholder="e.g. help Sachin with stock count / call 5 distributors for rates")
-    with c2:
-        own_n = st.number_input("How many?", 0, 500, 0, key=f"blk_own_n_{hours}",
-                                help="Optional. If you set a number, you'll enter how many you finished at the end.")
-    if note.strip():
-        items.append({"key": "other", "label": "✏️ " + note.strip()[:80], "target": int(own_n), "self": True})
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        if st.button(f"🚀 Start {hours}-hour block", type="primary", width='stretch', key="blk_start",
-                     disabled=(not items and not note.strip()) or not sure):
-            s = _now_n()
-            supabase.table("work_blocks").insert({
-                "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
-                "start_at": _iso(s), "end_at": _iso(s + timedelta(hours=hours)), "hours": hours,
-                "items": items, "note": None, "status": "Active"}).execute()
-            _blk_reset()
-            st.rerun()
-    with c2:
-        if st.button("🚨 Urgent — plan later", width='stretch', key="blk_skip",
-                     help=f"Start urgent work now; you'll be asked to plan in {BLOCK_SKIP_MINS} min. Shown in your review."):
-            s = _now_n()
-            supabase.table("work_blocks").insert({
-                "person": me, "team": team, "area": area, "date": date_str(), "kind": "skip",
-                "start_at": _iso(s), "end_at": _iso(s + timedelta(minutes=BLOCK_SKIP_MINS)), "hours": 0,
-                "items": [], "status": "Active"}).execute()
-            _blk_reset()
-            st.rerun()
-    if not items and not note.strip():
-        st.caption("Set at least one number (or write what you'll do) to start.")
-
 
 def show_my_reviews():
     """team member: unseen review comments on the home screen (checked every 2 min)"""
