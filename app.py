@@ -637,6 +637,7 @@ def end_timer(key, start_time, keep_record=False):
     end = now_ist()
     duration = int((end - start_time).total_seconds() / 60)
     st.session_state["mission_done"] = int((end - start_time).total_seconds())
+    st.session_state.pop("_blk_prog", None)
     st.session_state[f"{key}_start"] = None
     task_id = st.session_state.get(f"{key}_task_id")
     if task_id:
@@ -3452,6 +3453,7 @@ def show_user_page():
 
     # ── REVIEW COMMENTS + 🎯 PLAN THE NEXT 1–2 HOURS (compulsory for Stock / Purchase / Call) ──
     show_my_reviews()
+    show_handover_notes()
     if not block_gate():
         return
 
@@ -6743,6 +6745,169 @@ def att_state(events):
     st_["on_break"] = brk_start
     return st_
 
+
+# ── 📤 IN / OUT messages for the WhatsApp group + day card + handover ────────
+def _wa_link(text):
+    import urllib.parse
+    return "https://wa.me/?text=" + urllib.parse.quote(text)
+
+
+def show_in_share(cin):
+    me, team = st.session_state.name, st.session_state.team
+    area = st.session_state.get("work_area") or ""
+    txt = f"🟢 IN — {me} · {team}" + (f" · {area}" if area and area != "All Areas" else "") + f" · {_naive(cin).strftime('%I:%M %p')}"
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        st.link_button("📤 Send IN on WhatsApp group", _wa_link(txt), type="primary", width='stretch')
+    with c2:
+        if st.button("✖️ Done", key="in_share_hide", width='stretch'):
+            st.session_state["_in_share_hide"] = True
+            st.rerun()
+
+
+def build_day_card(person, team, area, s, handover=""):
+    """text of one person's day (also what goes to WhatsApp)"""
+    day = date_str()
+    try:
+        tasks = [t for t in fetch_all("daily_tasks", lambda q: q.eq("person", person).eq("date", day))
+                 if t.get("status") != "In Progress"]
+    except Exception:
+        tasks = []
+    now = now_ist()
+    cin = s["clock_in"]
+    end = s["clock_out"] or now
+    present = int(max(0, (end - cin).total_seconds() - s["break_secs"]) // 60) if cin else 0
+    task_m = int(sum(task_secs(t) for t in tasks) // 60)
+    L = [f"🔴 OUT — {person} · {team}" + (f" · {area}" if area and area != "All Areas" else "") + f" · {now.strftime('%a %d %b')}",
+         f"⏰ {cin.strftime('%I:%M %p') if cin else '—'} → {end.strftime('%I:%M %p')} · {fmt_age(present)} present"
+         + (f" · breaks {fmt_age(int(s['break_secs'] // 60))}" if s["breaks"] else ""),
+         f"✅ {len(tasks)} tasks · {fmt_age(task_m)} on tasks"]
+    if team == "Purchase":
+        po = _sum_details(tasks, ["Purchase Order"], "no_sku")
+        ar = _sum_details(tasks, ["Arrangement Order", "Arrangement"], "no_medicines")
+        L.append(f"💊 Medicines ordered: {po + ar} (sheet/PO {po} · arrangement {ar})")
+    if team == "Call":
+        L.append(f"📞 Calls: {_sum_details(tasks, ['Call Log'], 'calls_made')} · orders delivered "
+                 f"{_sum_details(tasks, ['Call Log'], 'orders_delivered')}")
+    cnt = {}
+    for t in tasks:
+        cnt[t.get("task_type", "")] = cnt.get(t.get("task_type", ""), 0) + 1
+    if cnt:
+        L.append("   " + " · ".join(f"{k} {v}" for k, v in sorted(cnt.items(), key=lambda x: -x[1])[:6]))
+    try:
+        bl = [float(b["result_pct"]) for b in fetch_all("work_blocks", lambda q: q.eq("person", person).eq("date", day))
+              if b.get("result_pct") is not None]
+        if bl:
+            L.append(f"🎯 Blocks {len(bl)} · plan hit {round(sum(bl) / len(bl))}%")
+    except Exception:
+        pass
+    pend = []
+    try:
+        if team == "Stock":
+            p = stock_pending(area)
+            if p.get("crosscheck"):
+                pend.append(f"{p['crosscheck']} bills to cross check")
+            if p.get("upload"):
+                pend.append(f"{p['upload']} bills to upload")
+        elif team == "Purchase":
+            p = purchase_pending()
+            if p.get("arr"):
+                pend.append(f"{p['arr']} customer medicines to order")
+    except Exception:
+        pass
+    if pend:
+        L.append("📦 Left pending: " + " · ".join(pend))
+    if handover:
+        L.append(f"📝 Handover: {handover}")
+    return "\n".join(L)
+
+
+def day_card_form(s):
+    """shows the day card + asks the handover note. Returns (card text, handover or '')"""
+    me, team = st.session_state.name, st.session_state.team
+    area = st.session_state.get("work_area") or ""
+    st.markdown("### 🧾 Your day")
+    hand = st.text_input("📝 Handover note — what is pending / whom to ask tomorrow *", key="out_hand",
+                         placeholder="e.g. Acorn bill page 2 missing, asked Naresh")
+    if st.checkbox("Nothing pending", key="out_nothing"):
+        hand = hand or "Nothing pending"
+    card = build_day_card(me, team, area, s, hand.strip())
+    st.code(card, language=None)
+    if not hand.strip():
+        st.caption("Write a handover note (or tick 'Nothing pending') to clock out.")
+    return card, hand.strip()
+
+
+def save_day_card(card, hand):
+    try:
+        supabase.table("day_cards").upsert({
+            "person": st.session_state.name, "team": st.session_state.team,
+            "area": st.session_state.get("work_area") or "", "date": date_str(),
+            "card": card, "handover": hand, "created_at": now_iso()}, on_conflict="person,date").execute()
+    except Exception:
+        pass
+    st.session_state["_out_card"] = card
+
+
+def clock_out_panel(s, active_key):
+    with st.container(border=True):
+        card, hand = day_card_form(s)
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅ Clock out", key="att_out_yes", type="primary", width='stretch', disabled=not hand):
+                if active_key:
+                    st.error("Finish or cancel your running task first.")
+                else:
+                    att_log("clock_out")
+                    save_day_card(card, hand)
+                    st.session_state["att_confirm_out"] = False
+                    st.rerun()
+        with b2:
+            if st.button("✖️ Not now", key="att_out_no", width='stretch'):
+                st.session_state["att_confirm_out"] = False
+                st.rerun()
+    return False
+
+
+def show_out_share():
+    card = st.session_state.get("_out_card")
+    if not card:
+        try:
+            r = supabase.table("day_cards").select("card").eq("person", st.session_state.name).eq("date", date_str())\
+                .limit(1).execute().data or []
+            card = r[0]["card"] if r else ""
+        except Exception:
+            card = ""
+    if card:
+        st.code(card, language=None)
+        st.link_button("📤 Send OUT on WhatsApp group", _wa_link(card), type="primary", width='stretch')
+
+
+def show_handover_notes():
+    """morning: yesterday's handover notes from my team (and area for Stock)"""
+    c = st.session_state.get("_hand_cache")
+    if c is None:
+        rows = []
+        try:
+            team = st.session_state.team
+            prev = supabase.table("day_cards").select("date").lt("date", date_str()).eq("team", team)\
+                .order("date", desc=True).limit(1).execute().data or []
+            if prev:
+                q = supabase.table("day_cards").select("person,area,handover,date").eq("date", prev[0]["date"]).eq("team", team)
+                rows = [r for r in (q.execute().data or []) if r.get("handover") and r["handover"] != "Nothing pending"
+                        and r.get("person") != st.session_state.name]
+                area = st.session_state.get("work_area") or ""
+                if team == "Stock" and area and area != "All Areas":
+                    rows = [r for r in rows if r.get("area") in (area, "", "All Areas")]
+        except Exception:
+            rows = []
+        st.session_state["_hand_cache"] = c = rows
+    if c:
+        with st.expander(f"📝 Handover from last shift ({len(c)})", expanded=True):
+            for r in c:
+                st.markdown(f"**{r['person']}**" + (f" · {r['area']}" if r.get("area") else "") + f": {r['handover']}")
+
+
 def attendance_gate():
     """Top-of-page attendance bar. Returns True when the person may work on tasks."""
     try:
@@ -6761,6 +6926,7 @@ def attendance_gate():
     if not s["clock_in"] or (s["clock_out"] and not s["working"]):
         if s["clock_out"]:
             st.info(f"🔴 You clocked out at **{s['clock_out'].strftime('%I:%M %p')}**. Came back? Clock in again to continue.")
+            show_out_share()
         else:
             st.markdown(f"### 🪖 Report for duty, {st.session_state.name}!")
             st.caption("Clock in to start today's mission.")
@@ -6783,6 +6949,8 @@ def attendance_gate():
 
     # Working: compact bar
     worked = int((now - s["clock_in"]).total_seconds() // 60)
+    if worked < 20 and not st.session_state.get("_in_share_hide"):
+        show_in_share(s["clock_in"])
     c0, c1, c2, c3, c4 = st.columns([3, 1, 1, 1, 1])
     with c0:
         st.caption(f"🟢 In since **{s['clock_in'].strftime('%I:%M %p')}** · {fmt_age(worked)} · "
@@ -6798,20 +6966,16 @@ def attendance_gate():
                     st.rerun()
     delivery = st.session_state.team == "Delivery"
     with c4:
-        if st.session_state.get("att_confirm_out") and not delivery:
-            if st.button("✅ Confirm Out", key="att_out_yes", type="primary", width='stretch'):
-                if active_key:
-                    st.error("Finish or cancel your running task first.")
-                else:
-                    att_log("clock_out")
-                    st.session_state["att_confirm_out"] = False
-                    st.rerun()
-        elif not st.session_state.get("att_confirm_out") and st.button("🔴 Clock Out", key="att_out", width='stretch'):
+        if not st.session_state.get("att_confirm_out") and st.button("🔴 Clock Out", key="att_out", width='stretch'):
             st.session_state["att_confirm_out"] = True
             st.rerun()
+    if st.session_state.get("att_confirm_out") and not delivery:
+        return clock_out_panel(s, active_key)
     if st.session_state.get("att_confirm_out") and delivery:
         # delivery boys: end-of-day bike meter before clocking out
         ok, saver = km_clock_out_block()
+        card, hand = day_card_form(s)
+        ok = ok and bool(hand)
         b1, b2 = st.columns(2)
         with b1:
             if st.button("✅ Confirm Clock Out", key="att_out_yes", type="primary", width='stretch', disabled=not ok):
@@ -6821,6 +6985,7 @@ def attendance_gate():
                     if saver:
                         saver()
                     att_log("clock_out")
+                    save_day_card(card, hand)
                     st.session_state["att_confirm_out"] = False
                     st.rerun()
         with b2:
@@ -7484,7 +7649,8 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t11, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["🔎 Reviews", "👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
+    t12, t11, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["📅 Daily Summary", "🔎 Reviews", "👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
+    with t12: show_daily_summary("mgr_ds")
     with t11: show_reviews("mgr_rv")
     with t0: show_all_staff_work("mgr_asw")
     with t1: show_attendance_admin("mgr_att")
@@ -10602,6 +10768,7 @@ def block_progress(block, upto=None):
     return rows, (round(100 * sum(parts) / len(parts)) if parts else None)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _break_secs_between(person, lo_n, hi_n):
     """seconds on break between two times (breaks don't eat into a block)"""
     try:
@@ -10812,7 +10979,22 @@ def stock_pending(area):
 
 
 # ── storage ───────────────────────────────────────────────────────────────────
+def _blk_reset():
+    """forget the cached block / progress (call after any change)"""
+    st.session_state.pop("_blk_cache", None)
+    st.session_state.pop("_blk_prog", None)
+
+
 def my_open_block(person):
+    c = st.session_state.get("_blk_cache")
+    if c and c[0] == person and (datetime.now() - c[1]).total_seconds() < 60:
+        return c[2]
+    blk = _my_open_block_db(person)
+    st.session_state["_blk_cache"] = (person, datetime.now(), blk)
+    return blk
+
+
+def _my_open_block_db(person):
     rows = supabase.table("work_blocks").select("*").eq("person", person).eq("date", date_str())\
         .eq("status", "Active").order("id", desc=True).limit(1).execute().data or []
     return rows[0] if rows else None
@@ -10824,6 +11006,7 @@ def close_block(block, reason=""):
         "status": "Done", "result_pct": pct, "reason": reason or None, "closed_at": now_iso(),
         "result": [{"label": l, "target": t, "done": d} for l, t, d in rows],
     }).eq("id", block["id"]).execute()
+    _blk_reset()
 
 
 def _bar(done, tgt):
@@ -10866,7 +11049,12 @@ def block_gate():
 
 
 def show_block_card(blk, end, overdue):
-    rows, pct = block_progress(blk)
+    pc = st.session_state.get("_blk_prog")
+    if pc and pc[0] == blk["id"] and (datetime.now() - pc[1]).total_seconds() < 45:
+        rows, pct = pc[2]
+    else:
+        rows, pct = block_progress(blk)
+        st.session_state["_blk_prog"] = (blk["id"], datetime.now(), (rows, pct))
     left = int((end - _now_n()).total_seconds() // 60)
     s = _naive(to_ist(blk.get("start_at")))
     if blk.get("kind") == "skip":
@@ -10882,6 +11070,7 @@ def show_block_card(blk, end, overdue):
             st.caption(f"📝 {blk['note']}")
         if not overdue and st.button("🏁 End block early & plan next", key="blk_end_early"):
             supabase.table("work_blocks").update({"end_at": _iso(_now_n())}).eq("id", blk["id"]).execute()
+            _blk_reset()
             st.rerun()
 
 
@@ -10899,6 +11088,7 @@ def show_block_result(blk):
                 if it in own:
                     it["done"] = int(vals[k]); k += 1
             supabase.table("work_blocks").update({"items": items}).eq("id", blk["id"]).execute()
+            _blk_reset()
             st.rerun()
         return False
     rows, pct = block_progress(blk, upto=block_end(blk))
@@ -10940,8 +11130,9 @@ def show_plan_form():
         with c2:
             n = st.number_input(label, 0, 500, 0, key=f"blk_n_{key}_{hours}", label_visibility="collapsed")
         if key in ("arr", "po", "crosscheck", "upload"):
-            with st.expander("📦 View & filter pending" + (" (date, area)" if key == "arr" else "")):
-                pending_view(team, key, area)
+            if st.toggle("📦 View & filter pending" + (" (date, area)" if key == "arr" else ""), key=f"pv_on_{key}"):
+                with st.container(border=True):
+                    pending_view(team, key, area)
         if n > 0:
             items.append({"key": key, "label": label, "target": int(n)})
     sure = True
@@ -10963,6 +11154,7 @@ def show_plan_form():
                 "person": me, "team": team, "area": area, "date": date_str(), "kind": "plan",
                 "start_at": _iso(s), "end_at": _iso(s + timedelta(hours=hours)), "hours": hours,
                 "items": items, "note": None, "status": "Active"}).execute()
+            _blk_reset()
             st.rerun()
     with c2:
         if st.button("🚨 Urgent — plan later", width='stretch', key="blk_skip",
@@ -10972,18 +11164,24 @@ def show_plan_form():
                 "person": me, "team": team, "area": area, "date": date_str(), "kind": "skip",
                 "start_at": _iso(s), "end_at": _iso(s + timedelta(minutes=BLOCK_SKIP_MINS)), "hours": 0,
                 "items": [], "status": "Active"}).execute()
+            _blk_reset()
             st.rerun()
     if not items and not note.strip():
         st.caption("Set at least one number (or write what you'll do) to start.")
 
 
 def show_my_reviews():
-    """team member: unseen review comments on the home screen"""
-    try:
-        rows = supabase.table("work_reviews").select("*").eq("person", st.session_state.name)\
-            .is_("seen_at", "null").order("id", desc=True).limit(3).execute().data or []
-    except Exception:
-        return
+    """team member: unseen review comments on the home screen (checked every 2 min)"""
+    c = st.session_state.get("_rev_cache")
+    if c and (datetime.now() - c[0]).total_seconds() < 120:
+        rows = c[1]
+    else:
+        try:
+            rows = supabase.table("work_reviews").select("*").eq("person", st.session_state.name)\
+                .is_("seen_at", "null").order("id", desc=True).limit(3).execute().data or []
+        except Exception:
+            return
+        st.session_state["_rev_cache"] = (datetime.now(), rows)
     for r in rows:
         with st.container(border=True):
             st.markdown(f"**🔎 {r.get('slot_label', 'Review')}** — {RATINGS.get(r.get('rating'), '')} · by {r.get('reviewer', '')}")
@@ -10991,6 +11189,7 @@ def show_my_reviews():
                 st.markdown(f"💬 {r['comment']}")
             if st.button("✅ Seen", key=f"rv_seen_{r['id']}"):
                 supabase.table("work_reviews").update({"seen_at": now_iso()}).eq("id", r["id"]).execute()
+                st.session_state.pop("_rev_cache", None)
                 st.rerun()
 
 
@@ -11088,9 +11287,15 @@ def _review_row(person, slot_key, day):
 
 
 def pending_reviews_banner():
-    """reminder for admin / managers when a review time has passed"""
+    """reminder for admin / managers when a review time has passed (re-checked every 3 min)"""
     if not is_reviewer():
         return
+    c = st.session_state.get("_rvb_cache")
+    if c and (datetime.now() - c[0]).total_seconds() < 180:
+        if c[1]:
+            st.warning(c[1])
+        return
+    st.session_state["_rvb_cache"] = (datetime.now(), "")
     try:
         now = _now_n()
         today = today_ist()
@@ -11116,7 +11321,9 @@ def pending_reviews_banner():
         if y_left:
             msgs.append(f"📅 **Yesterday's full-day review** pending for {len(y_left)}")
         if msgs:
-            st.warning("  \n".join(msgs) + "  \n→ open the **🔎 Reviews** tab")
+            txt = "  \n".join(msgs) + "  \n→ open the **🔎 Reviews** tab"
+            st.session_state["_rvb_cache"] = (datetime.now(), txt)
+            st.warning(txt)
     except Exception:
         pass
 
@@ -11211,6 +11418,7 @@ def review_card(u, f, slot_key, slot_label, day, kp):
                         rec["seen_at"] = None
                     try:
                         supabase.table("work_reviews").upsert(rec, on_conflict="person,date,slot").execute()
+                        st.session_state.pop("_rvb_cache", None)
                         if mk_task and comment.strip():
                             supabase.table("assigned_tasks").insert({
                                 "title": comment.strip()[:120], "details": f"From {slot_label} review",
@@ -11346,6 +11554,453 @@ def show_close_old_lines(kp="col"):
                     st.rerun()
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 📅 DAILY SUMMARY — one page for admin / managers (+ WhatsApp text)
+# ══════════════════════════════════════════════════════════════════════════════
+def _sum_details(tasks, types, field):
+    return int(sum(_to_float((t.get("details") or {}).get(field), 0) for t in tasks if t.get("task_type") in types))
+
+
+def _by_person(tasks, types, field=None):
+    out = {}
+    for t in tasks:
+        if t.get("task_type") in types:
+            v = _to_float((t.get("details") or {}).get(field), 0) if field else 1
+            out[t.get("person") or "?"] = out.get(t.get("person") or "?", 0) + v
+    return {k: int(v) for k, v in sorted(out.items(), key=lambda x: -x[1]) if v}
+
+
+def _in_area(t, area):
+    return area == "All Areas" or (t.get("details") or {}).get("area") == area
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def day_summary(day_s, area):
+    """every number of the Daily Summary for one day (YYYY-MM-DD)"""
+    day = datetime.strptime(day_s, "%Y-%m-%d").date()
+    is_today = day_s == date_str()
+    tasks_all = [t for t in fetch_all("daily_tasks", lambda q: q.eq("date", day_s)) if t.get("status") != "In Progress"]
+    tasks = [t for t in tasks_all if _in_area(t, area)]
+    S = {"day": day_s, "area": area}
+
+    # 🛒 purchase — medicines ordered
+    S["med_po"] = _by_person(tasks, ["Purchase Order"], "no_sku")
+    S["med_arr"] = _by_person(tasks, ["Arrangement Order", "Arrangement"], "no_medicines")
+    tot = {}
+    for d in (S["med_po"], S["med_arr"]):
+        for p, v in d.items():
+            tot[p] = tot.get(p, 0) + v
+    S["med_by"] = dict(sorted(tot.items(), key=lambda x: -x[1]))
+    S["med_total"] = sum(tot.values())
+    S["orders_po"] = sum(1 for t in tasks if t.get("task_type") == "Purchase Order")
+    S["orders_arr"] = sum(1 for t in tasks if t.get("task_type") in ("Arrangement Order", "Arrangement"))
+    try:
+        sl = [l for l in fetch_all("order_sheet_lines", lambda q: q.eq("sheet_date", day_s))
+              if not l.get("superseded_by") and (area == "All Areas" or l.get("area") == area)]
+    except Exception:
+        sl = []
+    S["sheet_total"] = len(sl)
+    S["sheet_ordered"] = sum(1 for l in sl if l.get("status") == "Ordered")
+    S["sheet_not"] = sum(1 for l in sl if l.get("status") == "Not Ordered")
+    S["off_top3"] = sum(1 for l in sl if l.get("status") == "Ordered" and l.get("off_top_reason"))
+    S["cust_waiting"] = None
+    if is_today:
+        try:
+            need = [l for l in _need_order_lines() if area == "All Areas" or l.get("area") == area]
+            S["cust_waiting"] = sum(1 for l in need if (l.get("scheduled_date") or "9999") <= day_s
+                                    and (l.get("scheduled_date") or "") >= (day - timedelta(days=3)).strftime("%Y-%m-%d"))
+            S["cust_overdue"] = sum(1 for l in need if (day - timedelta(days=3)).strftime("%Y-%m-%d")
+                                    <= (l.get("scheduled_date") or "") < day_s)
+        except Exception:
+            pass
+
+    # 🧾 bills
+    regs = [t for t in tasks if t.get("task_type") == "Register Entry"]
+    S["bills_in"] = len(regs)
+    S["bills_value"] = int(sum(_to_float((t.get("details") or {}).get("bill_amount"), 0) for t in regs))
+    ccs = [t for t in tasks if t.get("task_type") == "Bill Cross Check"]
+    S["bills_cc"] = len(ccs)
+    S["bills_up"] = sum(1 for t in tasks if t.get("task_type") in ("Bill Upload (Software)", "Bill Upload"))
+    S["cc_by"] = _by_person(tasks, ["Bill Cross Check"])
+    S["up_by"] = _by_person(tasks, ["Bill Upload (Software)", "Bill Upload"])
+    S["reg_by"] = _by_person(tasks, ["Register Entry"])
+    S["issues"] = {}
+    for k, lbl in ISSUE_FIELDS:
+        n = int(sum(_to_float((t.get("details") or {}).get(k), 0) for t in ccs if _to_float((t.get("details") or {}).get(k), 0) < 500))
+        if n:
+            S["issues"][lbl] = n
+    try:
+        jr = [b for b in build_bill_journeys(day_s, day_s, (day + timedelta(days=1)).strftime("%Y-%m-%d"))
+              if area == "All Areas" or (b["d"] or {}).get("area") == area]
+    except Exception:
+        jr = []
+    waits = [(b["uploaded"] - b["arrived"]).total_seconds() / 60 for b in jr
+             if b.get("arrived") and b.get("uploaded") and b["uploaded"] >= b["arrived"]]
+    S["avg_upload_mins"] = _median(waits)
+    S["pend_cc"] = sum(1 for b in jr if not b["stages"][0].get("task"))
+    S["pend_up"] = sum(1 for b in jr if b["stages"][0].get("task") and not b.get("uploaded"))
+
+    # 📞 calls / customers
+    calls = [t for t in tasks_all if t.get("task_type") == "Call Log"]
+    S["calls_by"] = _by_person(calls, ["Call Log"], "calls_made")
+    S["calls"] = sum(S["calls_by"].values())
+    S["calls_picked"] = _sum_details(calls, ["Call Log"], "calls_picked")
+    S["delivered_log"] = _sum_details(calls, ["Call Log"], "orders_delivered")
+    lo_ts = IST.localize(datetime.combine(day, datetime.min.time())).isoformat()
+    hi_ts = IST.localize(datetime.combine(day, datetime.max.time())).isoformat()
+    try:
+        dl = [l for l in fetch_all("customer_order_lines", lambda q: q.gte("delivery_at", lo_ts).lte("delivery_at", hi_ts))
+              if area == "All Areas" or l.get("area") == area]
+    except Exception:
+        dl = []
+    S["deliv_orders"] = len({l.get("order_no") for l in dl if l.get("delivery_status") == "Delivered"})
+    nd = [l for l in dl if l.get("delivery_status") == "Not Delivered"]
+    S["not_deliv_orders"] = len({l.get("order_no") for l in nd})
+    rs = [l.get("delivery_reason") or "No reason" for l in nd]
+    S["not_deliv_reasons"] = {r: rs.count(r) for r in sorted(set(rs), key=lambda r: -rs.count(r))[:3]}
+    try:
+        due = [l for l in fetch_all("customer_order_lines", lambda q: q.eq("scheduled_date", day_s).eq("removed", False))
+               if area == "All Areas" or l.get("area") == area]
+    except Exception:
+        due = []
+    S["due_today"] = len(due)
+    ontime = late = 0
+    for l in due:
+        if l.get("status") == "Received" and l.get("delivery_time"):
+            di = due_info(l, to_ist(l.get("completed_at")) or now_ist())
+            if di:
+                ontime += di[1] >= 0
+                late += di[1] < 0
+    S["due_ontime"], S["due_late"] = ontime, late
+    S["due_received"] = sum(1 for l in due if l.get("status") == "Received")
+
+    # 🚚 pickups
+    try:
+        arrs = [a for a in fetch_all("arrangements", lambda q: q.eq("order_placed_date", day_s))
+                if area == "All Areas" or a.get("area") == area]
+    except Exception:
+        arrs = []
+    S["arr_placed"] = len(arrs)
+    S["arr_picked"] = sum(1 for a in arrs if a.get("status") not in ("Pending", None, ""))
+    S["arr_reached"] = sum(1 for a in arrs if a.get("status") in ("Reached Warehouse", "Bill Cross Checked", "Bill Uploaded",
+                                                                  "Stock Placed", "Completed"))
+    pk = [t for t in tasks_all if t.get("task_type") == "Pickup"]
+    ot = [(t.get("details") or {}).get("on_time") for t in pk if (t.get("details") or {}).get("on_time")]
+    S["pickups"] = len(pk)
+    S["pickup_ontime"] = round(100 * sum(1 for x in ot if x == "Yes") / len(ot)) if ot else None
+    try:
+        S["km"] = {k.get("person"): float(k["km"]) for k in fetch_all("km_log", lambda q: q.eq("date", day_s))
+                   if k.get("km") is not None}
+    except Exception:
+        S["km"] = {}
+
+    # 👥 team — working time
+    try:
+        ev = fetch_all("attendance_log", lambda q: q.eq("date", day_s))
+    except Exception:
+        ev = []
+    try:
+        shifts = {r.get("person"): r for r in fetch_all("shift_roster", lambda q: q.eq("date", day_s))}
+    except Exception:
+        shifts = {}
+    try:
+        blocks = fetch_all("work_blocks", lambda q: q.eq("date", day_s))
+        revs = fetch_all("work_reviews", lambda q: q.eq("date", day_s))
+    except Exception:
+        blocks, revs = [], []
+    users = {u.get("name"): u for u in (load_users() or {}).values() if u.get("active", True) is not False}
+    try:
+        cards = {c.get("person"): c for c in fetch_all("day_cards", lambda q: q.eq("date", day_s))}
+    except Exception:
+        cards = {}
+    by_p = {}
+    for e in ev:
+        by_p.setdefault(e.get("person"), []).append(e)
+    team_rows = []
+    people = sorted(set(by_p) | {t.get("person") for t in tasks_all if t.get("person")})
+    for p in people:
+        es = sorted(by_p.get(p, []), key=lambda e: str(e.get("at")))
+        s = att_state(es)
+        mine = [t for t in tasks_all if t.get("person") == p]
+        task_m = int(sum(task_secs(t) for t in mine) // 60)
+        cin, cout = s["clock_in"], s["clock_out"]
+        est = False
+        if cin:
+            end = cout or (now_ist() if is_today else None)
+            if not end:                       # forgot to clock out -> count till the last finished task
+                ends = [_naive(_task_dt(t, "end_time")) for t in mine]
+                ends = [e for e in ends if e]
+                end = IST.localize(max(ends)) if ends else None
+                est = bool(end)
+            present_m = int(max(0, (end - cin).total_seconds() - s["break_secs"]) // 60) if end and end > cin else None
+        else:
+            present_m = None
+        late = ""
+        sh = shifts.get(p)
+        if cin and sh and sh.get("start_time") and sh.get("status", "Working") == "Working":
+            try:
+                st_t = datetime.strptime(f"{day_s} {sh['start_time']}", "%Y-%m-%d %I:%M %p")
+                lm = int((_naive(cin) - st_t).total_seconds() // 60)
+                if lm > 10:
+                    late = f"{lm} min late"
+            except Exception:
+                pass
+        bl = [float(b["result_pct"]) for b in blocks if b.get("person") == p and b.get("result_pct") is not None]
+        team_rows.append({
+            "Person": p, "Team": (users.get(p) or {}).get("team", "") or (mine[0].get("team") if mine else ""),
+            "In": cin.strftime("%I:%M %p") if cin else "—",
+            "Out": cout.strftime("%I:%M %p") if cout else ("working" if cin and is_today else ("last task " + end.strftime("%I:%M %p") if cin and est else "—")),
+            "Present": (fmt_age(present_m) + ("*" if est else "")) if present_m is not None else "—",
+            "Breaks": fmt_age(int(s["break_secs"] // 60)) if s["breaks"] else "—",
+            "On tasks": fmt_age(task_m), "Tasks": len(mine),
+            "Idle %": f"{max(0, 100 - round(100 * task_m / present_m))}%" if present_m and present_m >= 30 else "—",
+            "Late": late, "Plan hit": f"{round(sum(bl) / len(bl))}%" if bl else "—",
+            "🔴": sum(1 for r in revs if r.get("person") == p and r.get("rating") == "red") or "",
+            "Handover": (cards.get(p) or {}).get("handover") or "",
+        })
+    S["team"] = team_rows
+    try:      # "absent" only for people who normally come (clocked in at least once in the last 14 days)
+        regular = {e.get("person") for e in fetch_all("attendance_log", lambda q: q.eq("event", "clock_in").gte(
+            "date", (day - timedelta(days=14)).strftime("%Y-%m-%d")).lte("date", day_s))}
+    except Exception:
+        regular = set(users)
+    working = [n for n, u in users.items() if u.get("team") in ("Stock", "Purchase", "Call", "Delivery")
+               and u.get("role") not in ("admin", "manager") and n in regular]
+    present = {r["Person"] for r in team_rows if r["In"] != "—"}
+    S["present"] = len(present & set(working))
+    S["absent"] = sorted(set(working) - present - {p for p, r in shifts.items() if r.get("status") not in (None, "", "Working")})
+    S["late"] = [r["Person"] for r in team_rows if r["Late"]]
+    # 🚪 did not clock out (with last activity + how often in the last 7 days)
+    try:
+        wk = fetch_all("attendance_log", lambda q: q.in_("event", ["clock_in", "clock_out"]).gte(
+            "date", (day - timedelta(days=6)).strftime("%Y-%m-%d")).lte("date", day_s))
+    except Exception:
+        wk = []
+    days_in, days_out = {}, {}
+    for e in wk:
+        (days_in if e.get("event") == "clock_in" else days_out).setdefault(e.get("person"), set()).add(e.get("date"))
+    now_n = _now_n()
+    no_out = []
+    for p in people:
+        es = sorted(by_p.get(p, []), key=lambda e: str(e.get("at")))
+        s = att_state(es)
+        if not s["clock_in"] or s["clock_out"]:
+            continue
+        if is_today:            # today: only once their shift is over (or after 9 PM)
+            sh = shifts.get(p) or {}
+            try:
+                end_t = datetime.strptime(f"{day_s} {sh.get('end_time')}", "%Y-%m-%d %I:%M %p")
+            except Exception:
+                end_t = datetime.strptime(f"{day_s} 09:00 PM", "%Y-%m-%d %I:%M %p")
+            if end_t < _naive(s["clock_in"]):
+                end_t = datetime.strptime(f"{day_s} 09:00 PM", "%Y-%m-%d %I:%M %p")
+            if now_n < end_t + timedelta(minutes=30):
+                continue
+        mine = [t for t in tasks_all if t.get("person") == p]
+        last = max(mine, key=lambda t: _naive(_task_dt(t, "end_time")) or datetime.min, default=None)
+        lt = _naive(_task_dt(last, "end_time")) if last else None
+        u = users.get(p) or {}
+        missed = len(days_in.get(p, set()) - days_out.get(p, set()))
+        no_out.append({"Person": p, "Team": u.get("team", ""), "Phone": u.get("phone") or "",
+                       "Clocked in": _naive(s["clock_in"]).strftime("%I:%M %p"),
+                       "Last task": (f"{lt.strftime('%I:%M %p')} · {last.get('task_type')}" if lt else "no task"),
+                       "No clock-out (7 days)": f"{missed} of {len(days_in.get(p, set()))} days"})
+    no_out.sort(key=lambda r: -int(r["No clock-out (7 days)"].split()[0]))
+    S["no_out"] = no_out
+    reasons = [b.get("reason").split(":")[0] for b in blocks if b.get("reason")]
+    S["top_reason"] = max(set(reasons), key=reasons.count) if reasons else ""
+    S["reds"] = sum(1 for r in revs if r.get("rating") == "red")
+    return S
+
+
+def _delta(now_v, prev_v):
+    if prev_v in (None, 0) or now_v is None:
+        return None
+    d = now_v - prev_v
+    return f"{d:+,}"
+
+
+def _list_txt(d, unit=""):
+    return "\n".join(f"  {p} — {v:,}{unit}" for p, v in d.items()) if d else "  —"
+
+
+def summary_text(S):
+    """WhatsApp-friendly text"""
+    day = datetime.strptime(S["day"], "%Y-%m-%d").strftime("%a %d %b")
+    L = [f"*RapidSurge — Daily Summary {day}*" + ("" if S["area"] == "All Areas" else f" ({S['area']})"), ""]
+    L += ["*🛒 Medicines ordered*", _list_txt(S["med_by"]), f"  *Total — {S['med_total']:,}*"
+          f" (sheet/PO {sum(S['med_po'].values()):,} · arrangement {sum(S['med_arr'].values()):,})"]
+    if S["sheet_total"]:
+        L.append(f"  Order sheet: {S['sheet_ordered']}/{S['sheet_total']} ordered ({round(100 * S['sheet_ordered'] / S['sheet_total'])}%)")
+    if S.get("cust_waiting") is not None:
+        L.append(f"  Customer medicines still to order: {S['cust_waiting']}")
+    L += ["", "*🧾 Bills*", f"  Received: {S['bills_in']} (₹{S['bills_value']:,})", f"  Cross checked: {S['bills_cc']}",
+          f"  Uploaded: {S['bills_up']}", f"  Pending: {S['pend_cc'] + S['pend_up']} (cross check {S['pend_cc']} · upload {S['pend_up']})"]
+    if S["avg_upload_mins"]:
+        L.append(f"  Avg arrival → upload: {fmt_age(int(S['avg_upload_mins']))}")
+    if S["issues"]:
+        L.append("  Problems: " + ", ".join(f"{k} {v}" for k, v in S["issues"].items()))
+    L += ["", "*📞 Calls & customers*", f"  Calls done: {S['calls']:,}" + (f" (picked {S['calls_picked']:,})" if S["calls_picked"] else ""),
+          _list_txt(S["calls_by"]), f"  Orders delivered: {max(S['deliv_orders'], S['delivered_log'])}"]
+    if S["not_deliv_orders"]:
+        L.append(f"  Not delivered: {S['not_deliv_orders']} — " + ", ".join(f"{k} {v}" for k, v in S["not_deliv_reasons"].items()))
+    if S["due_today"]:
+        L.append(f"  Customer medicines due: {S['due_today']} · received {S['due_received']} (on time {S['due_ontime']}, late {S['due_late']})")
+    L += ["", "*🚚 Pickups*", f"  Arrangement orders: {S['arr_placed']} placed · {S['arr_picked']} picked · {S['arr_reached']} reached"]
+    if S["pickup_ontime"] is not None:
+        L.append(f"  On-time pickups: {S['pickup_ontime']}%")
+    if S["km"]:
+        L.append("  KM: " + ", ".join(f"{p} {v:.0f}" for p, v in S["km"].items()))
+    L += ["", "*👥 Team*", f"  Present {S['present']}" + (f" · Absent: {', '.join(S['absent'])}" if S["absent"] else "")
+          + (f" · Late: {', '.join(S['late'])}" if S["late"] else "")]
+    for r in S["team"]:
+        if r["In"] != "—" or r["Tasks"]:
+            L.append(f"  {r['Person']}: {r['Present']} present · {r['On tasks']} on tasks · {r['Tasks']} tasks"
+                     + (f" · plan {r['Plan hit']}" if r["Plan hit"] != "—" else ""))
+    if S["top_reason"]:
+        L.append(f"  Top reason for slow work: {S['top_reason']}")
+    if S.get("no_out"):
+        L.append("  Did not clock out: " + ", ".join(r["Person"] for r in S["no_out"]))
+    return "\n".join(L)
+
+
+def _people_table(d, col="Medicines"):
+    if not d:
+        st.caption("—")
+        return
+    tot = sum(d.values())
+    rows = [{"Person": p, col: f"{v:,}"} for p, v in d.items()] + [{"Person": "**Total**", col: f"{tot:,}"}]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+
+
+def show_no_clockout(S, kp):
+    rows = S.get("no_out") or []
+    st.markdown(f"#### 🚪 Did not clock out ({len(rows)})")
+    if not rows:
+        st.caption("Everyone clocked out ✅" if S["day"] != date_str() else
+                   "Nobody yet — people show here 30 min after their shift ends (or after 9 PM).")
+        return
+    st.caption("Without clock-out we can't see their real working hours. Talk to them — sorted by who misses most.")
+    day = datetime.strptime(S["day"], "%Y-%m-%d").strftime("%d %b")
+    for r in rows:
+        c1, c2 = st.columns([4, 2])
+        with c1:
+            st.markdown(f"**{r['Person']}** · {r['Team']} · in {r['Clocked in']} · last task {r['Last task']}  \n"
+                        f"<span style='opacity:0.7'>No clock-out on {r['No clock-out (7 days)']}</span>",
+                        unsafe_allow_html=True)
+        with c2:
+            ph = re.sub(r"\D", "", r["Phone"] or "")
+            if ph:
+                if len(ph) == 10:
+                    ph = "91" + ph
+                msg = (f"Hi {r['Person']}, you did not clock out on {day} in the RapidSurge app. "
+                       f"Please clock out every day before leaving.")
+                import urllib.parse
+                st.markdown(f"[📞 Call](tel:+{ph}) · [💬 WhatsApp](https://wa.me/{ph}?text={urllib.parse.quote(msg)})")
+            else:
+                st.caption("No phone saved (add it in Settings → Users)")
+
+
+def show_daily_summary(kp="ds"):
+    st.subheader("📅 Daily Summary")
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        day = st.date_input("Day", value=today_ist(), max_value=today_ist(), key=f"{kp}_day", format="DD/MM/YYYY")
+    with c2:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    with c3:
+        st.write("")
+        if st.button("🔄 Refresh", key=f"{kp}_rf"):
+            day_summary.clear()
+    try:
+        with st.spinner("Adding up the day…"):
+            S = day_summary(day.strftime("%Y-%m-%d"), area)
+            P = day_summary((day - timedelta(days=1)).strftime("%Y-%m-%d"), area)
+    except Exception as e:
+        st.error(f"Could not build the summary ({e})")
+        return
+    st.caption("▲▼ = compared with the day before. Numbers refresh every 5 minutes.")
+
+    m = st.columns(4)
+    m[0].metric("💊 Medicines ordered", f"{S['med_total']:,}", _delta(S["med_total"], P["med_total"]))
+    m[1].metric("🧾 Bills received", S["bills_in"], _delta(S["bills_in"], P["bills_in"]))
+    m[2].metric("📤 Bills uploaded", S["bills_up"], _delta(S["bills_up"], P["bills_up"]))
+    m[3].metric("📞 Calls done", f"{S['calls']:,}", _delta(S["calls"], P["calls"]))
+
+    t1, t2, t3, t4, t5, t6 = st.tabs(["🛒 Purchase", "🧾 Bills", "📞 Calls", "🚚 Pickups", "👥 Team", "📋 WhatsApp"])
+    with t1:
+        st.markdown(f"**No. of medicines ordered — by person** (total **{S['med_total']:,}** in "
+                    f"{S['orders_po'] + S['orders_arr']} orders)")
+        _people_table(S["med_by"])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"Sheet / Purchase Orders: **{sum(S['med_po'].values()):,}**")
+            _people_table(S["med_po"])
+        with c2:
+            st.markdown(f"Arrangement: **{sum(S['med_arr'].values()):,}**")
+            _people_table(S["med_arr"])
+        if S["sheet_total"]:
+            pct = round(100 * S["sheet_ordered"] / S["sheet_total"])
+            st.progress(pct / 100, text=f"Order sheet: {S['sheet_ordered']} of {S['sheet_total']} medicines ordered ({pct}%)"
+                        + (f" · {S['sheet_not']} marked not ordered" if S["sheet_not"] else ""))
+        if S["off_top3"]:
+            st.warning(f"💸 {S['off_top3']} sheet medicine(s) ordered from a distributor outside the top 3 margins")
+        if S.get("cust_waiting") is not None:
+            st.info(f"📦 Customer medicines still to be ordered (last 3 days + today): **{S['cust_waiting']}**"
+                    + (f" — {S['cust_overdue']} overdue" if S.get("cust_overdue") else ""))
+    with t2:
+        c = st.columns(4)
+        c[0].metric("Received", S["bills_in"], _delta(S["bills_in"], P["bills_in"]))
+        c[1].metric("Cross checked", S["bills_cc"], _delta(S["bills_cc"], P["bills_cc"]))
+        c[2].metric("Uploaded", S["bills_up"], _delta(S["bills_up"], P["bills_up"]))
+        c[3].metric("Pending", S["pend_cc"] + S["pend_up"], f"check {S['pend_cc']} · upload {S['pend_up']}", delta_color="off")
+        st.markdown(f"Bill value received: **₹{S['bills_value']:,}**"
+                    + (f" · Avg arrival → upload: **{fmt_age(int(S['avg_upload_mins']))}**" if S["avg_upload_mins"] else ""))
+        if S["issues"]:
+            st.warning("Problems found in cross check: " + " · ".join(f"**{k}** {v}" for k, v in S["issues"].items()))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Register entry**"); _people_table(S["reg_by"], "Bills")
+        with c2:
+            st.markdown("**Cross check**"); _people_table(S["cc_by"], "Bills")
+        with c3:
+            st.markdown("**Upload**"); _people_table(S["up_by"], "Bills")
+    with t3:
+        c = st.columns(3)
+        c[0].metric("Calls done", f"{S['calls']:,}", _delta(S["calls"], P["calls"]))
+        c[1].metric("Orders delivered", max(S["deliv_orders"], S["delivered_log"]))
+        c[2].metric("Not delivered", S["not_deliv_orders"])
+        if S["not_deliv_reasons"]:
+            st.caption("Top reasons: " + " · ".join(f"{k} ({v})" for k, v in S["not_deliv_reasons"].items()))
+        _people_table(S["calls_by"], "Calls")
+        if S["due_today"]:
+            st.markdown(f"Customer medicines due this day: **{S['due_today']}** · received **{S['due_received']}** "
+                        f"(🟢 on time {S['due_ontime']} · 🔴 late {S['due_late']})")
+    with t4:
+        c = st.columns(3)
+        c[0].metric("Arrangement orders placed", S["arr_placed"])
+        c[1].metric("Picked up", S["arr_picked"])
+        c[2].metric("Reached warehouse", S["arr_reached"])
+        st.markdown(f"Pickups done: **{S['pickups']}**" + (f" · on time **{S['pickup_ontime']}%**" if S["pickup_ontime"] is not None else ""))
+        if S["km"]:
+            st.markdown("KM run: " + " · ".join(f"{p} **{v:.0f} km**" for p, v in S["km"].items()))
+    with t5:
+        st.markdown(f"**Present {S['present']}**" + (f" · ❌ Absent: {', '.join(S['absent'])}" if S["absent"] else "")
+                    + (f" · ⏰ Late: {', '.join(S['late'])}" if S["late"] else ""))
+        if S["team"]:
+            st.dataframe(pd.DataFrame(S["team"]), hide_index=True, width='stretch')
+            st.caption("Present = clock in → clock out minus breaks (* = no clock-out, counted till the last task) · "
+                       "On tasks = time inside task timers · "
+                       "Idle % = present time not spent on tasks · Late = after shift start (+10 min grace)")
+        if S["top_reason"]:
+            st.markdown(f"🗒️ Top reason for slow work: **{S['top_reason']}**" + (f" · 🔴 reviews: {S['reds']}" if S["reds"] else ""))
+        show_no_clockout(S, kp)
+    with t6:
+        st.caption("Tap the copy icon (top right of the box) and paste in WhatsApp.")
+        st.code(summary_text(S), language=None)
+
+
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
@@ -11358,8 +12013,9 @@ def show_admin_page():
     pending_reviews_banner()
     st.divider()
 
-    tab0, tab17, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15, tab16 = st.tabs([
+    tab0, tab18, tab17, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15, tab16 = st.tabs([
         "🎯 My Day",
+        "📅 Daily Summary",
         "🔎 Reviews",
         "📊 Dashboard",
         "👥 All Staff Work",
@@ -11378,6 +12034,9 @@ def show_admin_page():
         "🏆 League",
         "📦 Photos"
     ])
+
+    with tab18:
+        show_daily_summary("adm_ds")
 
     with tab17:
         show_reviews("adm_rv")
