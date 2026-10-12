@@ -7649,20 +7649,20 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    t12, t11, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["📅 Daily Summary", "🔎 Reviews", "👥 All Staff Work", "🕐 Attendance", "📋 Full Day", "📌 Assign Tasks", "📅 Shift Planner", "🧾 Bills Register", "📦 Customer Orders", "🛒 Normal Orders", "🚚 Distributors", "🛵 Delivery KM", "🏆 League"])
-    with t12: show_daily_summary("mgr_ds")
-    with t11: show_reviews("mgr_rv")
-    with t0: show_all_staff_work("mgr_asw")
-    with t1: show_attendance_admin("mgr_att")
-    with t2: show_full_day_picker("mgr_fd")
-    with t3: show_assign_tasks_admin("mgr_asg")
-    with t4: show_shift_planner("mgr_shift")
-    with t5: show_bills_register("mgr_bills")
-    with t6: show_customer_order_tracker("mgr_trk", show_phone=True)
-    with t7: show_order_sheet_report("mgr_osr")
-    with t8: show_distributors_admin("mgr_dist")
-    with t9: show_delivery_km("mgr_dkm")
-    with t10: show_league("mgr_lg")
+    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League'])
+    if _nav == '📅 Daily Summary': show_daily_summary("mgr_ds")
+    if _nav == '🔎 Reviews': show_reviews("mgr_rv")
+    if _nav == '👥 All Staff Work': show_all_staff_work("mgr_asw")
+    if _nav == '🕐 Attendance': show_attendance_admin("mgr_att")
+    if _nav == '📋 Full Day': show_full_day_picker("mgr_fd")
+    if _nav == '📌 Assign Tasks': show_assign_tasks_admin("mgr_asg")
+    if _nav == '📅 Shift Planner': show_shift_planner("mgr_shift")
+    if _nav == '🧾 Bills Register': show_bills_register("mgr_bills")
+    if _nav == '📦 Customer Orders': show_customer_order_tracker("mgr_trk", show_phone=True)
+    if _nav == '🛒 Normal Orders': show_order_sheet_report("mgr_osr")
+    if _nav == '🚚 Distributors': show_distributors_admin("mgr_dist")
+    if _nav == '🛵 Delivery KM': show_delivery_km("mgr_dkm")
+    if _nav == '🏆 League': show_league("mgr_lg")
 
 # ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
 DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
@@ -11229,6 +11229,7 @@ def _idle_gaps(tasks, lo, hi, person, min_gap=30):
     return gaps
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def review_facts(person, team, area, slot_key, day):
     lo, hi = _slot_window(slot_key, day)
     hi = min(hi, _now_n())
@@ -12001,6 +12002,19 @@ def show_daily_summary(kp="ds"):
         st.code(summary_text(S), language=None)
 
 
+
+def section_nav(kp, labels):
+    """one-section-at-a-time menu (st.tabs runs EVERY tab on every click -> very slow pages).
+    The open section is kept in the link, so a refresh stays on it."""
+    qp = st.query_params.get(f"{kp}_s")
+    key = f"{kp}_nav"
+    if key not in st.session_state:
+        st.session_state[key] = labels[int(qp)] if qp and str(qp).isdigit() and int(qp) < len(labels) else labels[0]
+    pick = st.radio("Section", labels, horizontal=True, key=key, label_visibility="collapsed")
+    st.query_params[f"{kp}_s"] = str(labels.index(pick))
+    st.divider()
+    return pick
+
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
@@ -12013,69 +12027,49 @@ def show_admin_page():
     pending_reviews_banner()
     st.divider()
 
-    tab0, tab18, tab17, tab1, tab12, tab2, tab3, tab4, tab5, tab6, tab7, tab13, tab8, tab9, tab10, tab11, tab14, tab15, tab16 = st.tabs([
-        "🎯 My Day",
-        "📅 Daily Summary",
-        "🔎 Reviews",
-        "📊 Dashboard",
-        "👥 All Staff Work",
-        "🔄 Pipeline",
-        "📈 Performance",
-        "📝 Submit Entry",
-        "👥 Settings",
-        "📥 Reports",
-        "📦 Customer Orders",
-        "🛒 Normal Orders",
-        "🧾 Bills Register",
-        "🕐 Attendance",
-        "📌 Assign Tasks",
-        "📅 Shift Planner",
-        "🛵 Delivery KM",
-        "🏆 League",
-        "📦 Photos"
-    ])
+    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos'])
 
-    with tab18:
+    if _nav == '📅 Daily Summary':
         show_daily_summary("adm_ds")
 
-    with tab17:
+    if _nav == '🔎 Reviews':
         show_reviews("adm_rv")
 
-    with tab16:
+    if _nav == '📦 Photos':
         show_photo_archive("adm_ph")
 
-    with tab15:
+    if _nav == '🏆 League':
         show_league("adm_lg")
 
-    with tab14:
+    if _nav == '🛵 Delivery KM':
         show_delivery_km("adm_dkm")
 
-    with tab0:
+    if _nav == '🎯 My Day':
         show_my_day("md")
 
-    with tab11:
+    if _nav == '📅 Shift Planner':
         show_shift_planner("adm_shift")
 
-    with tab13:
+    if _nav == '🛒 Normal Orders':
         show_order_sheet_report("adm_osr")
 
-    with tab12:
+    if _nav == '👥 All Staff Work':
         show_all_staff_work("adm_asw")
 
-    with tab10:
+    if _nav == '📌 Assign Tasks':
         show_assign_tasks_admin("adm_asg")
 
-    with tab9:
+    if _nav == '🕐 Attendance':
         show_attendance_admin("adm_att")
 
-    with tab7:
+    if _nav == '📦 Customer Orders':
         show_close_old_lines("adm_col")
         show_customer_order_tracker("adm", show_phone=True)
 
-    with tab8:
+    if _nav == '🧾 Bills Register':
         show_bills_register("adm_bills")
 
-    with tab1:
+    if _nav == '📊 Dashboard':
         try:
             tasks_resp = supabase.table("daily_tasks").select("*").eq("date", date_str()).execute()
             df = pd.DataFrame(tasks_resp.data) if tasks_resp.data else pd.DataFrame()
@@ -12258,7 +12252,7 @@ def show_admin_page():
         except Exception as e:
             st.error(f"Error: {e}")
 
-    with tab2:
+    if _nav == '🔄 Pipeline':
         st.subheader("🔄 Pipeline View")
         pickup_board_today()
 
@@ -12506,7 +12500,7 @@ def show_admin_page():
                     else:
                         st.markdown(f"⏳ {step_name}")
 
-    with tab3:
+    if _nav == '📈 Performance':
         st.subheader("📈 Performance & CEO Dashboard")
 
         perf_tab1, perf_tab2 = st.tabs(["👤 Team Performance", "💼 CEO Dashboard"])
@@ -13043,7 +13037,7 @@ def show_admin_page():
             st.dataframe(person_summary, width='stretch')
             st.bar_chart(tasks_df.groupby("person").size())
 
-    with tab4:
+    if _nav == '📝 Submit Entry':
         st.subheader("📝 Submit Entry")
         tabs_entry = st.tabs(["🛒 Purchase","📋 Arrangement","🧾 Bill Upload",
                               "📞 Call","🚚 Delivery","🚛 Book Porter",
@@ -13059,7 +13053,7 @@ def show_admin_page():
         with tabs_entry[8]: form_porter_payment()
         with tabs_entry[9]: form_other_task()
 
-    with tab5:
+    if _nav == '👥 Settings':
         st.subheader("👥 User Management")
         tab_u1, tab_u2 = st.tabs(["➕ Add User","👥 Manage Users"])
         with tab_u1:
@@ -13213,7 +13207,7 @@ def show_admin_page():
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-    with tab6:
+    if _nav == '📥 Reports':
         st.subheader("📥 Download Reports")
         c1,c2,c3 = st.columns(3)
         with c1: sel_team   = st.selectbox("Team", ["All","Purchase","Stock","Call","Delivery"], key="r_team")
