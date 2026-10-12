@@ -2153,6 +2153,114 @@ def form_edit_register_entry():
             d = entry.get("details",{}) or {}
             st.markdown(f"- {entry.get('time','')} | {d.get('distributor','')} | Bill: {d.get('bill_no','')} | Items: {d.get('no_items','')} | ₹{d.get('bill_amount','')}")
 
+
+# ── 📥 DISTRIBUTOR ARRIVED — live photo starts the bill clock ─────────────────
+ARRIVAL_TEAMS = ("Stock", "Purchase", "Call")
+
+
+def load_open_arrivals(days=2):
+    """arrivals of the last N days with how many bills are already entered"""
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        arr = fetch_all("bill_arrivals", lambda q: q.gte("date", lo))
+    except Exception:
+        return []
+    try:
+        regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", lo))
+    except Exception:
+        regs = []
+    done = {}
+    for r in regs:
+        aid = str((r.get("details") or {}).get("arrival_id") or "")
+        if aid:
+            done[aid] = done.get(aid, 0) + 1
+    for a in arr:
+        a["_entered"] = done.get(str(a["id"]), 0)
+    return sorted(arr, key=lambda a: str(a.get("arrived_at")))
+
+
+def arrival_label(a, now=None):
+    t = to_ist(a.get("arrived_at"))
+    age = fmt_age(int(((now or now_ist()) - t).total_seconds() // 60)) if t else ""
+    return (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills · arrived "
+            f"{t.strftime('%I:%M %p') if t else ''}" + (f" ({age} ago)" if age else "")
+            + f" · {a.get('_entered', 0)}/{a.get('bills', 0)} entered")
+
+
+def show_arrival_button():
+    """📥 button on the home screen (works before clock-in too — early morning deliveries)"""
+    if st.session_state.get("team") not in ARRIVAL_TEAMS and st.session_state.get("role") != "manager":
+        return
+    msg = st.session_state.pop("arr_in_msg", None)
+    if msg:
+        st.success(msg)
+    if not st.session_state.get("arr_in_open"):
+        if st.button("📥 Distributor arrived — take live photo", key="arr_in_btn", width='stretch'):
+            st.session_state["arr_in_open"] = True
+            st.rerun()
+        return
+    with st.container(border=True):
+        st.markdown("### 📥 Distributor arrived")
+        st.caption("One photo per delivery (10 bills = 1 photo). Take it **now, with the distributor's boy holding "
+                   "the bills** — the time is set by the app.")
+        areas = load_areas()
+        wa = st.session_state.get("work_area")
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            area = st.selectbox("Warehouse / Area *", areas, index=areas.index(wa) if wa in areas else 0, key="arr_in_area")
+        with c2:
+            dist = st.selectbox("Distributor *", DISTRIBUTORS + ["Other"], key="arr_in_dist")
+        with c3:
+            n = st.number_input("Bills *", 1, 100, 1, key="arr_in_n")
+        other = st.text_input("Distributor name", key="arr_in_other") if dist == "Other" else ""
+        ver = st.session_state.get("arr_in_v", 0)
+        photo = st.camera_input("📷 Live photo — distributor's boy with the bills", key=f"arr_in_cam_{ver}")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅ Save arrival", type="primary", width='stretch', key="arr_in_save",
+                         disabled=photo is None or (dist == "Other" and not other.strip())):
+                name = upload_image(photo, "arrival")
+                if name:
+                    try:
+                        supabase.table("bill_arrivals").insert({
+                            "date": date_str(), "area": area, "distributor": other.strip() or dist, "bills": int(n),
+                            "photo": name, "arrived_at": now_iso(), "logged_by": st.session_state.name,
+                            "team": st.session_state.get("team")}).execute()
+                        st.session_state["arr_in_open"] = False
+                        st.session_state["arr_in_v"] = ver + 1
+                        st.session_state["arr_in_msg"] = (f"✅ {other.strip() or dist}: {int(n)} bill(s) arrived at "
+                                                          f"{time_str()} — clock started. Do 📒 Register Entry for each bill.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save: {e} — did you run bill_arrival_setup.sql?")
+        with b2:
+            if st.button("✖️ Cancel", width='stretch', key="arr_in_cancel"):
+                st.session_state["arr_in_open"] = False
+                st.rerun()
+        if photo is None:
+            st.caption("📷 Allow the camera, point it at the boy with the bills, tap **Take Photo**. "
+                       "Gallery photos are not accepted here.")
+
+
+def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills not entered yet"):
+    arr = [a for a in load_open_arrivals(1) if a.get("_entered", 0) < int(a.get("bills") or 0)
+           and (area in ("All Areas", None, "") or a.get("area") == area)]
+    if not arr:
+        return
+    st.markdown(title)
+    now = now_ist()
+    rows = []
+    for a in arr:
+        t = to_ist(a.get("arrived_at"))
+        age = int((now - t).total_seconds() // 60) if t else 0
+        rows.append({"⏰": "🔴" if age >= 60 else "🟡" if age >= 20 else "🟢", "Distributor": a.get("distributor"),
+                     "Area": a.get("area"), "Arrived": t.strftime("%d %b %I:%M %p") if t else "",
+                     "Waiting": fmt_age(age), "Bills": a.get("bills"), "Entered": a.get("_entered", 0),
+                     "Not entered": int(a.get("bills") or 0) - a.get("_entered", 0), "Logged by": a.get("logged_by")})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+    st.caption("🟢 under 20 min · 🟡 20–60 min · 🔴 over 1 hour since the distributor arrived")
+
+
 def form_register_entry():
     st.subheader("📒 Register Entry")
     st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
@@ -2186,6 +2294,29 @@ def form_register_entry():
         except Exception as e:
             st.error(f"Error: {e}")
 
+    # 📥 which delivery is this bill from? (its clock started when the distributor arrived)
+    arrival, arr_choice = None, None
+    opens = [a for a in load_open_arrivals(2) if a.get("_entered", 0) < int(a.get("bills") or 0)]
+    wa = st.session_state.get("work_area")
+    opens.sort(key=lambda a: (a.get("area") != wa, str(a.get("arrived_at"))))
+    NO_ARR = "⚠️ No arrival photo was taken"
+    a_map = {arrival_label(a): a for a in opens}
+    if order_type == "Normal Order" or a_map:
+        arr_choice = st.selectbox("📥 Arrival (distributor delivery) *",
+                                  ["— Select arrival —"] + list(a_map) + [NO_ARR], key="re_arrival",
+                                  help="Tap 📥 Distributor arrived on the home screen when the boy brings bills.")
+        arrival = a_map.get(arr_choice)
+        if arr_choice == NO_ARR:
+            st.warning("This bill will be marked **⚠️ no arrival photo** in reports. Write why below.")
+        elif order_type == "Normal Order" and not arrival:
+            if not opens:
+                st.info("No open arrivals. Take the 📥 live photo on the home screen first — or pick "
+                        f"'{NO_ARR}' and give a reason.")
+    if arrival and not arr_dist:
+        arr_dist = arrival.get("distributor")
+    if arrival and not arr_area:
+        arr_area = arrival.get("area")
+
     st.markdown("📸 **Image of Packet/Box (Mandatory — take photo BEFORE opening)**")
     st.caption("⚠️ Take photo of sealed packet/box before opening — prevents disputes later!")
     invoice_img = photos_input("📷 Take photo or choose file", "re_upload", ("jpg","jpeg","png"))
@@ -2217,11 +2348,17 @@ def form_register_entry():
 
 
             bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
+            no_arr_reason = st.text_input("Why no arrival photo? *", key="re_noarr",
+                                          placeholder="e.g. came by courier / forgot") if arr_choice == NO_ARR else ""
             remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
 
             if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
                 if not bill_no or no_items == 0:
                     st.error("Fill Bill Number and No of Items!")
+                elif order_type == "Normal Order" and not arrival and arr_choice != NO_ARR:
+                    st.error("Select the 📥 Arrival this bill came with (top of the form).")
+                elif arr_choice == NO_ARR and not no_arr_reason.strip():
+                    st.error("Write why there is no arrival photo.")
                 elif order_type == "Arrangement" and not arr_no:
                     st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
                 elif not invoice_img:
@@ -2247,7 +2384,9 @@ def form_register_entry():
                                 "arrangement_no": arr_no,
                                 "area": re_area,
                                 "invoice_image": img_name,
-                                "remarks": remarks
+                                "remarks": remarks,
+                                **({"arrival_id": arrival["id"], "arrived_at": arrival.get("arrived_at")} if arrival else {}),
+                                **({"no_arrival_reason": no_arr_reason.strip()} if arr_choice == NO_ARR else {}),
                             },
                             "start_time": time_str(),
                             "end_time": time_str(),
@@ -3434,6 +3573,7 @@ def show_user_page():
     st.divider()
 
     show_my_shift()
+    show_arrival_button()
     done_secs = st.session_state.pop("mission_done", None)
     if done_secs is not None:
         st.toast(f"🎖️ Mission complete — {fmt_secs(done_secs)}", icon="✅")
@@ -6357,12 +6497,36 @@ def build_bill_journeys(reg_from, reg_to, later_to):
             continue
         rid = (task.get("details") or {}).get("reg_id")
         idx.setdefault(task.get("task_type"), {}).setdefault(("REG", str(rid)) if rid else _bill_key(task.get("details")), task)
+    # arrangement bills: when the stock really reached the warehouse (porter / distributor receipt)
+    recv = {}
+    for t in fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Porter Receipt", "Distributor Delivery Receipt"])
+                       .gte("date", (datetime.strptime(reg_from, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d"))
+                       .lte("date", reg_to)):
+        d_ = t.get("details") or {}
+        when = _task_dt(t, "time")
+        for a_no in re.split(r"[,\s]+", str(d_.get("arrangement_nos") or d_.get("arrangement_no") or "")):
+            a_no = a_no.strip().lstrip("#")
+            if a_no and when and (a_no not in recv or when < recv[a_no]):
+                recv[a_no] = when
     out = []
     for r in regs:
         d = r.get("details") or {}
         k = _bill_key(d)
-        arrived = _task_dt(r, "time")
-        rec = {"reg": r, "d": d, "arrived": arrived, "stages": []}
+        entered = _task_dt(r, "time")
+        arrived, src = entered, "⚠️ none"
+        real = _naive(to_ist(d.get("arrived_at"))) if d.get("arrived_at") else None
+        if real:
+            src = "📥 photo"
+        a_no = str(d.get("arrangement_no") or "").strip().lstrip("#")
+        if a_no and a_no in recv and (not real or recv[a_no] < real):
+            real, src = recv[a_no], "📦 receipt"
+        if real and entered and real <= entered:
+            arrived = real
+        elif real and not entered:
+            arrived = real
+        rec = {"reg": r, "d": d, "arrived": arrived, "entered": entered, "arr_src": src,
+               "entry_delay": ((entered - arrived).total_seconds() / 60) if entered and arrived else None,
+               "stages": []}
         prev_end = arrived
         for label, ttype in [("✔️ Cross Check", "Bill Cross Check"), ("📤 Upload", "Bill Upload (Software)"),
                              ("📍 Placement", "Stock Placement")]:
@@ -6464,6 +6628,7 @@ def show_bills_register(kp="bills", default_area=None):
     areas_all = ["All Areas"] + load_areas()
     area = st.selectbox("Area", areas_all, key=f"{kp}_area",
                         index=areas_all.index(default_area) if default_area in areas_all else 0)
+    show_waiting_arrivals(area)
     show_live_pending_bills(area)
 
     st.divider()
@@ -6508,6 +6673,10 @@ def show_bills_register(kp="bills", default_area=None):
         typ = "Arrangement" if (d.get("order_type") == "Arrangement" or d.get("arrangement_no")) else "Normal"
         row = {"Arrival Date": a.strftime("%d %b") if a else b["reg"].get("date", ""),
                "Arrival Time": a.strftime("%I:%M %p") if a else "",
+               "Entered": _fmt_when(b.get("entered"), a) if b.get("entered") else "",
+               "Entry Delay": (("🔴 " if b["entry_delay"] >= 60 else "🟡 " if b["entry_delay"] >= 20 else "")
+                               + fmt_age(int(b["entry_delay"]))) if b.get("entry_delay") else "0m",
+               "Arrival Proof": b.get("arr_src", ""),
                "Bill No": d.get("bill_no", ""), "No of SKU": int(_to_float(d.get("no_items"), 0)),
                "Bill Type": typ, "Distributor": d.get("distributor", ""), "Area": d.get("area", ""),
                "Cross Check Time": _fmt_when(cc.get("end"), a) if cc["task"] else "",
@@ -6544,6 +6713,12 @@ def show_bills_register(kp="bills", default_area=None):
     with m[3]: st.metric("⏱️ Avg Arrival → Placed" if PLACEMENT_STEP else "📅 Pending now",
                          fmt_age(pl_m.mean()) if PLACEMENT_STEP and not pl_m.empty
                          else (int(df["Current Status"].str.contains("Waiting").sum()) if not PLACEMENT_STEP else "—"))
+    delays = [b["entry_delay"] for b in sel if b.get("entry_delay") is not None and b.get("arr_src") != "⚠️ none"]
+    m = st.columns(3)
+    with m[0]: st.metric("📥 Avg entry delay", fmt_age(int(sum(delays) / len(delays))) if delays else "—",
+                         help="Distributor arrived (live photo / receipt) → bill entered in Register Entry")
+    with m[1]: st.metric("🔴 Entered 1h+ after arrival", sum(1 for x in delays if x >= 60))
+    with m[2]: st.metric("⚠️ No arrival proof", sum(1 for b in sel if b.get("arr_src") == "⚠️ none"))
     m = st.columns(4)
     with m[0]: st.metric("📦 Total SKUs", int(df["No of SKU"].sum()))
     with m[1]: st.metric("📅 Uploaded next day or later", int(df["_nextday"].sum()))
@@ -6552,12 +6727,15 @@ def show_bills_register(kp="bills", default_area=None):
     with m[3]: st.metric("⚠️ Bills with issues", int((df["Issues"] != "").sum()))
 
     show_all = st.toggle("Show extra columns (amount, entered by, start / took / wait of every stage, issues)", key=f"{kp}_all")
-    base_cols = ["Arrival Date", "Arrival Time", "Bill No", "No of SKU", "Bill Type", "Distributor", "Area",
+    base_cols = ["Arrival Date", "Arrival Time", "Entered", "Entry Delay", "Arrival Proof",
+                 "Bill No", "No of SKU", "Bill Type", "Distributor", "Area",
                  "Cross Check Time", "Checked By", "Upload Time", "Uploaded By"]
     base_cols += (["Placement Time", "Placed By"] if PLACEMENT_STEP else []) + ["Current Status", "Total Time Taken"]
     full = df.drop(columns=["_up_m", "_pl_m", "_nextday"])
     st.dataframe(full if show_all else full[base_cols], hide_index=True, width='stretch')
-    st.caption("Times on a later day than arrival show the date, e.g. '28 Sep 10:05 AM'. "
+    st.caption("Arrival = 📥 live photo of the distributor's boy, or 📦 porter / distributor receipt for arrangement bills "
+               "(⚠️ none = only the entry time is known). Entry Delay = arrival → Register Entry. "
+               "Times on a later day than arrival show the date, e.g. '28 Sep 10:05 AM'. "
                "Waiting time in Current Status: 🟢 under 1h · 🟡 1–2h · 🔴 over 2h.")
 
     # ── ONE BILL'S JOURNEY ──
@@ -9967,6 +10145,8 @@ STOCK_METRICS = [  # key, label, weight, higher_is_better, unit
     ("ontime", "🚚 Customer items on time", 20, True, "%"),
     ("check", "⚡ Check speed", 15, False, "sec/item"),
     ("quality", "✅ Quality (photos + cross check)", 15, True, "%"),
+    ("entry", "📥 Entry delay (arrival → entered)", 10, False, "min"),
+    ("proof", "📸 Bills with arrival proof", 10, True, "%"),
 ]
 DELIVERY_METRICS = [
     ("ontime", "⏰ Pickups on time", 50, True, "%"),
@@ -10082,8 +10262,18 @@ def league_stock_raw(lo, hi):
         di = due_info(l, to_ist(l.get("completed_at")) or now_ist())
         if di:
             ont[a].append(1 if di[1] >= 0 else 0)
+    ent = {a: [] for a in areas}
+    prf = {a: [] for a in areas}
+    for b in jr:
+        a = (b["d"] or {}).get("area", "")
+        if a in ent:
+            prf[a].append(1 if b.get("arr_src") != "⚠️ none" else 0)
+            if b.get("arr_src") != "⚠️ none" and b.get("entry_delay") is not None:
+                ent[a].append(b["entry_delay"])
     for a in areas:
         raw[a].update({
+            "entry": _median(ent[a]),
+            "proof": 100.0 * sum(prf[a]) / len(prf[a]) if prf[a] and any(prf[a]) else None,
             "speed": _median(speed[a]),
             "sameday": 100.0 * sum(same[a]) / len(same[a]) if same[a] else None,
             "ontime": 100.0 * sum(ont[a]) / len(ont[a]) if ont[a] else None,
@@ -11652,6 +11842,20 @@ def day_summary(day_s, area):
     waits = [(b["uploaded"] - b["arrived"]).total_seconds() / 60 for b in jr
              if b.get("arrived") and b.get("uploaded") and b["uploaded"] >= b["arrived"]]
     S["avg_upload_mins"] = _median(waits)
+    S["entry_delay"] = _median([b["entry_delay"] for b in jr if b.get("arr_src") != "⚠️ none" and b.get("entry_delay") is not None])
+    S["no_proof"] = sum(1 for b in jr if b.get("arr_src") == "⚠️ none")
+    late = {}
+    for b in jr:
+        if b.get("entry_delay") and b["entry_delay"] >= 60:
+            p = b["reg"].get("person") or "?"
+            late[p] = late.get(p, 0) + 1
+    S["late_entry_by"] = dict(sorted(late.items(), key=lambda x: -x[1]))
+    try:
+        arrs_d = [a for a in fetch_all("bill_arrivals", lambda q: q.eq("date", day_s)) if area == "All Areas" or a.get("area") == area]
+    except Exception:
+        arrs_d = []
+    S["arrivals"] = len(arrs_d)
+    S["arrival_bills"] = sum(int(a.get("bills") or 0) for a in arrs_d)
     S["pend_cc"] = sum(1 for b in jr if not b["stages"][0].get("task"))
     S["pend_up"] = sum(1 for b in jr if b["stages"][0].get("task") and not b.get("uploaded"))
 
@@ -11855,6 +12059,10 @@ def summary_text(S):
         L.append(f"  Avg arrival → upload: {fmt_age(int(S['avg_upload_mins']))}")
     if S["issues"]:
         L.append("  Problems: " + ", ".join(f"{k} {v}" for k, v in S["issues"].items()))
+    if S.get("entry_delay"):
+        L.append(f"  Avg entry delay (arrival → entered): {fmt_age(int(S['entry_delay']))}")
+    if S.get("no_proof"):
+        L.append(f"  Bills without arrival photo: {S['no_proof']}")
     L += ["", "*📞 Calls & customers*", f"  Calls done: {S['calls']:,}" + (f" (picked {S['calls_picked']:,})" if S["calls_picked"] else ""),
           _list_txt(S["calls_by"]), f"  Orders delivered: {max(S['deliv_orders'], S['delivered_log'])}"]
     if S["not_deliv_orders"]:
@@ -11973,6 +12181,11 @@ def show_daily_summary(kp="ds"):
                     + (f" · Avg arrival → upload: **{fmt_age(int(S['avg_upload_mins']))}**" if S["avg_upload_mins"] else ""))
         if S["issues"]:
             st.warning("Problems found in cross check: " + " · ".join(f"**{k}** {v}" for k, v in S["issues"].items()))
+        st.markdown(f"📥 Distributor arrivals (live photo): **{S['arrivals']}** with **{S['arrival_bills']}** bills"
+                    + (f" · avg entry delay **{fmt_age(int(S['entry_delay']))}**" if S["entry_delay"] else "")
+                    + (f" · ⚠️ **{S['no_proof']}** bills without arrival proof" if S["no_proof"] else ""))
+        if S["late_entry_by"]:
+            st.warning("🔴 Bills entered 1h+ after arrival: " + " · ".join(f"{p} {n}" for p, n in S["late_entry_by"].items()))
         c1, c2, c3 = st.columns(3)
         with c1:
             st.markdown("**Register entry**"); _people_table(S["reg_by"], "Bills")
