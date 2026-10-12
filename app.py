@@ -6752,6 +6752,16 @@ def _wa_link(text):
     return "https://wa.me/?text=" + urllib.parse.quote(text)
 
 
+def _wa_laptop(text):
+    """laptop options: WhatsApp Web (already logged-in browser), WhatsApp desktop app, or copy"""
+    import urllib.parse
+    q = urllib.parse.quote(text)
+    st.markdown(f"<span style='font-size:0.85em;opacity:0.75'>💻 On laptop: "
+                f"<a href='https://web.whatsapp.com/send?text={q}' target='_blank'>WhatsApp Web</a> · "
+                f"<a href='whatsapp://send?text={q}'>WhatsApp desktop app</a> · or copy the text below</span>",
+                unsafe_allow_html=True)
+
+
 def show_in_share(cin):
     me, team = st.session_state.name, st.session_state.team
     area = st.session_state.get("work_area") or ""
@@ -6759,6 +6769,8 @@ def show_in_share(cin):
     c1, c2 = st.columns([4, 1])
     with c1:
         st.link_button("📤 Send IN on WhatsApp group", _wa_link(txt), type="primary", width='stretch')
+        _wa_laptop(txt)
+        st.code(txt, language=None)
     with c2:
         if st.button("✖️ Done", key="in_share_hide", width='stretch'):
             st.session_state["_in_share_hide"] = True
@@ -6879,8 +6891,9 @@ def show_out_share():
         except Exception:
             card = ""
     if card:
-        st.code(card, language=None)
         st.link_button("📤 Send OUT on WhatsApp group", _wa_link(card), type="primary", width='stretch')
+        _wa_laptop(card)
+        st.code(card, language=None)
 
 
 def show_handover_notes():
