@@ -197,7 +197,77 @@ if not SUPABASE_URL or not SUPABASE_SECRET:
 @st.cache_resource
 def init_supabase():
     return create_client(SUPABASE_URL, SUPABASE_SECRET)
-supabase = init_supabase()
+_sb_real = init_supabase()
+
+# ── SPEED: short memory for database reads (per person / browser session) ────
+# The same read asked again within READ_TTL seconds is answered from memory.
+# Any insert / update / upsert / delete on a table clears that table's memory at once,
+# so a person always sees their own changes immediately; other people's changes show within READ_TTL.
+READ_TTL = 20
+_WRITE_OPS = ("insert", "update", "upsert", "delete")
+
+
+class _Query:
+    """records a supabase query chain and runs it on execute() — with the read memory in between"""
+    __slots__ = ("_t", "_c")
+
+    def __init__(self, table, chain=()):
+        self._t, self._c = table, chain
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _Query(self._t, self._c + (("a", name),))
+
+    def __call__(self, *args, **kw):
+        return _Query(self._t, self._c + (("c", args, kw),))
+
+    def _run(self):
+        obj = _sb_real.table(self._t)
+        for step in self._c:
+            obj = getattr(obj, step[1]) if step[0] == "a" else obj(*step[1], **step[2])
+        return obj.execute()
+
+    def execute(self):
+        import copy, time as _time
+        first = self._c[0][1] if self._c else ""
+        try:
+            store = st.session_state.setdefault("_qcache", {})
+        except Exception:
+            return self._run()                       # outside a page run
+        if first in _WRITE_OPS:
+            for k in [k for k in store if k[0] == self._t]:
+                store.pop(k, None)
+            if self._t in ("daily_tasks", "customer_order_lines"):
+                st.session_state.pop("_blk_prog", None)      # block card shows the new task at once
+            return self._run()
+        key = (self._t, repr(self._c))
+        hit = store.get(key)
+        now = _time.time()
+        if hit and now - hit[0] < READ_TTL:
+            return copy.deepcopy(hit[1])
+        resp = self._run()
+        data = getattr(resp, "data", None)
+        if data is None or not isinstance(data, list) or len(data) <= 3000:
+            store[key] = (now, copy.deepcopy(resp))
+            if len(store) > 400:                     # keep memory small
+                for k in sorted(store, key=lambda k: store[k][0])[:100]:
+                    store.pop(k, None)
+        return resp
+
+
+class _SupabaseFast:
+    def __init__(self, real):
+        self._real = real
+
+    def table(self, name):
+        return _Query(name)
+
+    def __getattr__(self, name):                     # storage, auth, rpc … go straight through
+        return getattr(self._real, name)
+
+
+supabase = _SupabaseFast(_sb_real)
 
 @st.cache_data(ttl=300)
 def load_warehouses():
@@ -4023,8 +4093,8 @@ def show_user_page():
         st.divider()
 
     # ── ARRANGEMENT PIPELINE (not for Stock: they see the simple incoming list) ──
-    with (st.container() if team == "Stock" else st.expander("🔄 View Today's Arrangement Pipeline", expanded=False)):
-      if team != "Stock":
+    with st.container():
+      if team != "Stock" and st.toggle("🔄 View Today's Arrangement Pipeline", key="pipe_on"):
         pickup_board_today()
         try:
             arr_resp = supabase.table("arrangements").select("*")\
@@ -4447,9 +4517,11 @@ def show_user_page():
             st.divider()
             show_incoming_arrangements(work_area)
             st.divider()
-            _summary = st.expander(f"📊 Today's Summary — {work_area}", expanded=False)
+            _sum_on = st.toggle(f"📊 Today's Summary — {work_area}", key="stock_sum_on")
+            _summary = st.container(border=True) if _sum_on else None
             try:
-              with _summary:
+              if _summary is not None:
+               with _summary:
                 reg_resp = supabase.table("daily_tasks").select("*")\
                     .eq("task_type","Register Entry").eq("date",date_str()).execute()
                 reg_entries = [t for t in (reg_resp.data or [])
