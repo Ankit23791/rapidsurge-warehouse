@@ -562,8 +562,11 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
+APP_VERSION = "v13-Oct 3:15 PM"
+
 def show_sidebar():
     with st.sidebar:
+        st.caption(f"🔖 App version {APP_VERSION}")
         # Time based greeting
         hour = now_ist().hour
         if hour < 12:
@@ -2395,6 +2398,14 @@ def form_register_entry():
                                   else arrival_label(a_by_id[i]),
                                   help="Tap 📥 Distributor arrived on the home screen when the boy brings bills.")
         arrival = a_by_id.get(arr_choice)
+        if not arrival and isinstance(arr_choice, int) and arr_choice > 0:
+            try:                                   # list was stale -> read the arrival directly
+                r = _sb_real.table("bill_arrivals").select("*").eq("id", arr_choice).execute().data or []
+                if r:
+                    arrival = dict(r[0], _entered=len(_sb_real.table("daily_tasks").select("id").eq(
+                        "task_type", "Register Entry").contains("details", {"arrival_id": arr_choice}).execute().data or []))
+            except Exception:
+                pass
         arr_choice = NO_ARR if arr_choice == -1 else arr_choice
         if arr_choice == NO_ARR:
             st.warning("This bill will be marked **⚠️ no arrival photo** in reports. Write why below.")
@@ -2414,16 +2425,17 @@ def form_register_entry():
         st.info("📷 **Step 1: take the photo (or choose a file).** The form opens after that.")
     else:
         remember_photo(invoice_img, "re_upload")
-        with st.form("register_entry_form", clear_on_submit=True):
+        _fv = st.session_state.get("re_form_v", 0)
+        with st.form(f"register_entry_form_{_fv}", clear_on_submit=False):
             c1,c2 = st.columns(2)
             with c1:
                 dist_idx    = dist_options(arr_dist).index(arr_dist) if arr_dist else 0
-                distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}_{(arrival or {}).get('id', '')}")
-                bill_no     = st.text_input("Bill Number *", value=arr_inv, key=f"re_bill_{arr_no}",
+                distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}_{(arrival or {}).get('id', '')}_{_fv}")
+                bill_no     = st.text_input("Bill Number *", value=arr_inv, key=f"re_bill_{arr_no}_{_fv}",
                                             help="Filled from the Invoice No entered by Purchase (if any)")
             with c2:
-                no_items    = st.number_input("No of Items Received *", min_value=0, step=1)
-                delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key="re_delby")
+                no_items    = st.number_input("No of Items Received *", min_value=0, step=1, key=f"re_items_{_fv}")
+                delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key=f"re_delby_{_fv}")
                 try:
                     areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
                     area_options = [a["name"] for a in (areas_resp.data or [])]
@@ -2434,13 +2446,13 @@ def form_register_entry():
                     default_re_area = area_options.index(arr_area)
                 elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
                     default_re_area = area_options.index(st.session_state.work_area)
-                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}_{(arrival or {}).get('id', '')}")
+                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}_{(arrival or {}).get('id', '')}_{_fv}")
 
 
-            bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
-            no_arr_reason = st.text_input("Why no arrival photo? *", key="re_noarr",
+            bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key=f"re_amount_{_fv}")
+            no_arr_reason = st.text_input("Why no arrival photo? *", key=f"re_noarr_{_fv}",
                                           placeholder="e.g. came by courier / forgot") if arr_choice == NO_ARR else ""
-            remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...")
+            remarks = st.text_input("Remarks", placeholder="Any notes about delivery condition...", key=f"re_rem_{_fv}")
 
             if st.form_submit_button("Submit Entry ✅", type="primary", width='stretch'):
                 if not bill_no or no_items == 0:
@@ -2493,6 +2505,7 @@ def form_register_entry():
                                     else f" — {arrival.get('distributor')}: all {arrival.get('bills')} bills entered ✅")
                         st.session_state["re_done_msg"] = (f"✅ Register entry done! Bill {bill_no} · {no_items} items "
                                                            f"from {distributor}{left}")
+                        st.session_state["re_form_v"] = st.session_state.get("re_form_v", 0) + 1   # empty form for the next bill
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
