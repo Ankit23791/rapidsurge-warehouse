@@ -2333,6 +2333,12 @@ def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills n
                      "Not entered": int(a.get("bills") or 0) - a.get("_entered", 0), "Logged by": a.get("logged_by")})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
     st.caption("🟢 under 20 min · 🟡 20–60 min · 🔴 over 1 hour since the distributor arrived")
+    pick = st.selectbox("📸 See arrival photo", ["—"] + [f"{a.get('distributor')} · {a.get('area')} · "
+                        f"{(to_ist(a.get('arrived_at')) or now).strftime('%I:%M %p')}" for a in arr], key=f"wa_ph_{area}")
+    if pick != "—":
+        a = arr[[f"{x.get('distributor')} · {x.get('area')} · {(to_ist(x.get('arrived_at')) or now).strftime('%I:%M %p')}"
+                 for x in arr].index(pick)]
+        show_image(a.get("photo"), caption=f"Logged by {a.get('logged_by')}", key=f"wa_img_{a['id']}", width=420)
 
 
 def form_register_entry():
@@ -2369,17 +2375,27 @@ def form_register_entry():
             st.error(f"Error: {e}")
 
     # 📥 which delivery is this bill from? (its clock started when the distributor arrived)
+    done_msg = st.session_state.pop("re_done_msg", None)
+    if done_msg:
+        st.success(done_msg)
+        st.balloons()
     arrival, arr_choice = None, None
     opens = [a for a in load_open_arrivals(2) if a.get("_entered", 0) < int(a.get("bills") or 0)]
     wa = st.session_state.get("work_area")
     opens.sort(key=lambda a: (a.get("area") != wa, str(a.get("arrived_at"))))
     NO_ARR = "⚠️ No arrival photo was taken"
-    a_map = {arrival_label(a): a for a in opens}
-    if order_type == "Normal Order" or a_map:
-        arr_choice = st.selectbox("📥 Arrival (distributor delivery) *",
-                                  ["— Select arrival —"] + list(a_map) + [NO_ARR], key="re_arrival",
+    a_by_id = {a["id"]: a for a in opens}
+    if order_type == "Normal Order" or a_by_id:
+        # options are ids (stable) — the label text with "1/2 entered" can change without losing the choice
+        opts = [0] + list(a_by_id) + [-1]
+        if st.session_state.get("re_arrival") not in opts:
+            st.session_state.pop("re_arrival", None)
+        arr_choice = st.selectbox("📥 Arrival (distributor delivery) *", opts, key="re_arrival",
+                                  format_func=lambda i: "— Select arrival —" if i == 0 else NO_ARR if i == -1
+                                  else arrival_label(a_by_id[i]),
                                   help="Tap 📥 Distributor arrived on the home screen when the boy brings bills.")
-        arrival = a_map.get(arr_choice)
+        arrival = a_by_id.get(arr_choice)
+        arr_choice = NO_ARR if arr_choice == -1 else arr_choice
         if arr_choice == NO_ARR:
             st.warning("This bill will be marked **⚠️ no arrival photo** in reports. Write why below.")
         elif order_type == "Normal Order" and not arrival:
@@ -2402,7 +2418,7 @@ def form_register_entry():
             c1,c2 = st.columns(2)
             with c1:
                 dist_idx    = dist_options(arr_dist).index(arr_dist) if arr_dist else 0
-                distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}")
+                distributor = st.selectbox("Distributor *", dist_options(arr_dist), index=dist_idx, key=f"re_dist_{arr_no}_{(arrival or {}).get('id', '')}")
                 bill_no     = st.text_input("Bill Number *", value=arr_inv, key=f"re_bill_{arr_no}",
                                             help="Filled from the Invoice No entered by Purchase (if any)")
             with c2:
@@ -2418,7 +2434,7 @@ def form_register_entry():
                     default_re_area = area_options.index(arr_area)
                 elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
                     default_re_area = area_options.index(st.session_state.work_area)
-                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}")
+                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}_{(arrival or {}).get('id', '')}")
 
 
             bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key="re_amount")
@@ -2433,6 +2449,11 @@ def form_register_entry():
                     st.error("Select the 📥 Arrival this bill came with (top of the form).")
                 elif arr_choice == NO_ARR and not no_arr_reason.strip():
                     st.error("Write why there is no arrival photo.")
+                elif arrival and len(_sb_real.table("daily_tasks").select("id").eq("task_type", "Register Entry")
+                                     .contains("details", {"arrival_id": arrival["id"]}).execute().data or []) \
+                        >= int(arrival.get("bills") or 0):
+                    st.error(f"❌ {arrival.get('distributor')} delivery had {arrival.get('bills')} bill(s) — all are already "
+                             "entered. If more bills came, take a new 📥 arrival photo.")
                 elif order_type == "Arrangement" and not arr_no:
                     st.error("Select the Arrangement No at the top — so this bill is linked to its ARR!")
                 elif not invoice_img:
@@ -2465,8 +2486,14 @@ def form_register_entry():
                             "start_time": time_str(),
                             "end_time": time_str(),
                         }).execute()
-                        st.success(f"✅ Register entry done! {no_items} items from {distributor} received!")
-                        st.balloons()
+                        left = ""
+                        if arrival:
+                            left_n = int(arrival.get("bills") or 0) - arrival.get("_entered", 0) - 1
+                            left = (f" — {arrival.get('distributor')}: {left_n} more bill(s) to enter" if left_n > 0
+                                    else f" — {arrival.get('distributor')}: all {arrival.get('bills')} bills entered ✅")
+                        st.session_state["re_done_msg"] = (f"✅ Register entry done! Bill {bill_no} · {no_items} items "
+                                                           f"from {distributor}{left}")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
 
@@ -6821,10 +6848,25 @@ def show_bills_register(kp="bills", default_area=None):
         pick = st.selectbox("Bill", list(labels.keys()), key=f"{kp}_pick")
         b = sorted(sel, key=lambda x: x["arrived"] or now_n, reverse=True)[labels[pick]]
         a = b["arrived"]
-        jr = [{"Stage": "📒 Arrived (Register Entry)", "By": b["reg"].get("person", ""), "Start": _fmt_when(a, a),
-               "End": _fmt_when(a, a), "Took": "", "Waited before": "",
-               "Details": f"{b['d'].get('distributor','')} · Bill {b['d'].get('bill_no','')} · {int(_to_float(b['d'].get('no_items'),0))} items · ₹{_to_float(b['d'].get('bill_amount'),0):,.0f}"}]
+        d0 = b["d"] or {}
+        arr_rec = None
+        if d0.get("arrival_id"):
+            try:
+                arr_rec = (supabase.table("bill_arrivals").select("*").eq("id", d0["arrival_id"]).execute().data or [None])[0]
+            except Exception:
+                arr_rec = None
+        jr = [{"Stage": {"📥 photo": "📥 Distributor arrived (live photo)", "📦 receipt": "📦 Reached warehouse (receipt)"}
+                        .get(b.get("arr_src"), "📥 Arrival — ⚠️ no proof"),
+               "By": (arr_rec or {}).get("logged_by", ""), "Start": _fmt_when(a, a), "End": "", "Took": "", "Waited before": "",
+               "Details": (f"{arr_rec.get('bills')} bills in this delivery" if arr_rec else
+                           (f"Reason: {d0.get('no_arrival_reason')}" if d0.get("no_arrival_reason") else ""))},
+              {"Stage": "📒 Register Entry", "By": b["reg"].get("person", ""), "Start": _fmt_when(b.get("entered"), a),
+               "End": _fmt_when(b.get("entered"), a), "Took": "",
+               "Waited before": _mins((b["entry_delay"] or 0) * 60) if b.get("entry_delay") else "",
+               "Details": f"{d0.get('distributor','')} · Bill {d0.get('bill_no','')} · {int(_to_float(d0.get('no_items'),0))} items · ₹{_to_float(d0.get('bill_amount'),0):,.0f}"}]
         for s in b["stages"]:
+            if not PLACEMENT_STEP and s["label"] == "📍 Placement":
+                continue
             if s["task"]:
                 jr.append({"Stage": s["label"], "By": s["by"], "Start": _fmt_when(s["start"], a), "End": _fmt_when(s["end"], a),
                            "Took": _mins(s["took"]), "Waited before": _mins(s["waited"]),
@@ -6837,6 +6879,41 @@ def show_bills_register(kp="bills", default_area=None):
             st.markdown(f"**Total: arrival → placed {_mins((b['placed'] - a).total_seconds())}**")
         elif a:
             st.markdown(f"**⏳ Open for {fmt_age(int((now_n - a).total_seconds() // 60))} — next step: {b['next']}**")
+        # 📸 every photo of this bill, in journey order
+        photos = []
+        if arr_rec and arr_rec.get("photo"):
+            photos.append(("📥 Arrival — boy with bills", arr_rec["photo"]))
+        if d0.get("invoice_image"):
+            photos.append(("📒 Packet / box (Register Entry)", d0["invoice_image"]))
+        for s_ in b["stages"]:
+            dd = (s_.get("task") or {}).get("details") or {}
+            for fld, lbl in (("bill_check_image", "✔️ Cross check"), ("bill_image", "📤 Bill upload"), ("image", s_["label"])):
+                if dd.get(fld):
+                    photos.append((lbl, dd[fld]))
+        a_no = str(d0.get("arrangement_no") or "").strip()
+        if a_no:
+            try:
+                arr_db = (supabase.table("arrangements").select("order_image,bill_image_arr").eq("arrangement_no", a_no)
+                          .execute().data or [{}])[0]
+                if arr_db.get("order_image"):
+                    photos.insert(0, ("📋 Arrangement order", arr_db["order_image"]))
+                pk = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Pickup").gte(
+                    "date", (b["reg"].get("date") or date_str())[:10]).lte("date", (b["reg"].get("date") or date_str())[:10]))
+                      if str((t.get("details") or {}).get("arrangement_no")) == a_no]
+                for t in pk[:1]:
+                    if (t.get("details") or {}).get("medicine_image"):
+                        photos.insert(1, ("🚚 Pickup at distributor", t["details"]["medicine_image"]))
+            except Exception:
+                pass
+        if photos:
+            if st.toggle(f"📸 Show photos ({len(photos)})", key=f"{kp}_ph_{labels[pick]}"):
+                cols = st.columns(min(3, len(photos)))
+                for i, (lbl, nm) in enumerate(photos):
+                    with cols[i % len(cols)]:
+                        st.caption(lbl)
+                        show_image(nm, key=f"{kp}_img_{labels[pick]}_{i}")
+        else:
+            st.caption("No photos saved for this bill.")
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
