@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v13-Oct 3:15 PM"
+APP_VERSION = "v13-Oct 5:10 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -877,7 +877,7 @@ def form_bounce_medicine():
                 st.error(f"Error: {e}")
 
 # ── ARRANGEMENT FORM ──────────────────────────────────────────────────────────
-# ── TARGET PICKUP TIME (arrangement → delivery boy) ───────────────────────────
+# ── TARGET PICKUP TIME (arrangement → delivery pilot) ───────────────────────────
 PICKUP_TARGETS = [("30 min", 30), ("1 hr", 60), ("1½ hr", 90), ("2 hr", 120), ("3 hr", 180), ("4 hr", 240),
                   ("Custom time", None)]
 PICKUP_SQL_HINT = "run **pickup_target_setup.sql** in Supabase to turn on target pickup times"
@@ -948,7 +948,7 @@ def _pickup_target_input(fv):
     with c1:
         choice = st.selectbox("⏰ Target pickup time (Self Pick) *", [n for n, _ in PICKUP_TARGETS], index=1,
                               key=f"arr_target_{fv}",
-                              help="By when the delivery boy must pick the stock from the distributor. "
+                              help="By when the delivery pilot must pick the stock from the distributor. "
                                    "He sees a countdown; if he is late, the delay is shown to everyone.")
     with c2:
         custom = st.time_input("Custom pickup time (only if 'Custom time')", value=None, step=900,
@@ -1131,7 +1131,7 @@ def form_arrangement():
                   "qty": _qty_txt(min(_to_float(p.get("Order Qty"), 0), _to_float(p.get("Needed"), 0)))}
                  for p in picked_lines],
                 f"📋 {auto_arr_no} · {link_area} · {today_ist().strftime('%d %b %Y')}")
-            st.caption("✅ No screenshot needed — this list is sent automatically to the delivery boy's Pickup screen. "
+            st.caption("✅ No screenshot needed — this list is sent automatically to the delivery pilot's Pickup screen. "
                        "(Screenshot only if you want to send it to the distributor on WhatsApp.)")
 
     # form keys change after each saved order -> fresh form; they do NOT change on an error,
@@ -1165,7 +1165,7 @@ def form_arrangement():
         target_choice, target_custom = _pickup_target_input(fv)
         remarks = st.text_input("Remarks", key=f"arr_remarks_{fv}")
         if picked_lines:
-            st.markdown("📸 **Image of Order** (optional — the ticked medicines go to the delivery boy automatically)")
+            st.markdown("📸 **Image of Order** (optional — the ticked medicines go to the delivery pilot automatically)")
         else:
             st.markdown("📸 **Image of Order *** (required when no customer items are ticked)")
         arr_img = st.file_uploader("Select or Take Photo", type=["jpg","jpeg","png"], key=f"arr_upload_{fv}")
@@ -2255,9 +2255,14 @@ def load_open_arrivals(days=2):
 def arrival_label(a, now=None):
     t = to_ist(a.get("arrived_at"))
     age = fmt_age(int(((now or now_ist()) - t).total_seconds() // 60)) if t else ""
-    return (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills · arrived "
+    via = a.get("brought_by_name") or a.get("brought_by") or ""
+    return (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills"
+            + (f" · via {via}" if via else "") + " · arrived "
             f"{t.strftime('%I:%M %p') if t else ''}" + (f" ({age} ago)" if age else "")
             + f" · {a.get('_entered', 0)}/{a.get('bills', 0)} entered")
+
+
+BROUGHT_BY = ["Distributor's person", "Delivery Pilot", "Porter", "Other"]
 
 
 def show_arrival_button():
@@ -2268,54 +2273,88 @@ def show_arrival_button():
     if msg:
         st.success(msg)
     if not st.session_state.get("arr_in_open"):
-        if st.button("📥 Distributor arrived — take live photo", key="arr_in_btn", width='stretch'):
+        if st.button("📥 Bills arrived — take live photo", key="arr_in_btn", width='stretch'):
             st.session_state["arr_in_open"] = True
             st.rerun()
         return
+    ver = st.session_state.get("arr_in_v", 0)
     with st.container(border=True):
-        st.markdown("### 📥 Distributor arrived")
-        st.caption("One photo per delivery (10 bills = 1 photo). Take it **now, with the distributor's boy holding "
-                   "the bills** — the time is set by the app.")
+        st.markdown("### 📥 Bills arrived")
+        st.caption("One photo for the whole handover — even if it has bills of several distributors. Take it **now, "
+                   "with the person holding the bills**; the time is set by the app.")
         areas = load_areas()
         wa = st.session_state.get("work_area")
-        c1, c2, c3 = st.columns([2, 2, 1])
-        with c1:
-            area = st.selectbox("Warehouse / Area *", areas, index=areas.index(wa) if wa in areas else 0, key="arr_in_area")
-        with c2:
-            dist = st.selectbox("Distributor *", DISTRIBUTORS + ["Other"], key="arr_in_dist")
-        with c3:
-            n = st.number_input("Bills *", 1, 100, 1, key="arr_in_n")
-        other = st.text_input("Distributor name", key="arr_in_other") if dist == "Other" else ""
-        ver = st.session_state.get("arr_in_v", 0)
-        photo = st.camera_input("📷 Live photo — distributor's boy with the bills", key=f"arr_in_cam_{ver}")
+        area = st.selectbox("Warehouse / Area *", areas, index=areas.index(wa) if wa in areas else 0, key=f"arr_in_area_{ver}")
+        by = st.radio("Brought by *", BROUGHT_BY, horizontal=True, key=f"arr_in_by_{ver}")
+        by_name = ""
+        if by == "Delivery Pilot":
+            pilots = delivery_people()
+            by_name = st.selectbox("Delivery Pilot *", pilots or ["(add pilots in Settings → Users, team Delivery)"],
+                                   key=f"arr_in_pilot_{ver}")
+        elif by == "Porter":
+            by_name = st.text_input("Porter name / vehicle no (optional)", key=f"arr_in_porter_{ver}")
+        elif by == "Other":
+            by_name = st.text_input("Who brought it? *", key=f"arr_in_other_by_{ver}")
+        n_rows = st.session_state.get(f"arr_in_rows_{ver}", 1)
+        rows = []
+        st.markdown("**Bills in this handover**")
+        for i in range(n_rows):
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                d = st.selectbox(f"Distributor {i + 1} *", DISTRIBUTORS + ["Other"], key=f"arr_in_dist_{ver}_{i}")
+                if d == "Other":
+                    d = st.text_input(f"Distributor {i + 1} name *", key=f"arr_in_dname_{ver}_{i}").strip()
+            with c2:
+                n = st.number_input("Bills *", 1, 100, 1, key=f"arr_in_n_{ver}_{i}")
+            rows.append((d, int(n)))
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Save arrival", type="primary", width='stretch', key="arr_in_save",
-                         disabled=photo is None):
-                name = None
-                if dist == "Other" and not other.strip():
-                    st.error("Write the distributor name.")
-                else:
-                    name = upload_image(photo, "arrival")
-                if name:
-                    try:
-                        supabase.table("bill_arrivals").insert({
-                            "date": date_str(), "area": area, "distributor": other.strip() or dist, "bills": int(n),
-                            "photo": name, "arrived_at": now_iso(), "logged_by": st.session_state.name,
-                            "team": st.session_state.get("team")}).execute()
-                        st.session_state["arr_in_open"] = False
-                        st.session_state["arr_in_v"] = ver + 1
-                        st.session_state["arr_in_msg"] = (f"✅ {other.strip() or dist}: {int(n)} bill(s) arrived at "
-                                                          f"{time_str()} — clock started. Do 📒 Register Entry for each bill.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not save: {e} — did you run bill_arrival_setup.sql?")
+            if st.button("➕ Add another distributor", key=f"arr_in_add_{ver}", width='stretch'):
+                st.session_state[f"arr_in_rows_{ver}"] = n_rows + 1
+                st.rerun()
         with b2:
+            if n_rows > 1 and st.button("➖ Remove last", key=f"arr_in_rm_{ver}", width='stretch'):
+                st.session_state[f"arr_in_rows_{ver}"] = n_rows - 1
+                st.rerun()
+        who = by_name if by in ("Delivery Pilot", "Other") and by_name else by
+        photo = st.camera_input(f"📷 Live photo — {who} holding all the bills", key=f"arr_in_cam_{ver}")
+        total = sum(n for _, n in rows)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(f"✅ Save arrival ({total} bill{'s' if total != 1 else ''})", type="primary", width='stretch',
+                         key="arr_in_save", disabled=photo is None):
+                names = [d for d, _ in rows]
+                if any(not d for d in names):
+                    st.error("Write the distributor name.")
+                elif len(set(names)) < len(names):
+                    st.error("The same distributor is listed twice — put all its bills in one line.")
+                elif by == "Other" and not by_name.strip():
+                    st.error("Write who brought the bills.")
+                else:
+                    pic = upload_image(photo, "arrival")
+                    if pic:
+                        import uuid
+                        gid, now_s = uuid.uuid4().hex[:12], now_iso()
+                        try:
+                            supabase.table("bill_arrivals").insert([{
+                                "date": date_str(), "area": area, "distributor": d, "bills": n, "photo": pic,
+                                "arrived_at": now_s, "logged_by": st.session_state.name, "team": st.session_state.get("team"),
+                                "brought_by": by, "brought_by_name": by_name.strip() or None, "group_id": gid}
+                                for d, n in rows]).execute()
+                            st.session_state["arr_in_open"] = False
+                            st.session_state["arr_in_v"] = ver + 1
+                            st.session_state["arr_in_msg"] = (
+                                f"✅ {total} bill(s) arrived at {time_str()} via {who} — "
+                                + ", ".join(f"{d} {n}" for d, n in rows) + ". Clock started — do 📒 Register Entry for each bill.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save: {e} — did you run bill_arrival_v2.sql?")
+        with c2:
             if st.button("✖️ Cancel", width='stretch', key="arr_in_cancel"):
                 st.session_state["arr_in_open"] = False
                 st.rerun()
         if photo is None:
-            st.caption("📷 Allow the camera, point it at the boy with the bills, tap **Take Photo**. "
+            st.caption("📷 Allow the camera, point it at the person with the bills, tap **Take Photo**. "
                        "Gallery photos are not accepted here.")
 
 
@@ -2333,7 +2372,8 @@ def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills n
         rows.append({"⏰": "🔴" if age >= 60 else "🟡" if age >= 20 else "🟢", "Distributor": a.get("distributor"),
                      "Area": a.get("area"), "Arrived": t.strftime("%d %b %I:%M %p") if t else "",
                      "Waiting": fmt_age(age), "Bills": a.get("bills"), "Entered": a.get("_entered", 0),
-                     "Not entered": int(a.get("bills") or 0) - a.get("_entered", 0), "Logged by": a.get("logged_by")})
+                     "Not entered": int(a.get("bills") or 0) - a.get("_entered", 0),
+                     "Brought by": a.get("brought_by_name") or a.get("brought_by") or "", "Logged by": a.get("logged_by")})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
     st.caption("🟢 under 20 min · 🟡 20–60 min · 🔴 over 1 hour since the distributor arrived")
     pick = st.selectbox("📸 See arrival photo", ["—"] + [f"{a.get('distributor')} · {a.get('area')} · "
@@ -2435,7 +2475,11 @@ def form_register_entry():
                                             help="Filled from the Invoice No entered by Purchase (if any)")
             with c2:
                 no_items    = st.number_input("No of Items Received *", min_value=0, step=1, key=f"re_items_{_fv}")
-                delivery_by = st.selectbox("Delivered By", ["Distributor","Porter","Naresh","Sandeep","Other"], key=f"re_delby_{_fv}")
+                _dopts = ["Distributor", "Porter"] + delivery_people() + ["Other"]
+                _dby = (arrival or {}).get("brought_by_name") if (arrival or {}).get("brought_by") == "Delivery Pilot" \
+                    else {"Porter": "Porter"}.get((arrival or {}).get("brought_by"), "Distributor")
+                delivery_by = st.selectbox("Delivered By", _dopts, index=_dopts.index(_dby) if _dby in _dopts else 0,
+                                           key=f"re_delby_{_fv}_{(arrival or {}).get('id', '')}")
                 try:
                     areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
                     area_options = [a["name"] for a in (areas_resp.data or [])]
@@ -3015,7 +3059,7 @@ def form_bill_upload_arrangement():
 def show_pickup_images():
     st.subheader("📸 Pickup Images from Naresh/Sandeep")
     pickup_board_today()
-    st.caption("What was ordered (order image) next to what the delivery boy picked up (his photo of medicines / bill).")
+    st.caption("What was ordered (order image) next to what the delivery pilot picked up (his photo of medicines / bill).")
     c1, c2, c3 = st.columns(3)
     with c1:
         filter_date = st.date_input("Pickup date", value=today_ist(), key="pi_date")
@@ -5721,7 +5765,7 @@ def save_customer_receipts(ed):
     return n_ok, n_short
 
 # ── BOUNCED / SHORT MEDICINES → PURCHASE VERIFIES → RE-ORDER ──────────────────
-# Stages: "Invoice" (purchase, direct) · "Pickup" (delivery boy got less → purchase checks photo, direct)
+# Stages: "Invoice" (purchase, direct) · "Pickup" (delivery pilot got less → purchase checks photo, direct)
 #         "Warehouse" (stock reports at Bill Cross Check → purchase verifies)
 # Confirmed bounce on a customer item -> arrangement_lines.qty_bounced += qty -> the customer item re-opens
 # with only the missing qty and shows up again (🔁) in the Arrangement Order item list.
@@ -5826,7 +5870,7 @@ def bounce_editor(arr, stage, kp, direct=True):
     return len(rows)
 
 def _short_pickups(days=3):
-    """Completed pickups where the delivery boy received fewer SKUs than ordered and purchase hasn't checked yet"""
+    """Completed pickups where the delivery pilot received fewer SKUs than ordered and purchase hasn't checked yet"""
     since = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = supabase.table("daily_tasks").select("*").eq("task_type", "Pickup").gte("date", since)\
         .order("id", desc=True).execute().data or []
@@ -5951,7 +5995,7 @@ def form_bounce_center():
             with st.expander(f"⚠️ #{d.get('arrangement_no')} | {d.get('distributor','')} | {p.get('person','')} | "
                              f"received {d.get('no_sku_received')} of {d.get('no_sku_ordered')} medicines", expanded=True):
                 if d.get("remarks"):
-                    st.info(f"💬 Delivery boy's remark: {d['remarks']}")
+                    st.info(f"💬 Delivery pilot's remark: {d['remarks']}")
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("**📋 Ordered**")
@@ -6871,7 +6915,8 @@ def show_bills_register(kp="bills", default_area=None):
         jr = [{"Stage": {"📥 photo": "📥 Distributor arrived (live photo)", "📦 receipt": "📦 Reached warehouse (receipt)"}
                         .get(b.get("arr_src"), "📥 Arrival — ⚠️ no proof"),
                "By": (arr_rec or {}).get("logged_by", ""), "Start": _fmt_when(a, a), "End": "", "Took": "", "Waited before": "",
-               "Details": (f"{arr_rec.get('bills')} bills in this delivery" if arr_rec else
+               "Details": (f"{arr_rec.get('bills')} bills · via {arr_rec.get('brought_by_name') or arr_rec.get('brought_by') or '—'}"
+                           if arr_rec else
                            (f"Reason: {d0.get('no_arrival_reason')}" if d0.get("no_arrival_reason") else ""))},
               {"Stage": "📒 Register Entry", "By": b["reg"].get("person", ""), "Start": _fmt_when(b.get("entered"), a),
                "End": _fmt_when(b.get("entered"), a), "Took": "",
@@ -6895,7 +6940,7 @@ def show_bills_register(kp="bills", default_area=None):
         # 📸 every photo of this bill, in journey order
         photos = []
         if arr_rec and arr_rec.get("photo"):
-            photos.append(("📥 Arrival — boy with bills", arr_rec["photo"]))
+            photos.append(("📥 Arrival — person with the bills", arr_rec["photo"]))
         if d0.get("invoice_image"):
             photos.append(("📒 Packet / box (Register Entry)", d0["invoice_image"]))
         for s_ in b["stages"]:
@@ -7334,7 +7379,7 @@ def attendance_gate():
     if st.session_state.get("att_confirm_out") and not delivery:
         return clock_out_panel(s, active_key)
     if st.session_state.get("att_confirm_out") and delivery:
-        # delivery boys: end-of-day bike meter before clocking out
+        # delivery pilots: end-of-day bike meter before clocking out
         ok, saver = km_clock_out_block()
         card, hand = day_card_form(s)
         b1, b2 = st.columns(2)
@@ -10087,11 +10132,12 @@ def expected_km(places, routes, home_km=0):
     return km, missing
 
 def delivery_people():
-    return sorted(u["name"] for u in (load_users() or {}).values() if u.get("team") == "Delivery")
+    return sorted(u["name"] for u in (load_users() or {}).values()
+                  if u.get("team") == "Delivery" and u.get("active", True) is not False)
 
 def show_route_km_admin(kp="rk"):
     st.subheader("🗺️ Routes & KM")
-    st.caption("Distance between places (one way, km). The app adds them up from each delivery boy's trips "
+    st.caption("Distance between places (one way, km). The app adds them up from each delivery pilot's trips "
                "to get the **expected km** and compares it with his bike meter.")
     routes = load_routes()
     if routes is None:
@@ -10101,7 +10147,7 @@ def show_route_km_admin(kp="rk"):
     # rates + home distance
     sett = km_settings()
     people = delivery_people()
-    with st.expander("🏠 Home distance & rate per km (per delivery boy)", expanded=not sett):
+    with st.expander("🏠 Home distance & rate per km (per delivery pilot)", expanded=not sett):
         default_rate = float((sett.get("*") or {}).get("rate_per_km") or 0)
         df = pd.DataFrame([{"Person": p, "Home ↔ base (km, one way)": float((sett.get(p) or {}).get("home_km") or 0),
                             "Rate ₹/km (blank = default)": (sett.get(p) or {}).get("rate_per_km")} for p in people]
@@ -10198,7 +10244,7 @@ def show_delivery_km_report(kp="dkm"):
                             format="DD/MM/YYYY")
     lo, hi = (rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else (today_ist(), today_ist()))
     with c2:
-        who = st.multiselect("Delivery boy", delivery_people(), key=f"{kp}_who", placeholder="All")
+        who = st.multiselect("Delivery pilot", delivery_people(), key=f"{kp}_who", placeholder="All")
     los, his = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
     logs = fetch_all("km_log", lambda q: q.gte("date", los).lte("date", his))
     tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Delivery Trip", "Pickup"]).gte("date", los).lte("date", his))
@@ -10253,7 +10299,7 @@ def show_delivery_km_report(kp="dkm"):
     with m[0]: st.metric("🛵 Total km", f"{df['Meter km'].sum():,.0f}")
     with m[1]: st.metric("💰 Total payable", f"₹{df['Amount ₹'].sum():,.0f}")
     with m[2]: st.metric("⚠️ Days to check", int(df["Check"].str.startswith("⚠️").sum()))
-    st.markdown("**Per delivery boy**")
+    st.markdown("**Per delivery pilot**")
     st.dataframe(tot.rename(columns={"KM": "Meter km", "Expected": "Expected km", "Amount": "Amount ₹"}),
                  hide_index=True, width='stretch')
     st.markdown("**Day by day**")
@@ -10311,7 +10357,7 @@ def show_delivery_km(kp="dk"):
     else:
         show_route_km_admin(f"{kp}_rt")
 
-# ── 🏆 LEAGUE: warehouse (Stock) · delivery boys · call team ───────────────────
+# ── 🏆 LEAGUE: warehouse (Stock) · delivery pilots · call team ───────────────────
 # Each metric is scored 0-100 against the best in the league for the period, then weighted.
 LEAGUE_PERIODS = ["This week", "Last week", "This month", "Last month", "📅 Choose dates"]
 STOCK_METRICS = [  # key, label, weight, higher_is_better, unit
@@ -12036,7 +12082,12 @@ def day_summary(day_s, area):
         arrs_d = [a for a in fetch_all("bill_arrivals", lambda q: q.eq("date", day_s)) if area == "All Areas" or a.get("area") == area]
     except Exception:
         arrs_d = []
-    S["arrivals"] = len(arrs_d)
+    S["arrivals"] = len({a.get("group_id") or a.get("id") for a in arrs_d})
+    bb = {}
+    for a in arrs_d:
+        k = a.get("brought_by_name") or a.get("brought_by") or "Distributor's person"
+        bb[k] = bb.get(k, 0) + int(a.get("bills") or 0)
+    S["brought_by"] = dict(sorted(bb.items(), key=lambda x: -x[1]))
     S["arrival_bills"] = sum(int(a.get("bills") or 0) for a in arrs_d)
     S["pend_cc"] = sum(1 for b in jr if not b["stages"][0].get("task"))
     S["pend_up"] = sum(1 for b in jr if b["stages"][0].get("task") and not b.get("uploaded"))
@@ -12366,6 +12417,8 @@ def show_daily_summary(kp="ds"):
         st.markdown(f"📥 Distributor arrivals (live photo): **{S['arrivals']}** with **{S['arrival_bills']}** bills"
                     + (f" · avg entry delay **{fmt_age(int(S['entry_delay']))}**" if S["entry_delay"] else "")
                     + (f" · ⚠️ **{S['no_proof']}** bills without arrival proof" if S["no_proof"] else ""))
+        if S.get("brought_by"):
+            st.caption("Bills brought by: " + " · ".join(f"{k} {v}" for k, v in S["brought_by"].items()))
         if S["late_entry_by"]:
             st.warning("🔴 Bills entered 1h+ after arrival: " + " · ".join(f"{p} {n}" for p, n in S["late_entry_by"].items()))
         c1, c2, c3 = st.columns(3)
