@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 8:50 PM"
+APP_VERSION = "v14-Oct 9:30 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -2450,6 +2450,37 @@ def show_pilot_carrying():
 BROUGHT_BY = ["Distributor's person", "Delivery Pilot", "Porter", "Other"]
 
 
+def open_porter_bookings(area=None):
+    """porter bookings not received yet (Booked / Handed Over, last 2 days) with their ARRs; only for this area"""
+    lo = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+    try:
+        bks = fetch_all("porter_bookings", lambda q: q.in_("status", ["Booked", "Handed Over"]).gte("date", lo))
+    except Exception:
+        return []
+    nos = sorted({n.strip().lstrip("#") for b in bks for n in str(b.get("arrangement_nos") or "").split(",") if n.strip()})
+    arrs = {}
+    if nos:
+        try:
+            for a in supabase.table("arrangements").select("arrangement_no,distributor,area").in_("arrangement_no", nos).execute().data or []:
+                arrs[str(a.get("arrangement_no"))] = a
+        except Exception:
+            pass
+    out = []
+    for b in bks:
+        mine = [arrs.get(n.strip().lstrip("#"), {"arrangement_no": n.strip(), "distributor": "", "area": ""})
+                for n in str(b.get("arrangement_nos") or "").split(",") if n.strip()]
+        if area and area != "All Areas" and mine and not any(a.get("area") in (area, "", None) for a in mine):
+            continue
+        out.append(dict(b, _arrs=[a for a in mine if not area or area == "All Areas" or a.get("area") in (area, "", None)]))
+    return sorted(out, key=lambda b: str(b.get("porter_no") or ""))
+
+
+def porter_label(b):
+    return (f"🚛 {b.get('porter_no') or 'Porter'}"
+            + (f" — {b.get('no_bills')} bills · {b.get('no_polythene') or 0} polythene" if b.get("no_bills") not in (None, "", "0")
+               else " — booked, not picked yet"))
+
+
 def show_arrival_button():
     """📥 button on the home screen (works before clock-in too — early morning deliveries)"""
     if st.session_state.get("team") not in ARRIVAL_TEAMS and st.session_state.get("role") != "manager":
@@ -2475,12 +2506,21 @@ def show_arrival_button():
                             help="Fixed to your work area" if wa in areas else None)
         by = st.radio("Brought by *", BROUGHT_BY, horizontal=True, key=f"arr_in_by_{ver}")
         by_name = ""
+        porter_bk = None
         if by == "Delivery Pilot":
             pilots = delivery_people()
             by_name = st.selectbox("Delivery Pilot *", pilots or ["(add pilots in Settings → Users, team Delivery)"],
                                    key=f"arr_in_pilot_{ver}")
         elif by == "Porter":
-            by_name = st.text_input("Porter name / vehicle no (optional)", key=f"arr_in_porter_{ver}")
+            _bks = open_porter_bookings(area)
+            _po = {porter_label(b) + " (#" + str(b.get("id")) + ")": b for b in _bks}
+            NOT_BOOKED = "Porter not booked in the app"
+            _pk = st.selectbox("Porter booking *", list(_po) + [NOT_BOOKED], key=f"arr_in_pbk_{ver}")
+            porter_bk = _po.get(_pk)
+            if porter_bk:
+                by_name = str(porter_bk.get("porter_no") or "")
+            else:
+                by_name = st.text_input("Porter name / vehicle no (optional)", key=f"arr_in_porter_{ver}")
         elif by == "Other":
             by_name = st.text_input("Who brought it? *", key=f"arr_in_other_by_{ver}")
         pre = st.session_state.pop("arr_in_prefill", None)
@@ -2505,6 +2545,27 @@ def show_arrival_button():
                 if st.button(f"⬇️ Fill these {len(carry)} bills", key=f"arr_in_fill_{ver}"):
                     st.session_state["arr_in_prefill"] = list(cnt.items())
                     st.rerun()
+        p_bills = p_poly = 0
+        p_short = ""
+        if porter_bk:
+            pa = porter_bk.get("_arrs") or []
+            cnt = {}
+            for a in pa:
+                cnt[a.get("distributor") or "?"] = cnt.get(a.get("distributor") or "?", 0) + 1
+            st.info(f"{porter_label(porter_bk)} — for {area}: "
+                    + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}" for a in pa) or "no ARR listed"))
+            if cnt and st.button(f"⬇️ Fill these {len(pa)} bills", key=f"arr_in_pfill_{ver}"):
+                st.session_state["arr_in_prefill"] = list(cnt.items())
+                st.rerun()
+            exp_b = int(_to_float(porter_bk.get("no_bills"), 0) or len(pa) or 1)
+            exp_p = int(_to_float(porter_bk.get("no_polythene"), 0))
+            c1, c2 = st.columns(2)
+            with c1:
+                p_bills = st.number_input(f"Bills received from porter * (booked: {exp_b})", 0, 200, exp_b, key=f"arr_in_pb_{ver}")
+            with c2:
+                p_poly = st.number_input(f"Polythene received (booked: {exp_p})", 0, 200, exp_p, key=f"arr_in_pp_{ver}")
+            if p_bills != exp_b or p_poly != exp_p:
+                p_short = st.text_input("⚠️ Count does not match the booking — what is short / extra? *", key=f"arr_in_ps_{ver}")
         n_rows = st.session_state.get(f"arr_in_rows_{ver}", 1)
         rows = []
         st.markdown("**Bills in this handover**")
@@ -2546,6 +2607,9 @@ def show_arrival_button():
                     st.error("The same distributor + type is listed twice — put those bills in one line.")
                 elif by == "Other" and not by_name.strip():
                     st.error("Write who brought the bills.")
+                elif porter_bk and (p_bills != int(_to_float(porter_bk.get("no_bills"), 0) or len(porter_bk.get("_arrs") or []) or 1)
+                                    or p_poly != int(_to_float(porter_bk.get("no_polythene"), 0))) and not p_short.strip():
+                    st.error("The count does not match the porter booking — write what is short / extra.")
                 else:
                     pic = upload_image(photo, "arrival")
                     if pic:
@@ -2558,6 +2622,15 @@ def show_arrival_button():
                                 "brought_by": by, "brought_by_name": by_name.strip() or None, "group_id": gid,
                                 "order_type": t}
                                 for d, n, t in rows]).execute()
+                            if porter_bk:              # what 📦 Receive Porter did: booking -> Delivered (opens 💰 payment)
+                                try:
+                                    supabase.table("porter_bookings").update({
+                                        "status": "Delivered", "bills_received": str(p_bills),
+                                        "polythene_received": str(p_poly), "receive_time": time_str(),
+                                        "received_by": st.session_state.name, "shortage": p_short.strip(),
+                                        "receipt_images": str({"arrival": pic})}).eq("id", porter_bk["id"]).execute()
+                                except Exception as e:
+                                    st.warning(f"Arrival saved, but the porter booking was not updated: {e}")
                             st.session_state["arr_in_open"] = False
                             st.session_state["arr_in_v"] = ver + 1
                             if wa not in areas:
@@ -2608,7 +2681,7 @@ def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills n
 
 
 ARR_BEFORE_WAREHOUSE = ["Pending", "Porter Booked", "Picked Up", "Picked", "Picked Up - In Transit",
-                        "Handed Over", "Delivered"]
+                        "Handed Over", "Given to Porter - In Transit", "Delivered"]
 
 
 def form_register_entry():
@@ -4784,10 +4857,6 @@ def show_user_page():
             if st.button("📒 Register Entry", width='stretch', key="s_register",
                 type="primary" if st.session_state.stock_active_form=="register" else "secondary"):
                 st.session_state.stock_active_form = "register"
-                st.rerun()
-            if st.button("📦 Receive Porter", width='stretch', key="s_receive",
-                type="primary" if st.session_state.stock_active_form=="receive" else "secondary"):
-                st.session_state.stock_active_form = "receive"
                 st.rerun()
             if st.button("🧾 Bills Register", width='stretch', key="s_bills",
                 type="primary" if st.session_state.stock_active_form=="bills" else "secondary"):
@@ -7386,13 +7455,45 @@ PLACED_BY = ["🙋 Me (our team)", "🏭 Warehouse team"]
 def bills_to_place(area):
     """bills uploaded (from PLACEMENT_FROM on) but not placed yet — last 7 days, oldest first"""
     lo = (today_ist() - timedelta(days=7)).strftime("%Y-%m-%d")
-    out = []
+    out, used = [], set()
     for b in build_bill_journeys(lo, date_str(), date_str()):
+        up = b["stages"][1].get("task") if len(b["stages"]) > 1 else None
+        if up:
+            used.add(up.get("id"))
         if b.get("next") != "📍 Placement":
             continue
         if area and area != "All Areas" and (b["d"] or {}).get("area") != area:
             continue
         out.append(b)
+    # uploads with no Register Entry in the app (e.g. arrangement bills received via 📦 Receive Porter)
+    try:
+        ups = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Bill Upload (Software)").gte("date", lo))
+               if t.get("status") != "In Progress" and t.get("id") not in used]
+        pls = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Stock Placement").gte("date", lo))
+    except Exception:
+        ups, pls = [], []
+    placed_ids = {(t.get("details") or {}).get("upload_id") for t in pls} - {None}
+    placed_keys = {_bill_key(t.get("details")) for t in pls}
+    arr_area = {}
+    nos = [str((t.get("details") or {}).get("arrangement_no") or "").strip() for t in ups]
+    nos = [n for n in nos if n]
+    if nos:
+        try:
+            for a in supabase.table("arrangements").select("arrangement_no,area").in_("arrangement_no", list(set(nos))).execute().data or []:
+                arr_area[str(a.get("arrangement_no"))] = a.get("area")
+        except Exception:
+            pass
+    for t in ups:
+        d = dict(t.get("details") or {})
+        when = _task_dt(t)
+        if not when or when.strftime("%Y-%m-%d %H:%M") < PLACEMENT_FROM:
+            continue
+        if t.get("id") in placed_ids or _bill_key(d) in placed_keys:
+            continue
+        d["area"] = d.get("area") or arr_area.get(str(d.get("arrangement_no") or "").strip(), "")
+        if area and area != "All Areas" and d.get("area") not in (area, ""):
+            continue
+        out.append({"reg": {"id": None}, "d": d, "uploaded": when, "upload_id": t.get("id")})
     return sorted(out, key=lambda b: b.get("uploaded") or datetime.max)
 
 
@@ -7420,6 +7521,7 @@ def form_bill_placement():
         "Distributor": b["d"].get("distributor", ""), "Bill no": b["d"].get("bill_no", ""),
         "Items": int(_to_float(b["d"].get("no_items"), 0)), "Area": b["d"].get("area", ""),
         "Uploaded": _fmt_when(b["uploaded"], now_n),
+        "Entry": "" if b["reg"].get("id") else "⚠️ no Register Entry",
         "Waiting": fmt_age(int((now_n - b["uploaded"]).total_seconds() // 60)) if b.get("uploaded") else ""}
         for b in bills]), hide_index=True, width='stretch', height=min(300, 38 + 35 * len(bills)))
 
@@ -7432,7 +7534,8 @@ def form_bill_placement():
         if start is None:
             return
     opts = {f"{b['d'].get('distributor', '')} — Bill {b['d'].get('bill_no', '') or '—'} — {int(_to_float(b['d'].get('no_items'), 0))} items"
-            + (f" — #{b['d'].get('arrangement_no')}" if b["d"].get("arrangement_no") else "") + f" (#{b['reg'].get('id')})": b
+            + (f" — #{b['d'].get('arrangement_no')}" if b["d"].get("arrangement_no") else "")
+            + (f" (#{b['reg'].get('id')})" if b["reg"].get("id") else f" (U{b.get('upload_id')})"): b
             for b in bills}
     with st.form(f"pl_form_{ver}"):
         pick = st.multiselect("Bills placed *", list(opts), key=f"pl_pick_{ver}",
@@ -7471,7 +7574,8 @@ def form_bill_placement():
                 "task_type": "Stock Placement", "status": "Completed",
                 "start_time": s_.strftime("%I:%M:%S %p"), "end_time": e_.strftime("%I:%M:%S %p"),
                 "duration_mins": str(round(dur / len(chosen), 1)) if mine else "0",
-                "details": {"reg_id": b["reg"].get("id"), "arrangement_no": d.get("arrangement_no") or "",
+                "details": {"reg_id": b["reg"].get("id"), "upload_id": b.get("upload_id"),
+                            "arrangement_no": d.get("arrangement_no") or "",
                             "bill_no": d.get("bill_no", ""), "distributor": d.get("distributor", ""),
                             "area": d.get("area", ""), "no_medicines": str(int(_to_float(d.get("no_items"), 0))),
                             "items_placed": str(int(items) if items else total_items),
@@ -10441,7 +10545,7 @@ def _md_windows(kp, person, windows, wmins):
 STOCK_MENU = [
     ("✅ Processing", [("✔️ Bill Cross Check", "crosscheck"), ("📤 Bill Upload", "upload"),
                       ("📍 Placement", "placement"), ("🏪 In-Store Pick", "storepick")]),
-    ("📥 Incoming Stock", [("📒 Register Entry", "register"), ("📦 Receive Porter", "receive"),
+    ("📥 Incoming Stock", [("📒 Register Entry", "register"),
                           ("🧾 Bills Register", "bills"), ("✏️ Edit Entry", "edit")]),
     ("🔧 Other Work", [("↩️ Purchase Return", "return"), ("🧹 Rack Cleaning", "rack"),
                       ("📊 Inventory Check", "inventory"), ("✏️ Other", "other")]),
@@ -10450,7 +10554,7 @@ STOCK_MENU = [
 ARR_STAGE = {
     "Pending": "🕐 Ordered — at distributor",
     "Porter Booked": "🚚 On the way", "Picked Up": "🚚 On the way", "Picked": "🚚 On the way",
-    "Picked Up - In Transit": "🚚 On the way",
+    "Picked Up - In Transit": "🚚 On the way", "Given to Porter - In Transit": "🚛 With porter",
     "Handed Over": "🚚 On the way", "Delivered": "🚚 On the way",
     "Reached Warehouse": "📦 Arrived — check bill",
     "Bill Cross Checked": "✔️ Checked — upload bill",
@@ -10479,10 +10583,20 @@ def show_incoming_arrangements(area, full=False):
                 holder[str(a.get("arrangement_no"))] = (p, a)
     except Exception:
         holder = {}
+    try:
+        _pbk = open_porter_bookings(area)
+    except Exception:
+        _pbk = []
+    for b in _pbk:
+        for a in b.get("_arrs") or []:
+            holder.setdefault(str(a.get("arrangement_no")), (f"🚛 {b.get('porter_no') or 'Porter'}", a))
+        st.info(f"{porter_label(b)}: " + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}"
+                                                     for a in b.get("_arrs") or []) or "—")
+                + " — when he arrives: 📥 Bills arrived → Porter → pick this booking → ⬇️ Fill these bills")
     coming = {}
     for a in open_:
         h = holder.get(str(a.get("arrangement_no")))
-        if h:
+        if h and not h[0].startswith("🚛"):
             coming.setdefault(h[0], []).append(h[1])
     for p, lst in sorted(coming.items()):
         st.info(f"🛵 **{p}** is bringing **{len(lst)} arrangement bill(s)**"
@@ -10540,7 +10654,7 @@ def show_incoming_arrangements(area, full=False):
         rows.append({"": "🔴" if u == "Very Urgent" else "🟡" if u == "Urgent" else "🟢",
                      "ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor", ""),
                      "Medicines": a.get("no_medicines", ""), "Status": stage,
-                     "Coming with": f"🛵 {_h[0]}" if _h else "",
+                     "Coming with": (_h[0] if _h[0].startswith("🚛") else f"🛵 {_h[0]}") if _h else "",
                      "Customer deliver by": first[1] + (f" +{len(meds) - 1} more" if len(meds) > 1 and first[1] else ""),
                      "Ordered": (("Yday " if a.get("order_placed_date") != date_str() else "") + str(a.get("order_placed_time") or "")),
                      **({"Area": a.get("area", "")} if area in (None, "", "All Areas") else {}),
