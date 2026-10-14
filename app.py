@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v13-Oct 5:10 PM"
+APP_VERSION = "v14-Oct 9:45 AM"
 
 def show_sidebar():
     with st.sidebar:
@@ -3739,6 +3739,7 @@ def show_user_page():
     # ── MANAGER: switch between own work and team view ───────────────────────
     if st.session_state.get("role") == "manager":
         pending_reviews_banner()
+        show_daily_checklist()
         mode = st.radio("View", ["🧑‍💼 My Work", "👥 Team View"], horizontal=True,
                         key="mgr_mode", label_visibility="collapsed")
         if mode == "👥 Team View":
@@ -12458,6 +12459,7 @@ def show_daily_summary(kp="ds"):
         if S["top_reason"]:
             st.markdown(f"🗒️ Top reason for slow work: **{S['top_reason']}**" + (f" · 🔴 reviews: {S['reds']}" if S["reds"] else ""))
         show_no_clockout(S, kp)
+        show_checklist_status(S["day"], kp + "_cl")
     with t6:
         st.caption("Tap the copy icon (top right of the box) and paste in WhatsApp.")
         st.code(summary_text(S), language=None)
@@ -12475,6 +12477,160 @@ def section_nav(kp, labels):
     st.query_params[f"{kp}_s"] = str(labels.index(pick))
     st.divider()
     return pick
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ✅ DAILY CHECKLIST for managers (Dharmendra) — live numbers + Done with note
+# ══════════════════════════════════════════════════════════════════════════════
+CHECK_ITEMS = [("location", "📍 Rack locations updated in the billing software"),
+               ("bounce", "🔁 Bounce medicines checked")]
+
+
+def checklist_people():
+    v = get_app_setting("checklist_people", "Dharmendra")
+    return [p.strip() for p in str(v or "").split(",") if p.strip()]
+
+
+def _checks_today(person, day=None):
+    try:
+        rows = supabase.table("manager_checks").select("*").eq("person", person).eq("date", day or date_str()).execute().data or []
+    except Exception:
+        return None
+    return {r["item"]: r for r in rows}
+
+
+def bounce_today_numbers(area=None):
+    """live bounce numbers for the checklist"""
+    out = {"today": 0, "verify": 0, "reorder": 0, "by_area": {}, "by_dist": {}}
+    try:
+        lo = IST.localize(datetime.combine(today_ist(), datetime.min.time())).isoformat()
+        today = fetch_all("bounce_items", lambda q: q.gte("reported_at", lo))
+        open_ = fetch_all("bounce_items", lambda q: q.in_("status", ["To verify", "Re-order"]))
+    except Exception:
+        return out
+    out["today"] = len(today)
+    out["verify"] = sum(1 for b in open_ if b.get("status") == "To verify")
+    out["reorder"] = sum(1 for b in open_ if b.get("status") == "Re-order")
+    for b in today:
+        out["by_area"][b.get("area") or "—"] = out["by_area"].get(b.get("area") or "—", 0) + 1
+        out["by_dist"][b.get("distributor") or "—"] = out["by_dist"].get(b.get("distributor") or "—", 0) + 1
+    return out
+
+
+def _save_check(item, result, note, photo=None):
+    rec = {"person": st.session_state.name, "date": date_str(), "item": item, "done_at": now_iso(),
+           "result": result, "note": note.strip() or None}
+    if photo is not None:
+        rec["photo"] = upload_image(photo, "check")
+    supabase.table("manager_checks").upsert(rec, on_conflict="person,date,item").execute()
+
+
+def show_daily_checklist():
+    """card on the manager's home screen"""
+    me = st.session_state.name
+    if me not in checklist_people():
+        return
+    done = _checks_today(me)
+    if done is None:
+        st.caption("✅ Daily checklist: run manager_checklist_setup.sql in Supabase to switch it on.")
+        return
+    n_done = sum(1 for k, _ in CHECK_ITEMS if k in done)
+    title = f"✅ My daily checklist — {n_done}/{len(CHECK_ITEMS)} done"
+    with st.expander(title if n_done == len(CHECK_ITEMS) else "⏳ " + title, expanded=n_done < len(CHECK_ITEMS)):
+        for key, label in CHECK_ITEMS:
+            d = done.get(key)
+            st.markdown(f"**{label}**" + (f"  ·  ✅ done {to_ist(d['done_at']).strftime('%I:%M %p')}" if d else ""))
+            if key == "location":
+                _check_location(d)
+            elif key == "bounce":
+                _check_bounce(d)
+            st.divider()
+
+
+def _check_location(d):
+    areas = load_areas()
+    if d:
+        res = (d.get("result") or {}).get("areas", {})
+        st.caption(" · ".join(f"{a}: {'✅' if v.get('checked') else '—'}"
+                              + (f" ({v.get('missing')} missing)" if v.get("missing") else "") for a, v in res.items())
+                   + (f"  ·  📝 {d['note']}" if d.get("note") else ""))
+        if not st.toggle("Update", key="chk_loc_edit"):
+            return
+    st.caption("Open the billing software and check that today's received medicines have their rack / shelf location.")
+    with st.form("chk_loc_form"):
+        res = {}
+        for a in areas:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                ok = st.checkbox(f"Checked {a}", key=f"chk_loc_{a}")
+            with c2:
+                miss = st.number_input("Missing location", 0, 999, 0, key=f"chk_loc_miss_{a}")
+            res[a] = {"checked": ok, "missing": int(miss)}
+        note = st.text_input("Note (which medicines / who to fix)", key="chk_loc_note")
+        photo = st.file_uploader("Screenshot / photo (optional)", type=["jpg", "jpeg", "png"], key="chk_loc_photo")
+        if st.form_submit_button("✅ Done", type="primary"):
+            if not any(v["checked"] for v in res.values()):
+                st.error("Tick at least one area you checked.")
+            else:
+                _save_check("location", {"areas": res}, note, photo)
+                st.rerun()
+
+
+def _check_bounce(d):
+    n = bounce_today_numbers()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Reported today", n["today"])
+    c2.metric("🔍 To verify", n["verify"])
+    c3.metric("🔁 Waiting re-order", n["reorder"])
+    if n["by_area"]:
+        st.caption("Today by area: " + " · ".join(f"{a} {v}" for a, v in n["by_area"].items())
+                   + "  ·  by distributor: " + " · ".join(f"{k} {v}" for k, v in
+                                                        sorted(n["by_dist"].items(), key=lambda x: -x[1])[:5]))
+    if st.session_state.get("team") == "Purchase" and st.button("🔁 Open Bounce Center", key="chk_bc_open"):
+        st.session_state["mgr_mode"] = "🧑‍💼 My Work"
+        st.session_state.purchase_active_form = "bounce_c"
+        st.rerun()
+    if d:
+        st.caption(f"Checked: {(d.get('result') or {}).get('verify', 0)} to verify at that time"
+                   + (f"  ·  📝 {d['note']}" if d.get("note") else ""))
+        if not st.toggle("Update", key="chk_bc_edit"):
+            return
+    if n["verify"]:
+        st.warning(f"{n['verify']} bounce(s) still waiting for verification — clear them in the Bounce Center first.")
+    with st.form("chk_bc_form"):
+        note = st.text_input("Note (e.g. Acorn short 3 items, re-ordered from Jai)", key="chk_bc_note")
+        if st.form_submit_button("✅ Done", type="primary"):
+            _save_check("bounce", {"today": n["today"], "verify": n["verify"], "reorder": n["reorder"]}, note)
+            st.rerun()
+
+
+def show_checklist_status(day_s, kp="cls"):
+    """admin / managers: who did the daily checklist (Daily Summary → Team)"""
+    st.markdown("#### ✅ Manager daily checklist")
+    people = checklist_people()
+    try:
+        rows = supabase.table("manager_checks").select("*").eq("date", day_s).execute().data or []
+    except Exception:
+        st.caption("Run manager_checklist_setup.sql to switch it on.")
+        return
+    out = []
+    for p in people:
+        mine = {r["item"]: r for r in rows if r.get("person") == p}
+        r = {"Person": p}
+        for k, label in CHECK_ITEMS:
+            x = mine.get(k)
+            r[label] = (f"✅ {to_ist(x['done_at']).strftime('%I:%M %p')}" + (f" — {x['note']}" if x.get("note") else "")) \
+                if x else "❌ not done"
+        out.append(r)
+    if out:
+        st.dataframe(pd.DataFrame(out), hide_index=True, width='stretch')
+    if st.session_state.get("role") == "admin":
+        users = sorted(u.get("name") for u in (load_users() or {}).values() if u.get("name"))
+        sel = st.multiselect("Who does this checklist", users, default=[p for p in people if p in users], key=f"{kp}_who")
+        if st.button("Save list", key=f"{kp}_save"):
+            set_app_setting("checklist_people", ",".join(sel))
+            st.success("Saved")
+
 
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
