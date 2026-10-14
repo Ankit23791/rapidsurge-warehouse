@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta
 import io
 import re
 import pytz
+from html import escape as _esc
 from supabase import create_client
 
 st.set_page_config(
@@ -170,6 +171,11 @@ def task_secs(row):
     except Exception:
         return 0
 
+def time_sort_key(s):
+    """'01:15 PM' must come after '09:30 AM' — sort by the real time, not the text"""
+    t = parse_task_time(s)
+    return (0, t.time()) if t else (1, datetime.min.time())
+
 def fmt_secs(secs):
     """45 -> '45 secs', 125 -> '2 min 5 secs', 3720 -> '1 hr 2 min'"""
     secs = int(round(secs or 0))
@@ -186,7 +192,7 @@ def fmt_secs(secs):
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_SECRET = st.secrets["SUPABASE_SECRET"]
-except:
+except Exception:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_SECRET = os.getenv("SUPABASE_SECRET", "")
 
@@ -240,7 +246,16 @@ class _Query:
                 store.pop(k, None)
             if self._t in ("daily_tasks", "customer_order_lines"):
                 st.session_state.pop("_blk_prog", None)      # block card shows the new task at once
-            return self._run()
+            main_save = self._t == "daily_tasks" and first in ("insert", "upsert")
+            try:
+                resp = self._run()
+            except Exception:
+                if main_save:
+                    _timer_save_failed()                     # saving the task failed -> timer keeps running
+                raise
+            if main_save:
+                _timer_save_done()
+            return resp
         key = (self._t, repr(self._c))
         hit = store.get(key)
         now = _time.time()
@@ -274,7 +289,7 @@ def load_warehouses():
     try:
         resp = supabase.table("warehouses").select("*").eq("active", True).execute()
         return [w["name"] for w in resp.data] if resp.data else ["Warehouse 1","Warehouse 2","Warehouse 3"]
-    except:
+    except Exception:
         return ["Warehouse 1","Warehouse 2","Warehouse 3"]
 
 @st.cache_data(ttl=300)
@@ -282,7 +297,7 @@ def load_areas():
     try:
         resp = supabase.table("areas").select("*").eq("active", True).execute()
         return [a["name"] for a in resp.data] if resp.data else ["Gaur City","Sector 78","Indirapuram"]
-    except:
+    except Exception:
         return ["Gaur City","Sector 78","Indirapuram"]
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
@@ -319,6 +334,57 @@ def find_user(username, users=None):
     return low.get(u.lower())
 
 USERS = load_users()
+
+# ── PASSWORDS & LOGIN LINK (security) ─────────────────────────────────────────
+# Passwords are still stored as plain text for now (hashing planned later).
+# verify_password / hash_password are ready for that: a "pbkdf2$..." value is checked as a hash.
+import hashlib, hmac, secrets, time as _time_mod
+PW_ITER = 200_000
+LOGIN_DAYS = 30            # "stay logged in" link is valid this many days
+
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", str(pw).encode(), bytes.fromhex(salt), PW_ITER).hex()
+    return f"pbkdf2${PW_ITER}${salt}${h}"
+
+def is_hashed(stored):
+    return str(stored or "").startswith("pbkdf2$")
+
+def verify_password(stored, given):
+    """True if `given` matches the saved password (hashed or old plain text)"""
+    stored, given = str(stored or ""), str(given or "")
+    if not stored:
+        return False
+    if is_hashed(stored):
+        try:
+            _, it, salt, h = stored.split("$")
+            for g in {given, given.strip()}:
+                calc = hashlib.pbkdf2_hmac("sha256", g.encode(), bytes.fromhex(salt), int(it)).hex()
+                if hmac.compare_digest(calc, h):
+                    return True
+        except Exception:
+            return False
+        return False
+    return hmac.compare_digest(stored, given) or hmac.compare_digest(stored, given.strip())
+
+def make_login_token(username, stored_pw, now=None):
+    """signed token 'expiry.signature' — changes when the password changes, expires after LOGIN_DAYS"""
+    exp = int((now or _time_mod.time()) + LOGIN_DAYS * 86400)
+    msg = f"{username}|{exp}|{stored_pw}".encode()
+    sig = hmac.new(str(SUPABASE_SECRET).encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{exp}.{sig}"
+
+def check_login_token(username, stored_pw, token, now=None):
+    try:
+        exp_s, sig = str(token).split(".", 1)
+        exp = int(exp_s)
+    except Exception:
+        return False
+    if exp < (now or _time_mod.time()):
+        return False
+    msg = f"{username}|{exp}|{stored_pw}".encode()
+    good = hmac.new(str(SUPABASE_SECRET).encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(good, sig)
 
 _OLD_DISTRIBUTORS = [
     "Acorns Health Solutions Private Limited","Admire Enterprises","Zone Ventures Put Ltd",
@@ -368,22 +434,17 @@ if not st.session_state.logged_in:
     try:
         params = st.query_params
         if "u" in params and "t" in params:
-            username = params["u"]
             token    = params["t"]
-            # Verify token matches (simple hash)
-            import hashlib
             USERS_temp = load_users()
-            if username in USERS_temp:
-                expected = hashlib.md5(
-                    (username + USERS_temp[username]["password"]).encode()
-                ).hexdigest()[:8]
-                if token == expected:
+            username = find_user(params["u"], USERS_temp)
+            if username:
+                if check_login_token(username, USERS_temp[username]["password"], token):
                     st.session_state.logged_in = True
                     st.session_state.username  = username
                     st.session_state.name      = USERS_temp[username]["name"]
                     st.session_state.team      = USERS_temp[username]["team"]
                     st.session_state.role      = USERS_temp[username]["role"]
-    except:
+    except Exception:
         pass
 
 # ── IMAGE UPLOAD ──────────────────────────────────────────────────────────────
@@ -396,9 +457,11 @@ def calc_actual_duration(df):
             try:
                 s = parse_task_time(row.get("start_time",""))
                 e = parse_task_time(row.get("end_time",""))
-                if e > s:
+                if s and e and e < s:
+                    e += timedelta(days=1)          # crossed midnight
+                if s and e and e > s:
                     periods.append((s, e))
-            except:
+            except Exception:
                 pass
         if not periods:
             return 0
@@ -410,7 +473,7 @@ def calc_actual_duration(df):
             else:
                 merged.append([start, end])
         return sum([int((e-s).total_seconds()/60) for s,e in merged])
-    except:
+    except Exception:
         return 0
 
 def compress_image(raw, fname=""):
@@ -539,10 +602,11 @@ def show_login():
             if not uname:
                 st.error("❌ Username not found — check the spelling, or ask Ankit if your user is active.")
                 st.stop()
-            if str(USERS_NOW[uname]["password"]) != str(password).strip() and str(USERS_NOW[uname]["password"]) != str(password):
+            if not verify_password(USERS_NOW[uname]["password"], password):
                 st.error("❌ Wrong password.")
                 st.stop()
             username = uname
+            stored_pw = str(USERS_NOW[username]["password"])
             if True:
                 st.session_state.logged_in = True
                 st.session_state.username = username
@@ -552,8 +616,7 @@ def show_login():
                 st.session_state.work_area = ""
                 st.session_state["fresh_login"] = True     # Stock: ask the area again after a real login
                 # Store login in URL for persistence
-                import hashlib
-                token = hashlib.md5((username + str(USERS_NOW[username]["password"])).encode()).hexdigest()[:8]
+                token = make_login_token(username, stored_pw)
                 st.query_params["u"] = username
                 st.query_params["t"] = token
                 st.rerun()
@@ -562,7 +625,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 10:45 PM"
+APP_VERSION = "v15-Oct fixes"
 
 def show_sidebar():
     with st.sidebar:
@@ -601,7 +664,7 @@ def show_sidebar():
             with c2:
                 delta = today_count - yest_count
                 st.metric("Today", today_count, f"{'+' if delta>=0 else ''}{delta}")
-        except:
+        except Exception:
             pass
 
         st.divider()
@@ -683,8 +746,8 @@ def timer_button(key, task_name=None):
                 }).execute()
                 if result.data:
                     st.session_state[f"{key}_task_id"] = result.data[0]["id"]
-            except:
-                pass
+            except Exception:
+                st.toast("⚠️ Timer started, but it could not be saved online — don't refresh the page.", icon="⚠️")
             st.rerun()
         return None
     else:
@@ -700,11 +763,28 @@ def timer_button(key, task_name=None):
                     try:
                         supabase.table("daily_tasks").delete()\
                             .eq("id", cancel_id).eq("status", "In Progress").execute()
-                    except:
+                    except Exception:
                         pass
                     st.session_state[f"{key}_task_id"] = None
                 st.rerun()
         return st.session_state[sk]
+
+def _timer_save_done():
+    """the form's task row was saved -> now it is safe to remove the 'In Progress' placeholder"""
+    p = st.session_state.pop("_timer_pending_end", None)
+    if p and p.get("task_id"):
+        try:
+            supabase.table("daily_tasks").delete().eq("id", p["task_id"]).eq("status", "In Progress").execute()
+        except Exception:
+            pass
+
+def _timer_save_failed():
+    """the form's save failed -> put the running timer back so the work time is not lost"""
+    p = st.session_state.pop("_timer_pending_end", None)
+    if p:
+        st.session_state[f"{p['key']}_start"] = p["start"]
+        st.session_state[f"{p['key']}_task_id"] = p.get("task_id")
+        st.session_state.pop("mission_done", None)
 
 def end_timer(key, start_time, keep_record=False):
     end = now_ist()
@@ -713,6 +793,13 @@ def end_timer(key, start_time, keep_record=False):
     st.session_state.pop("_blk_prog", None)
     st.session_state[f"{key}_start"] = None
     task_id = st.session_state.get(f"{key}_task_id")
+    if not keep_record:
+        # Form saves its own full row next. The placeholder is removed only after that save works
+        # (_timer_save_done); if the save fails, the timer comes back (_timer_save_failed).
+        _timer_save_done()                                 # finish any older pending one first
+        st.session_state["_timer_pending_end"] = {"key": key, "start": start_time, "task_id": task_id}
+        st.session_state[f"{key}_task_id"] = None
+        return end.strftime("%I:%M:%S %p"), duration
     if task_id:
         try:
             if keep_record:
@@ -727,7 +814,7 @@ def end_timer(key, start_time, keep_record=False):
                 # (this was creating a duplicate empty entry for every task)
                 supabase.table("daily_tasks").delete()\
                     .eq("id", task_id).eq("status", "In Progress").execute()
-        except:
+        except Exception:
             pass
         st.session_state[f"{key}_task_id"] = None
     return end.strftime("%I:%M:%S %p"), duration
@@ -1111,7 +1198,7 @@ def form_arrangement():
             .like("arrangement_no", f"ARR-{today_prefix}-%").execute()
         next_no = len(existing.data) + 1 if existing.data else 1
         auto_arr_no = f"ARR-{today_prefix}-{str(next_no).zfill(3)}"
-    except:
+    except Exception:
         auto_arr_no = f"ARR-{today_ist().strftime('%Y%m%d')}-001"
 
     # Customer order items: decide each one / tick to order (optional for stock top-ups)
@@ -1257,7 +1344,7 @@ def form_arrangement():
                                         "remarks": remarks
                                     }
                                 }).eq("id", task_resp.data[0]["id"]).execute()
-                        except:
+                        except Exception:
                             pass
                         # fresh, empty form + picker for the next order
                         st.session_state["arr_form_ver"] = fv + 1
@@ -1505,13 +1592,13 @@ def medicine_list_card(meds, title=""):
         return
     rows = "".join(
         f"<tr><td style='padding:6px 10px;color:#6b7280'>{i}</td>"
-        f"<td style='padding:6px 10px;font-weight:600'>{m['name']}</td>"
-        f"<td style='padding:6px 10px'>{m.get('pack','')}</td>"
-        f"<td style='padding:6px 10px;text-align:right;font-weight:700;font-size:1.15em'>{m['qty']}</td></tr>"
+        f"<td style='padding:6px 10px;font-weight:600'>{_esc(str(m['name']))}</td>"
+        f"<td style='padding:6px 10px'>{_esc(str(m.get('pack','')))}</td>"
+        f"<td style='padding:6px 10px;text-align:right;font-weight:700;font-size:1.15em'>{_esc(str(m['qty']))}</td></tr>"
         for i, m in enumerate(meds, 1))
     st.markdown(
         f"<div style='border:2px solid #0B1F33;border-radius:10px;padding:10px 12px;background:#fff;color:#111'>"
-        + (f"<div style='font-weight:700;font-size:1.1em;margin-bottom:6px'>{title}</div>" if title else "")
+        + (f"<div style='font-weight:700;font-size:1.1em;margin-bottom:6px'>{_esc(str(title))}</div>" if title else "")
         + "<table style='width:100%;border-collapse:collapse;font-size:1.05em'>"
           "<tr style='background:#0B1F33;color:#fff'><th style='padding:6px 10px;text-align:left'>#</th>"
           "<th style='padding:6px 10px;text-align:left'>Medicine</th><th style='padding:6px 10px;text-align:left'>Pack</th>"
@@ -1804,7 +1891,7 @@ def form_stock_placement():
         try:
             areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-        except:
+        except Exception:
             area_list = ["All Areas"]
         default_sp_area_idx = 0
         if st.session_state.get("work_area") and st.session_state.work_area in area_list:
@@ -1845,7 +1932,7 @@ def form_stock_placement():
             area_match = sp_area == "All Areas" or d.get("area","") == sp_area or d.get("area","") == ""
             if not d.get("arrangement_no","") and not d.get("placement_done") and area_match:
                 normal_orders.append(t)
-    except:
+    except Exception:
         normal_orders = []
 
     if not arrangements and not normal_orders:
@@ -1878,7 +1965,7 @@ def form_stock_placement():
             meds_resp = supabase.table("arrangement_medicines").select("*")\
                 .eq("arrangement_id", selected_data["id"]).execute()
             medicines = meds_resp.data if meds_resp.data else []
-        except:
+        except Exception:
             medicines = []
     else:
         d = selected_data.get("details",{})
@@ -2040,7 +2127,7 @@ def form_placement_crosscheck():
         check_meds = []
         try:
             check_meds = json.loads(selected_arr.get("cross_check_medicines","[]"))
-        except:
+        except Exception:
             check_meds = []
 
         if check_meds:
@@ -2167,7 +2254,7 @@ def form_edit_register_entry():
                 editable.append(e)
             else:
                 non_editable.append(e)
-        except:
+        except Exception:
             non_editable.append(e)
 
     if editable:
@@ -2816,7 +2903,7 @@ def form_register_entry():
                 try:
                     areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
                     area_options = [a["name"] for a in (areas_resp.data or [])]
-                except:
+                except Exception:
                     area_options = ["Gaur City","Sector 78","Indirapuram"]
                 default_re_area = 0
                 if arr_area and arr_area in area_options:
@@ -2909,7 +2996,7 @@ def form_bill_crosscheck():
         try:
             areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-        except:
+        except Exception:
             area_list = ["All Areas"]
         # Default to work area
         default_area_idx = 0
@@ -2966,7 +3053,7 @@ def form_bill_crosscheck():
                 if wait > area_summary[area]["oldest_wait"]:
                     area_summary[area]["oldest_wait"] = wait
                 area_summary[area]["total_wait"] += wait
-            except:
+            except Exception:
                 pass
 
         # From normal orders
@@ -2981,7 +3068,7 @@ def form_bill_crosscheck():
                 if wait > area_summary[area]["oldest_wait"]:
                     area_summary[area]["oldest_wait"] = wait
                 area_summary[area]["total_wait"] += wait
-            except:
+            except Exception:
                 pass
 
         if area_summary:
@@ -3050,7 +3137,7 @@ def form_bill_crosscheck():
         if bc_area != "All Areas":
             normal_orders = [n for n in normal_orders 
                            if n.get("details",{}).get("area","") == bc_area]
-    except:
+    except Exception:
         normal_orders = []
 
     if not arrangements and not normal_orders:
@@ -3227,7 +3314,7 @@ def form_bill_upload_arrangement():
         try:
             areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
             area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-        except:
+        except Exception:
             area_list = ["All Areas"]
         default_bu_area_idx = 0
         if st.session_state.get("work_area") and st.session_state.work_area in area_list:
@@ -3266,7 +3353,7 @@ def form_bill_upload_arrangement():
             area_match = bu_area == "All Areas" or d.get("area","") == bu_area or d.get("area","") == ""
             if not d.get("arrangement_no","") and not d.get("bill_uploaded") and area_match:
                 cross_checked_normal.append(t)
-    except:
+    except Exception:
         cross_checked_normal = []
 
     # Apply order type filter
@@ -3544,7 +3631,7 @@ def form_book_porter():
                     .execute()
                 next_num = len(existing.data or []) + 1
                 auto_porter_no = f"PRT-{today_str}-{next_num:03d}"
-            except:
+            except Exception:
                 auto_porter_no = f"PRT-{date_str()}-001"
             porter_no    = st.text_input("System Porter ID", value=auto_porter_no,
                 help="Auto-generated ID for tracking")
@@ -3650,7 +3737,7 @@ def form_porter_handover():
                     labels.append(f"{arr_no}({area})")
                 else:
                     labels.append(arr_no)
-            except:
+            except Exception:
                 labels.append(arr_no)
         return ", ".join(labels)
 
@@ -3929,7 +4016,7 @@ def form_porter_receive():
                     labels.append(f"{arr_no}({area})")
                 else:
                     labels.append(arr_no)
-            except:
+            except Exception:
                 labels.append(arr_no)
         return ", ".join(labels)
 
@@ -4097,7 +4184,7 @@ def show_user_page():
         try:
             areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
             area_options = [a["name"] for a in (areas_resp.data or [])] + ["All Areas"]
-        except:
+        except Exception:
             area_options = ["Gaur City","Sector 78","Indirapuram","All Areas"]
 
         cols = st.columns(len(area_options))
@@ -4220,7 +4307,7 @@ def show_user_page():
                             else:
                                 end_t = dt.strptime(time_str(), "%I:%M %p")
                             total_mins = int((end_t - reg_t).total_seconds() / 60)
-                        except:
+                        except Exception:
                             total_mins = "-"
 
                         rows.append({
@@ -4405,12 +4492,12 @@ def show_user_page():
                     .eq("date", date_str()).execute()
                 tasks = resp.data or []
                 if tasks:
-                    for t in sorted(tasks, key=lambda x: x.get("time","")):
+                    for t in sorted(tasks, key=lambda x: time_sort_key(x.get("time",""))):
                         status_icon = "🔄" if t.get("status")=="In Progress" else "✅"
                         st.markdown(f"{status_icon} {t.get('time','')} — **{t.get('task_type','')}**")
                 else:
                     st.caption("No tasks yet today!")
-            except:
+            except Exception:
                 st.caption("Error loading tasks")
 
         # Main area
@@ -4524,7 +4611,7 @@ def show_user_page():
                     .eq("pickup_type","Self Pick")\
                     .eq("order_placed_date", date_str()).execute()
                 pending_count = len(pending_resp.data or [])
-            except:
+            except Exception:
                 pending_count = 0
             if pending_count > 0:
                 st.error(f"🔴 {pending_count} Pickup(s) Pending Today!")
@@ -4566,7 +4653,7 @@ def show_user_page():
                 with c3: st.metric("🚛 Handovers", handover)
                 if tasks:
                     st.markdown("**Recent tasks:**")
-                    for t in sorted(tasks, key=lambda x: x.get("time",""), reverse=True)[:5]:
+                    for t in sorted(tasks, key=lambda x: (time_sort_key(x.get("time","")), x.get("id") or 0), reverse=True)[:5]:
                         st.markdown(f"✅ {t.get('time','')} — {t.get('task_type','')}")
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -4586,7 +4673,7 @@ def show_user_page():
             arr_resp = supabase.table("arrangements").select("*")\
                 .eq("order_placed_date", date_str()).execute()
             arr_today = arr_resp.data if arr_resp.data else []
-        except:
+        except Exception:
             arr_today = []
 
         if not arr_today:
@@ -4718,12 +4805,12 @@ def show_user_page():
                     .eq("date", date_str()).execute()
                 tasks = resp.data or []
                 if tasks:
-                    for t in sorted(tasks, key=lambda x: x.get("time","")):
+                    for t in sorted(tasks, key=lambda x: time_sort_key(x.get("time",""))):
                         status_icon = "🔄" if t.get("status")=="In Progress" else "✅"
                         st.markdown(f"{status_icon} {t.get('time','')} — **{t.get('task_type','')}**")
                 else:
                     st.caption("No tasks yet today!")
-            except:
+            except Exception:
                 st.caption("Error loading tasks")
 
         # Main area
@@ -4893,7 +4980,7 @@ def show_user_page():
                             st.markdown(f"{icon} **#{arr.get('arrangement_no','')}** | {arr.get('distributor','')} | **{status}**")
                     else:
                         st.info("No arrangements placed today!")
-                except:
+                except Exception:
                     pass
 
             except Exception as e:
@@ -4964,12 +5051,12 @@ def show_user_page():
                     .eq("date", date_str()).execute()
                 tasks = resp.data or []
                 if tasks:
-                    for t in sorted(tasks, key=lambda x: x.get("time","")):
+                    for t in sorted(tasks, key=lambda x: time_sort_key(x.get("time",""))):
                         status_icon = "🔄" if t.get("status")=="In Progress" else "✅"
                         st.markdown(f"{status_icon} {t.get('time','')} — **{t.get('task_type','')}**")
                 else:
                     st.caption("No tasks yet today!")
-            except:
+            except Exception:
                 st.caption("Error loading tasks")
 
         # Main area (sidebar is hidden on phones -> everything reachable from here)
@@ -5211,7 +5298,7 @@ def show_user_page():
             try:
                 df["sort_time"] = pd.to_datetime(df["time"], format="%I:%M %p", errors="coerce")
                 df = df.sort_values("sort_time").drop(columns=["sort_time"])
-            except:
+            except Exception:
                 pass
             display_rows = []
             total_sku = 0
@@ -5226,7 +5313,7 @@ def show_user_page():
                 if row.get("task_type") == "Purchase Order":
                     try:
                         sku = int(float(details.get("no_sku",0) or 0))
-                    except:
+                    except Exception:
                         sku = 0
                     po_dist = details.get("distributor","")
                     po_area_txt = details.get("area","")
@@ -5250,7 +5337,7 @@ def show_user_page():
                 elif row.get("task_type") in ["Order Import","Customer Items Check","Customer Items Received","Customer Delivery Update"]:
                     try:
                         sku = int(float(details.get("lines",0) or 0))
-                    except:
+                    except Exception:
                         sku = 0
                     if row.get("task_type") == "Order Import":
                         extra = f"{details.get('area','')} | {sku} new items ({details.get('file_lines','')} in file)"
@@ -5264,7 +5351,7 @@ def show_user_page():
                     arr_no_row = str(details.get("arrangement_no",""))
                     try:
                         sku = int(float(arr_meds_lookup.get(arr_no_row, details.get("no_medicines",0)) or 0))
-                    except:
+                    except Exception:
                         sku = 0
                     arr_area_txt = arr_area_lookup.get(arr_no_row) or details.get("area","")
                     parts = [f"#{arr_no_row}" if arr_no_row else "", details.get("distributor",""), arr_area_txt]
@@ -7337,13 +7424,22 @@ def save_delivery(changes, label):
 
 # ── LOAD ALL ROWS (Supabase returns max 1000 per request) ─────────────────────
 def fetch_all(table, build=None, page=1000, max_rows=50000):
-    """Fetch every matching row in pages. build(query) adds filters."""
-    rows, start = [], 0
+    """Fetch every matching row in pages. build(query) adds filters.
+    Pages need a fixed order, otherwise the database can skip or repeat rows between pages."""
+    rows, start, by_id = [], 0, True
     while start < max_rows:
         q = supabase.table(table).select("*")
         if build:
             q = build(q)
-        data = q.range(start, start + page - 1).execute().data or []
+        has_order = any(s[0] == "a" and s[1] == "order" for s in getattr(q, "_c", ()))
+        try:
+            qq = q.order("id") if (by_id and not has_order) else q
+            data = qq.range(start, start + page - 1).execute().data or []
+        except Exception:
+            if not by_id or has_order or start:
+                raise
+            by_id = False                          # table without an "id" column
+            data = q.range(start, start + page - 1).execute().data or []
         rows += data
         if len(data) < page:
             break
@@ -8584,7 +8680,7 @@ def show_my_assigned_tasks():
             due = "Today" if r.get("due_date") == date_str() else f"⚠️ Due {r.get('due_date')}"
             c1, c2 = st.columns([3, 2])
             with c1:
-                st.markdown(f"{icon} **{r.get('title','')}**  \n<small>{due} · from {r.get('assigned_by','')}</small>", unsafe_allow_html=True)
+                st.markdown(f"{icon} **{_esc(str(r.get('title','')))}**  \n<small>{_esc(str(due))} · from {_esc(str(r.get('assigned_by','')))}</small>", unsafe_allow_html=True)
                 if r.get("details"):
                     st.caption(r["details"])
             with c2:
@@ -8713,8 +8809,8 @@ def show_assign_tasks_admin(kp="asg"):
         with c1:
             late = " · ⚠️ overdue" if str(r.get("due_date")) < date_str() and r.get("status") in ("Pending", "In Progress") else ""
             rep = " · 🔁" if r.get("template_id") else ""
-            st.markdown(f"{PRIORITY_ICON.get(r.get('priority'),'🟢')} **{r.get('title','')}**{rep}  \n"
-                        f"<small>👤 {r.get('assigned_to','')} · due {r.get('due_date','')}{late}</small>", unsafe_allow_html=True)
+            st.markdown(f"{PRIORITY_ICON.get(r.get('priority'),'🟢')} **{_esc(str(r.get('title','')))}**{rep}  \n"
+                        f"<small>👤 {_esc(str(r.get('assigned_to','')))} · due {_esc(str(r.get('due_date','')))}{late}</small>", unsafe_allow_html=True)
             if r.get("note"):
                 st.caption(f"📝 {r['note']}")
         with c2:
@@ -9630,7 +9726,6 @@ def _mark_not_ordered(area, d, pending, live, by_id):
 # the order/invoice file per order (Order No, Store, Product, Qty, Free, Scheme ...).
 # Uploading those files here marks the matching order-sheet medicines as Ordered.
 import difflib
-from datetime import timedelta
 
 PR_COLS = {"orderno": "order_no", "orderdate": "order_date", "store": "store", "product": "product",
            "productname": "product", "itemname": "product", "productcode": "product_code", "qty": "qty",
@@ -10879,9 +10974,12 @@ def sync_form_with_link(team):
 def restore_timer(key, task_name=None):
     """After a refresh: pick up the 'In Progress' record saved when Start was pressed"""
     name = task_name or key.replace("_", " ").title()
+    days = [date_str()]
+    if now_ist().hour < 6:          # night work: a task started before midnight is saved on yesterday's date
+        days.append((today_ist() - timedelta(days=1)).strftime("%Y-%m-%d"))
     try:
-        rows = supabase.table("daily_tasks").select("id,start_time,time").eq("person", st.session_state.name)\
-            .eq("date", date_str()).eq("status", "In Progress").eq("task_type", name).execute().data or []
+        rows = supabase.table("daily_tasks").select("id,start_time,time,date").eq("person", st.session_state.name)\
+            .in_("date", days).eq("status", "In Progress").eq("task_type", name).execute().data or []
     except Exception:
         return False
     if not rows:
@@ -10896,7 +10994,11 @@ def restore_timer(key, task_name=None):
     t = parse_task_time(keep.get("start_time") or keep.get("time"))
     if not t:
         return False
-    start = IST.localize(datetime.combine(today_ist(), t.time()))
+    try:
+        day = datetime.strptime(str(keep.get("date") or date_str()), "%Y-%m-%d").date()
+    except Exception:
+        day = today_ist()
+    start = IST.localize(datetime.combine(day, t.time()))
     if start > now_ist():
         return False
     st.session_state[f"{key}_start"] = start
@@ -13329,8 +13431,8 @@ def show_no_clockout(S, kp):
     for r in rows:
         c1, c2 = st.columns([4, 2])
         with c1:
-            st.markdown(f"**{r['Person']}** · {r['Team']} · in {r['Clocked in']} · last task {r['Last task']}  \n"
-                        f"<span style='opacity:0.7'>No clock-out on {r['No clock-out (7 days)']}</span>",
+            st.markdown(f"**{_esc(str(r['Person']))}** · {_esc(str(r['Team']))} · in {_esc(str(r['Clocked in']))} · last task {_esc(str(r['Last task']))}  \n"
+                        f"<span style='opacity:0.7'>No clock-out on {_esc(str(r['No clock-out (7 days)']))}</span>",
                         unsafe_allow_html=True)
         with c2:
             ph = re.sub(r"\D", "", r["Phone"] or "")
@@ -13699,13 +13801,13 @@ def show_admin_page():
         try:
             tasks_resp = supabase.table("daily_tasks").select("*").eq("date", date_str()).execute()
             df = pd.DataFrame(tasks_resp.data) if tasks_resp.data else pd.DataFrame()
-        except:
+        except Exception:
             df = pd.DataFrame()
 
         try:
             arr_resp = supabase.table("arrangements").select("*").eq("order_placed_date", date_str()).execute()
             arr_today = arr_resp.data if arr_resp.data else []
-        except:
+        except Exception:
             arr_today = []
 
         # ── ALERTS & BOTTLENECKS ──────────────────────────────────────────────
@@ -13724,7 +13826,7 @@ def show_admin_page():
                         hours = diff_mins // 60
                         mins  = diff_mins % 60
                         alerts.append(f"⚠️ **#{arr.get('arrangement_no')}** — {arr.get('distributor','')} stuck at **{status}** for **{hours}h {mins}m**!")
-                except:
+                except Exception:
                     pass
 
         pending_self = [a for a in arr_today if a.get("status")=="Pending" and a.get("pickup_type")=="Self Pick"]
@@ -13742,7 +13844,7 @@ def show_admin_page():
                 for u in all_users.data:
                     if u["name"] not in active_persons:
                         alerts.append(f"⚠️ **{u['name']}** ({u['team']}) — No activity today!")
-        except:
+        except Exception:
             pass
 
         # Show as expander
@@ -13772,7 +13874,7 @@ def show_admin_page():
                             new_t    = dt.strptime(str(row.get("time","12:00 AM")), "%I:%M %p")
                             if new_t > existing:
                                 latest_tasks[person] = row
-                        except:
+                        except Exception:
                             pass
 
             # Team filter
@@ -13829,7 +13931,7 @@ def show_admin_page():
                     diff = int((u-o).total_seconds()/60)
                     if diff > 0:
                         pipeline_times.append(diff)
-                except:
+                except Exception:
                     pass
             if pipeline_times:
                 avg_t = int(sum(pipeline_times)/len(pipeline_times))
@@ -13896,7 +13998,7 @@ def show_admin_page():
                 try:
                     areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
                     no_area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-                except:
+                except Exception:
                     no_area_list = ["All Areas"]
                 no_area = st.selectbox("Area", no_area_list, key="no_area")
             with c3:
@@ -14055,7 +14157,7 @@ def show_admin_page():
                                             mime="image/jpeg",
                                             key=f"dl_inv_{r['Bill No']}"
                                         )
-                                    except:
+                                    except Exception:
                                         st.info(removed_photo_note(img_name) or "Image not available")
 
                     buf = io.BytesIO()
@@ -14077,7 +14179,7 @@ def show_admin_page():
             try:
                 areas_resp = supabase.table("areas").select("name").eq("active", True).execute()
                 area_list = ["All Areas"] + [a["name"] for a in areas_resp.data]
-            except:
+            except Exception:
                 area_list = ["All Areas"]
             pipeline_area = st.selectbox("Area", area_list, key="pipeline_area_tab")
         with c3:
@@ -14143,7 +14245,7 @@ def show_admin_page():
                         .eq("active",True).neq("role","admin").execute()
                     person_list = [u["name"] for u in (users_resp.data or [])]
                     teams_dict  = {u["name"]: u["team"] for u in (users_resp.data or [])}
-                except:
+                except Exception:
                     person_list = []
                     teams_dict  = {}
                 sel_person = st.selectbox("Select Person", person_list, key="perf_person")
@@ -14173,7 +14275,7 @@ def show_admin_page():
                         .eq("person", sel_person)\
                         .eq("date", yesterday_str).execute()
                     yest_tasks = yest_resp.data or []
-                except:
+                except Exception:
                     tasks = []
                     yest_tasks = []
 
@@ -14300,14 +14402,14 @@ def show_admin_page():
             try:
                 areas_resp = supabase.table("areas").select("name").eq("active",True).execute()
                 area_list = ["All Areas"] + [a["name"] for a in (areas_resp.data or [])]
-            except:
+            except Exception:
                 area_list = ["All Areas"]
             dash_area = st.selectbox("Area", area_list, key="dash_area")
         with c3:
             try:
                 users_resp = supabase.table("app_users").select("name").eq("team","Stock").eq("active",True).execute()
                 person_list = ["All Persons"] + [u["name"] for u in (users_resp.data or [])]
-            except:
+            except Exception:
                 person_list = ["All Persons"]
             dash_person = st.selectbox("Person", person_list, key="dash_person")
 
@@ -14412,7 +14514,7 @@ def show_admin_page():
         try:
             stock_users = supabase.table("app_users").select("name").eq("team","Stock").eq("active",True).execute()
             stock_names = [u["name"] for u in (stock_users.data or [])]
-        except:
+        except Exception:
             stock_names = list(set([t.get("person","") for t in cross_tasks + upload_tasks + place_tasks]))
 
         person_rows = []
@@ -14563,7 +14665,7 @@ def show_admin_page():
                         diff = int((u-o).total_seconds()/60)
                         if diff > 0:
                             pipeline_times.append(diff)
-                    except:
+                    except Exception:
                         pass
                 avg_pipeline = round(sum(pipeline_times)/len(pipeline_times),0) if pipeline_times else 0
                 st.metric("⏱️ Avg Pipeline Time", f"{int(avg_pipeline)} mins")
@@ -14651,7 +14753,7 @@ def show_admin_page():
         try:
             tasks_resp = supabase.table("daily_tasks").select("*").eq("date", perf_date_str).execute()
             tasks = tasks_resp.data if tasks_resp.data else []
-        except:
+        except Exception:
             tasks = []
 
         if not tasks:
@@ -14704,7 +14806,7 @@ def show_admin_page():
                                 st.error(f"❌ Username already exists!")
                             else:
                                 supabase.table("app_users").insert({
-                                    "username": new_username, "password": new_password,
+                                    "username": new_username.strip(), "password": new_password,
                                     "name": new_name, "team": new_team,
                                     "role": new_role, "active": True,
                                     **({"phone": new_phone.strip()} if new_phone.strip() else {})
@@ -14764,10 +14866,12 @@ def show_admin_page():
                             if u.get("active"):
                                 if st.button("Deactivate", key=f"deact_{u['id']}"):
                                     supabase.table("app_users").update({"active": False}).eq("id", u["id"]).execute()
+                                    load_users.clear()
                                     st.rerun()
                             else:
                                 if st.button("Activate", key=f"act_{u['id']}"):
                                     supabase.table("app_users").update({"active": True}).eq("id", u["id"]).execute()
+                                    load_users.clear()
                                     st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -14897,6 +15001,7 @@ def show_forms_section():
     with tabs[9]: form_other_task()
 
 def main():
+    _timer_save_done()      # placeholder of a task finished in the previous run (form saved elsewhere)
     if not st.session_state.logged_in:
         show_login()
     else:
