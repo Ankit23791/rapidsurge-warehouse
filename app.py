@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 2:05 PM"
+APP_VERSION = "v14-Oct 2:30 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -2256,7 +2256,8 @@ def arrival_label(a, now=None, live=True):
     """live=False -> text that never changes (safe for a dropdown); live=True adds 'Xm ago' and 'n/N entered'"""
     t = to_ist(a.get("arrived_at"))
     via = a.get("brought_by_name") or a.get("brought_by") or ""
-    base = (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills"
+    base = (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} "
+            + ("ARR bills" if a.get("order_type") == "Arrangement" else "bills")
             + (f" · via {via}" if via else "") + f" · arrived {t.strftime('%I:%M %p') if t else ''}")
     if not live:
         return base
@@ -2308,9 +2309,11 @@ def show_arrival_button():
                 d = st.selectbox(f"Distributor {i + 1} *", DISTRIBUTORS + ["Other"], key=f"arr_in_dist_{ver}_{i}")
                 if d == "Other":
                     d = st.text_input(f"Distributor {i + 1} name *", key=f"arr_in_dname_{ver}_{i}").strip()
+                t = st.radio("Type", ["Normal Order", "Arrangement"], horizontal=True, key=f"arr_in_type_{ver}_{i}",
+                             label_visibility="collapsed")
             with c2:
                 n = st.number_input("Bills *", 1, 100, 1, key=f"arr_in_n_{ver}_{i}")
-            rows.append((d, int(n)))
+            rows.append((d, int(n), t))
         b1, b2 = st.columns(2)
         with b1:
             if st.button("➕ Add another distributor", key=f"arr_in_add_{ver}", width='stretch'):
@@ -2322,16 +2325,16 @@ def show_arrival_button():
                 st.rerun()
         who = by_name if by in ("Delivery Pilot", "Other") and by_name else by
         photo = st.camera_input(f"📷 Live photo — {who} holding all the bills", key=f"arr_in_cam_{ver}")
-        total = sum(n for _, n in rows)
+        total = sum(r[1] for r in rows)
         c1, c2 = st.columns(2)
         with c1:
             if st.button(f"✅ Save arrival ({total} bill{'s' if total != 1 else ''})", type="primary", width='stretch',
                          key="arr_in_save", disabled=photo is None):
-                names = [d for d, _ in rows]
-                if any(not d for d in names):
+                names = [(d, t) for d, _, t in rows]
+                if any(not d for d, _ in names):
                     st.error("Write the distributor name.")
                 elif len(set(names)) < len(names):
-                    st.error("The same distributor is listed twice — put all its bills in one line.")
+                    st.error("The same distributor + type is listed twice — put those bills in one line.")
                 elif by == "Other" and not by_name.strip():
                     st.error("Write who brought the bills.")
                 else:
@@ -2343,8 +2346,9 @@ def show_arrival_button():
                             supabase.table("bill_arrivals").insert([{
                                 "date": date_str(), "area": area, "distributor": d, "bills": n, "photo": pic,
                                 "arrived_at": now_s, "logged_by": st.session_state.name, "team": st.session_state.get("team"),
-                                "brought_by": by, "brought_by_name": by_name.strip() or None, "group_id": gid}
-                                for d, n in rows]).execute()
+                                "brought_by": by, "brought_by_name": by_name.strip() or None, "group_id": gid,
+                                "order_type": t}
+                                for d, n, t in rows]).execute()
                             st.session_state["arr_in_open"] = False
                             st.session_state["arr_in_v"] = ver + 1
                             if wa not in areas:
@@ -2354,7 +2358,8 @@ def show_arrival_button():
                                     pass
                             st.session_state["arr_in_msg"] = (
                                 f"✅ {total} bill(s) arrived at {time_str()} via {who} — "
-                                + ", ".join(f"{d} {n}" for d, n in rows) + ". Clock started — do 📒 Register Entry for each bill.")
+                                + ", ".join(f"{d} {n}" + (" (ARR)" if t == "Arrangement" else "") for d, n, t in rows)
+                                + ". Clock started — do 📒 Register Entry for each bill.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Could not save: {e} — did you run bill_arrival_v2.sql?")
@@ -2393,6 +2398,10 @@ def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills n
         show_image(a.get("photo"), caption=f"Logged by {a.get('logged_by')}", key=f"wa_img_{a['id']}", width=420)
 
 
+ARR_BEFORE_WAREHOUSE = ["Pending", "Porter Booked", "Picked Up", "Picked", "Picked Up - In Transit",
+                        "Handed Over", "Delivered"]
+
+
 def form_register_entry():
     st.subheader("📒 Register Entry")
     st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
@@ -2419,34 +2428,6 @@ def form_register_entry():
         my_area = None if _pick == "All Areas" else _pick
     # Order type + arrangement picker OUTSIDE the form so the ARR list appears immediately
     order_type = st.radio("Order Type *", ["Normal Order","Arrangement"], horizontal=True, key="re_type")
-    arr_no, arr_dist, arr_area, arr_inv = "", None, None, ""
-    if order_type == "Arrangement":
-        try:
-            from datetime import timedelta
-            two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
-            resp = supabase.table("arrangements").select("*")\
-                .eq("status", "Reached Warehouse")\
-                .gte("order_placed_date", two_days_ago)\
-                .execute()
-            reg_done = supabase.table("daily_tasks").select("details")\
-                .eq("task_type", "Register Entry").gte("date", two_days_ago).execute()
-            registered = set(str((t.get("details") or {}).get("arrangement_no","")) for t in (reg_done.data or []))
-            arr_list = [a for a in (resp.data or []) if str(a.get("arrangement_no","")) not in registered
-                        and (not my_area or a.get("area") == my_area)]
-            if arr_list:
-                arr_map = {f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a for a in arr_list}
-                arr_select = st.selectbox("Arrangement No *", ["— Select Arrangement —"] + list(arr_map.keys()), key="re_arr")
-                if arr_select in arr_map:
-                    arr_no   = str(arr_map[arr_select].get("arrangement_no",""))
-                    arr_dist = arr_map[arr_select].get("distributor")
-                    arr_area = arr_map[arr_select].get("area")
-                    arr_inv  = arr_map[arr_select].get("invoice_no") or ""
-            else:
-                st.warning("No arrangements waiting for register entry. The ARR must first be marked "
-                           "'Reached Warehouse' in 📦 Receive Porter.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
     # 📥 which delivery is this bill from? (its clock started when the distributor arrived)
     done_msg = st.session_state.pop("re_done_msg", None)
     if done_msg:
@@ -2454,7 +2435,8 @@ def form_register_entry():
         st.balloons()
     arrival, arr_choice = None, None
     opens = [a for a in load_open_arrivals(2) if a.get("_entered", 0) < int(a.get("bills") or 0)
-             and (not my_area or a.get("area") == my_area)]
+             and (not my_area or a.get("area") == my_area)
+             and (a.get("order_type") or "Normal Order") == order_type]
     wa = st.session_state.get("work_area")
     opens.sort(key=lambda a: (a.get("area") != wa, str(a.get("arrived_at"))))
     NO_ARR = "⚠️ No arrival photo was taken"
@@ -2492,6 +2474,36 @@ def form_register_entry():
             if not opens:
                 st.info("No open arrivals. Take the 📥 live photo on the home screen first — or pick "
                         f"'{NO_ARR}' and give a reason.")
+    # Arrangement: pick the ARR (also ones still in transit — the arrival photo proves they reached)
+    arr_no, arr_dist, arr_area, arr_inv, arr_rec = "", None, None, "", None
+    if order_type == "Arrangement":
+        try:
+            two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+            resp = supabase.table("arrangements").select("*")\
+                .in_("status", ARR_BEFORE_WAREHOUSE + ["Reached Warehouse"])\
+                .gte("order_placed_date", two_days_ago).execute()
+            reg_done = supabase.table("daily_tasks").select("details")\
+                .eq("task_type", "Register Entry").gte("date", two_days_ago).execute()
+            registered = set(str((t.get("details") or {}).get("arrangement_no","")) for t in (reg_done.data or []))
+            arr_list = [x for x in (resp.data or []) if str(x.get("arrangement_no","")) not in registered
+                        and (not my_area or x.get("area") == my_area)
+                        and (not arrival or _bill_norm(x.get("distributor")) == _bill_norm(arrival.get("distributor")))]
+            if arr_list:
+                arr_map = {f"#{x.get('arrangement_no')} — {x.get('distributor','')} — {x.get('area','')}"
+                           + ("" if x.get("status") == "Reached Warehouse" else f" ({x.get('status')})"): x for x in arr_list}
+                arr_select = st.selectbox("Arrangement No *", ["— Select Arrangement —"] + list(arr_map.keys()), key="re_arr")
+                if arr_select in arr_map:
+                    arr_rec  = arr_map[arr_select]
+                    arr_no   = str(arr_rec.get("arrangement_no",""))
+                    arr_dist = arr_rec.get("distributor")
+                    arr_area = arr_rec.get("area")
+                    arr_inv  = arr_rec.get("invoice_no") or ""
+            else:
+                st.warning("No arrangement found" + (f" for **{arrival.get('distributor')}**" if arrival else "")
+                           + (f" in {my_area}" if my_area else "") + " in the last 2 days.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
     if arrival and not arr_dist:
         arr_dist = arrival.get("distributor")
     if arrival and not arr_area:
@@ -2585,6 +2597,12 @@ def form_register_entry():
                             "start_time": time_str(),
                             "end_time": time_str(),
                         }).execute()
+                        if order_type == "Arrangement" and arr_rec and arr_rec.get("status") in ARR_BEFORE_WAREHOUSE:
+                            try:
+                                supabase.table("arrangements").update({"status": "Reached Warehouse"})\
+                                    .eq("id", arr_rec["id"]).execute()
+                            except Exception:
+                                pass
                         left = ""
                         if arrival:
                             left_n = int(arrival.get("bills") or 0) - arrival.get("_entered", 0) - 1
