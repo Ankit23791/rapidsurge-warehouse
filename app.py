@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 9:45 AM"
+APP_VERSION = "v14-Oct 2:05 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -2252,15 +2252,16 @@ def load_open_arrivals(days=2):
     return sorted(arr, key=lambda a: str(a.get("arrived_at")))
 
 
-def arrival_label(a, now=None):
+def arrival_label(a, now=None, live=True):
+    """live=False -> text that never changes (safe for a dropdown); live=True adds 'Xm ago' and 'n/N entered'"""
     t = to_ist(a.get("arrived_at"))
-    age = fmt_age(int(((now or now_ist()) - t).total_seconds() // 60)) if t else ""
     via = a.get("brought_by_name") or a.get("brought_by") or ""
-    return (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills"
-            + (f" · via {via}" if via else "") + " · arrived "
-            f"{t.strftime('%I:%M %p') if t else ''}" + (f" ({age} ago)" if age else "")
-            + f" · {a.get('_entered', 0)}/{a.get('bills', 0)} entered")
-
+    base = (f"{a.get('distributor', '')} · {a.get('area', '')} · {a.get('bills', 0)} bills"
+            + (f" · via {via}" if via else "") + f" · arrived {t.strftime('%I:%M %p') if t else ''}")
+    if not live:
+        return base
+    age = fmt_age(int(((now or now_ist()) - t).total_seconds() // 60)) if t else ""
+    return base + (f" ({age} ago)" if age else "") + f" · {a.get('_entered', 0)}/{a.get('bills', 0)} entered"
 
 BROUGHT_BY = ["Distributor's person", "Delivery Pilot", "Porter", "Other"]
 
@@ -2284,7 +2285,10 @@ def show_arrival_button():
                    "with the person holding the bills**; the time is set by the app.")
         areas = load_areas()
         wa = st.session_state.get("work_area")
-        area = st.selectbox("Warehouse / Area *", areas, index=areas.index(wa) if wa in areas else 0, key=f"arr_in_area_{ver}")
+        _last = wa if wa in areas else get_app_setting(f"last_area_{st.session_state.name}", "")
+        area = st.selectbox("Warehouse / Area *", areas, index=areas.index(_last) if _last in areas else 0,
+                            key=f"arr_in_area_{ver}", disabled=wa in areas,
+                            help="Fixed to your work area" if wa in areas else None)
         by = st.radio("Brought by *", BROUGHT_BY, horizontal=True, key=f"arr_in_by_{ver}")
         by_name = ""
         if by == "Delivery Pilot":
@@ -2343,6 +2347,11 @@ def show_arrival_button():
                                 for d, n in rows]).execute()
                             st.session_state["arr_in_open"] = False
                             st.session_state["arr_in_v"] = ver + 1
+                            if wa not in areas:
+                                try:
+                                    set_app_setting(f"last_area_{st.session_state.name}", area)
+                                except Exception:
+                                    pass
                             st.session_state["arr_in_msg"] = (
                                 f"✅ {total} bill(s) arrived at {time_str()} via {who} — "
                                 + ", ".join(f"{d} {n}" for d, n in rows) + ". Clock started — do 📒 Register Entry for each bill.")
@@ -2388,6 +2397,26 @@ def form_register_entry():
     st.subheader("📒 Register Entry")
     st.caption("Quick entry when stock arrives — no need to make distributor/porter wait!")
 
+    my_area = st.session_state.get("work_area") if st.session_state.get("work_area") not in (None, "", "All Areas") else None
+    area_locked = bool(my_area)
+    if my_area:
+        st.caption(f"📍 Showing only **{my_area}** — your work area today.")
+    else:
+        # no fixed area (Purchase / managers): remember the area this person used last time
+        _key = f"last_area_{st.session_state.name}"
+        _areas = ["All Areas"] + load_areas()
+        if "re_my_area" not in st.session_state:
+            _last = get_app_setting(_key, "All Areas")
+            st.session_state["re_my_area"] = _last if _last in _areas else "All Areas"
+        _pick = st.selectbox("📍 Area", _areas, key="re_my_area",
+                             help="Remembered for next time — pick the warehouse where you are entering bills.")
+        if _pick != st.session_state.get("_re_area_saved"):
+            try:
+                set_app_setting(_key, _pick)
+            except Exception:
+                pass
+            st.session_state["_re_area_saved"] = _pick
+        my_area = None if _pick == "All Areas" else _pick
     # Order type + arrangement picker OUTSIDE the form so the ARR list appears immediately
     order_type = st.radio("Order Type *", ["Normal Order","Arrangement"], horizontal=True, key="re_type")
     arr_no, arr_dist, arr_area, arr_inv = "", None, None, ""
@@ -2402,7 +2431,8 @@ def form_register_entry():
             reg_done = supabase.table("daily_tasks").select("details")\
                 .eq("task_type", "Register Entry").gte("date", two_days_ago).execute()
             registered = set(str((t.get("details") or {}).get("arrangement_no","")) for t in (reg_done.data or []))
-            arr_list = [a for a in (resp.data or []) if str(a.get("arrangement_no","")) not in registered]
+            arr_list = [a for a in (resp.data or []) if str(a.get("arrangement_no","")) not in registered
+                        and (not my_area or a.get("area") == my_area)]
             if arr_list:
                 arr_map = {f"#{a.get('arrangement_no')} — {a.get('distributor','')} — {a.get('area','')}": a for a in arr_list}
                 arr_select = st.selectbox("Arrangement No *", ["— Select Arrangement —"] + list(arr_map.keys()), key="re_arr")
@@ -2423,7 +2453,8 @@ def form_register_entry():
         st.success(done_msg)
         st.balloons()
     arrival, arr_choice = None, None
-    opens = [a for a in load_open_arrivals(2) if a.get("_entered", 0) < int(a.get("bills") or 0)]
+    opens = [a for a in load_open_arrivals(2) if a.get("_entered", 0) < int(a.get("bills") or 0)
+             and (not my_area or a.get("area") == my_area)]
     wa = st.session_state.get("work_area")
     opens.sort(key=lambda a: (a.get("area") != wa, str(a.get("arrived_at"))))
     NO_ARR = "⚠️ No arrival photo was taken"
@@ -2433,11 +2464,19 @@ def form_register_entry():
         opts = [0] + list(a_by_id) + [-1]
         if st.session_state.get("re_arrival") not in opts:
             st.session_state.pop("re_arrival", None)
+        _lbl = {i: arrival_label(a, live=False) for i, a in a_by_id.items()}
+        _dup = {v for v in _lbl.values() if list(_lbl.values()).count(v) > 1}
+        _lbl = {i: (v + f" #{i}" if v in _dup else v) for i, v in _lbl.items()}
+        # the option texts must not change while the screen is open (the browser sends the text back)
         arr_choice = st.selectbox("📥 Arrival (distributor delivery) *", opts, key="re_arrival",
                                   format_func=lambda i: "— Select arrival —" if i == 0 else NO_ARR if i == -1
-                                  else arrival_label(a_by_id[i]),
-                                  help="Tap 📥 Distributor arrived on the home screen when the boy brings bills.")
+                                  else _lbl.get(i, f"arrival #{i}"),
+                                  help="Tap 📥 Bills arrived on the home screen when the bills come.")
         arrival = a_by_id.get(arr_choice)
+        if arrival:
+            _t = to_ist(arrival.get("arrived_at"))
+            st.caption(f"⏱️ Arrived {fmt_age(int((now_ist() - _t).total_seconds() // 60)) if _t else '?'} ago · "
+                       f"**{arrival.get('_entered', 0)}/{arrival.get('bills', 0)} bills entered**")
         if not arrival and isinstance(arr_choice, int) and arr_choice > 0:
             try:                                   # list was stale -> read the arrival directly
                 r = _sb_real.table("bill_arrivals").select("*").eq("id", arr_choice).execute().data or []
@@ -2490,7 +2529,11 @@ def form_register_entry():
                     default_re_area = area_options.index(arr_area)
                 elif st.session_state.get("work_area") and st.session_state.work_area in area_options:
                     default_re_area = area_options.index(st.session_state.work_area)
-                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area, key=f"re_area_{arr_no}_{(arrival or {}).get('id', '')}_{_fv}")
+                if my_area and my_area in area_options:
+                    default_re_area = area_options.index(my_area)
+                re_area = st.selectbox("Warehouse/Area *", area_options, index=default_re_area,
+                                       key=f"re_area_{arr_no}_{(arrival or {}).get('id', '')}_{my_area}_{_fv}",
+                                       disabled=area_locked, help="Fixed to your work area" if area_locked else None)
 
 
             bill_amount = st.number_input("Bill Amount (₹)", min_value=0.0, step=100.0, key=f"re_amount_{_fv}")
