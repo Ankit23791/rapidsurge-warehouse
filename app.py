@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 6:15 PM"
+APP_VERSION = "v14-Oct 8:50 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -5898,11 +5898,13 @@ def arrangement_line_picker():
                                                        (due_info(l, now) or (None, 10**9))[1],
                                                        str(l.get("imported_at") or ""), str(l.get("order_no"))))
         rows = []
+        _k = st.session_state.get("arr_keep_ticks") or {}       # ticks survive a 💾 Save of times / In Store
+        keep = _k.get("ticks", {}) if _k.get("ver") == ver else {}
         for l in open_lines:
             di = due_info(l, now)
             rows.append({
                 "id": l["id"],
-                "Order?": False,
+                "Order?": l["id"] in keep,
                 "Not ordering?": "",
                 "⏰": di[0] if di else age_flag(age_mins(l.get("imported_at"), now)),
                 "Date": _sched_label(l.get("scheduled_date")),
@@ -5915,7 +5917,7 @@ def arrangement_line_picker():
                 "Item": l.get("item_name", ""),
                 "Pack": l.get("pack_size", ""),
                 "Needed": remaining_qty(l),
-                "Order Qty": remaining_qty(l),
+                "Order Qty": keep.get(l["id"], remaining_qty(l)),
             })
         ldf = pd.DataFrame(rows)
         if not ldf["🔁"].astype(bool).any():
@@ -5957,6 +5959,7 @@ def arrangement_line_picker():
                     st.error(f"Error: {e}")
                 else:
                     st.session_state["arr_link_ver"] = ver + 1
+                    st.session_state["arr_keep_ticks"] = {"ver": ver + 1, "ticks": {int(r["id"]): r["Order Qty"] for r in picked}}
                     st.session_state["arr_dec_msg"] = f"✅ Saved: {ns} In Store · {nn} Not Available · {len(time_changes)} delivery time(s)"
                     st.rerun()
         if picked:
@@ -7297,7 +7300,7 @@ def build_bill_journeys(reg_from, reg_to, later_to):
             prev_end = e_ or prev_end
         rec["checked"], rec["uploaded"], rec["placed"] = [s.get("end") if s["task"] else None for s in rec["stages"]]
         # placement is needed only for bills uploaded from PLACEMENT_FROM on (older ones end at upload)
-        need_pl = PLACEMENT_STEP and not (rec["uploaded"] and rec["uploaded"].strftime("%Y-%m-%d") < PLACEMENT_FROM)
+        need_pl = PLACEMENT_STEP and not (rec["uploaded"] and rec["uploaded"].strftime("%Y-%m-%d %H:%M") < PLACEMENT_FROM)
         rec["need_pl"] = need_pl
         rec["next"] = next((s["label"] for s in rec["stages"]
                             if not s["task"] and (need_pl or s["label"] != "📍 Placement")), None)
@@ -7338,7 +7341,7 @@ def _issues(task):
     return ", ".join(out)
 
 PLACEMENT_STEP = True    # 📍 placement after bill upload (our team or the warehouse team)
-PLACEMENT_FROM = "2026-10-15"   # bills uploaded before this day end at upload (placement was not logged then)
+PLACEMENT_FROM = "2026-10-14 19:00"   # bills uploaded before this (IST) end at upload — placement was not logged then
 
 def show_live_pending_bills(area="All Areas", title="#### ⏳ Live — bills not yet done (check · upload · placement)"):
     """Bills of the last 7 days that are not placed yet, oldest first, for one area or all"""
@@ -10447,6 +10450,7 @@ STOCK_MENU = [
 ARR_STAGE = {
     "Pending": "🕐 Ordered — at distributor",
     "Porter Booked": "🚚 On the way", "Picked Up": "🚚 On the way", "Picked": "🚚 On the way",
+    "Picked Up - In Transit": "🚚 On the way",
     "Handed Over": "🚚 On the way", "Delivered": "🚚 On the way",
     "Reached Warehouse": "📦 Arrived — check bill",
     "Bill Cross Checked": "✔️ Checked — upload bill",
@@ -10467,6 +10471,26 @@ def show_incoming_arrangements(area, full=False):
     open_ = [a for a in arrs if a.get("status") not in DONE]
     done_today = [a for a in arrs if a.get("status") in DONE and a.get("order_placed_date") == date_str()]
     st.markdown(f"#### 📦 Incoming arrangement orders — {area}")
+    # 🛵 which Delivery Pilot is bringing which bill (after pickups / pilot-to-pilot handovers)
+    holder = {}
+    try:
+        for p, lst in pilots_carrying().items():
+            for a in lst:
+                holder[str(a.get("arrangement_no"))] = (p, a)
+    except Exception:
+        holder = {}
+    coming = {}
+    for a in open_:
+        h = holder.get(str(a.get("arrangement_no")))
+        if h:
+            coming.setdefault(h[0], []).append(h[1])
+    for p, lst in sorted(coming.items()):
+        st.info(f"🛵 **{p}** is bringing **{len(lst)} arrangement bill(s)**"
+                + ": "
+                + " · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}"
+                             + (f" → {a.get('area')}" if area in (None, "", "All Areas") else "")
+                             + (f" (from {a['_from']})" if a.get("_from") else "") for a in lst)
+                + " — when he arrives: 📥 Bills arrived → Delivery Pilot → " + p + " → ⬇️ Fill these bills")
     if not open_:
         st.success("No arrangement orders pending." + (f" ✅ {len(done_today)} done today." if done_today else ""))
         return
@@ -10512,9 +10536,11 @@ def show_incoming_arrangements(area, full=False):
             med_rows.append({"ARR #": a.get("arrangement_no", ""), "Medicine": m.get("item_name", ""),
                              "Customer": m.get("customer_name") or "", "Order #": m.get("order_no") or "",
                              "Deliver by": txt, "Status": stage, "_m": mins})
+        _h = holder.get(str(a.get("arrangement_no")))
         rows.append({"": "🔴" if u == "Very Urgent" else "🟡" if u == "Urgent" else "🟢",
                      "ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor", ""),
                      "Medicines": a.get("no_medicines", ""), "Status": stage,
+                     "Coming with": f"🛵 {_h[0]}" if _h else "",
                      "Customer deliver by": first[1] + (f" +{len(meds) - 1} more" if len(meds) > 1 and first[1] else ""),
                      "Ordered": (("Yday " if a.get("order_placed_date") != date_str() else "") + str(a.get("order_placed_time") or "")),
                      **({"Area": a.get("area", "")} if area in (None, "", "All Areas") else {}),
