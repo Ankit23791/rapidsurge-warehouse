@@ -625,7 +625,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v15-Oct fixes"
+APP_VERSION = "v16-Oct arrangement fixes"
 
 def show_sidebar():
     with st.sidebar:
@@ -2356,6 +2356,34 @@ def arrival_label(a, now=None, live=True):
 ARR_IN_TRANSIT = ["Picked Up", "Picked", "Picked Up - In Transit", "Handed Over", "Delivered", "Porter Booked"]
 
 
+def _arrival_credits(days=3):
+    """arrival photos of arrangement bills (last N days), oldest first, each with a bill count still to match"""
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        rows = fetch_all("bill_arrivals", lambda q: q.gte("date", lo))
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        if r.get("order_type") not in (None, "", "Arrangement"):
+            continue                                   # normal-order bills never clear an arrangement
+        out.append(dict(r, _left=int(_to_float(r.get("bills"), 0)), _at=_naive(to_ist(r.get("arrived_at")))))
+    return sorted(out, key=lambda r: (r["_at"] is None, r["_at"] or datetime.min))
+
+def _take_arrival(credits, distributor, area, after, by_name=None):
+    """use one bill of a matching arrival photo (same distributor + area, after `after`; brought by `by_name` if given)"""
+    dist = str(distributor or "").strip().lower()
+    for c in credits:
+        if c["_left"] <= 0 or str(c.get("distributor") or "").strip().lower() != dist or c.get("area") != area:
+            continue
+        if after and c["_at"] and c["_at"] < after:
+            continue
+        if by_name is not None and str(c.get("brought_by_name") or "").strip() != str(by_name).strip():
+            continue
+        c["_left"] -= 1
+        return True
+    return False
+
 def pilots_carrying():
     """{pilot: [arrangement rows he holds now]} — holder = last handover, else who picked it up"""
     lo = (today_ist() - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -2377,7 +2405,8 @@ def pilots_carrying():
             last_real[k] = h
     today = date_str()
     out = {}
-    for a in arrs:
+    credits = _arrival_credits()
+    for a in sorted(arrs, key=lambda a: str(a.get("picked_up_at") or a.get("created_at") or "")):
         k = str(a.get("arrangement_no"))
         h = last.get(k)
         holder = (h or {}).get("to_person") or a.get("pickup_by")
@@ -2385,6 +2414,8 @@ def pilots_carrying():
             continue
         hr = last_real.get(k)
         since = _naive(to_ist((hr or {}).get("at") or a.get("picked_up_at")))
+        if _take_arrival(credits, a.get("distributor"), a.get("area"), since, by_name=holder):
+            continue                                   # 📥 photo taken at the warehouse -> handed over, register entry pending
         nt = night.get(k)
         a = dict(a, _from=(hr or {}).get("from_person") if hr else None, _since=since,
                  _overnight=bool(since and since.strftime("%Y-%m-%d") < today),
@@ -2447,6 +2478,26 @@ def not_picked_arrangements(hours=3):
     return sorted(out, key=lambda a: -a["_age"])
 
 
+def not_arrived_distributor_deliveries(hours=4):
+    """'Distributor Delivers' orders with no arrival photo / register entry after N hours (last 2 days)"""
+    lo = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+    try:
+        rows = fetch_all("arrangements", lambda q: q.eq("status", "Pending").eq("pickup_type", "Distributor Delivers")
+                         .gte("order_placed_date", lo))
+    except Exception:
+        return []
+    credits = _arrival_credits()
+    now_n = now_ist().replace(tzinfo=None)
+    out = []
+    for a in sorted(rows, key=lambda a: str(a.get("created_at") or "")):
+        t = _naive(to_ist(a.get("created_at")))
+        if not t or (now_n - t).total_seconds() < hours * 3600:
+            continue
+        if _take_arrival(credits, a.get("distributor"), a.get("area"), t):
+            continue                                   # arrived (photo taken), only register entry pending
+        out.append(dict(a, _age=int((now_n - t).total_seconds() // 60)))
+    return sorted(out, key=lambda a: -a["_age"])
+
 def show_pilot_bills_alert(kp="pba"):
     """manager: bills still with pilots (red near the pilots' day end / overnight) + self-pick orders nobody picked"""
     carry = pilots_carrying()
@@ -2454,7 +2505,8 @@ def show_pilot_bills_alert(kp="pba"):
     late = (now_ist().hour, now_ist().minute) >= al
     n = sum(len(v) for v in carry.values())
     nopick = not_picked_arrangements()
-    if not n and not nopick:
+    noarr = not_arrived_distributor_deliveries()
+    if not n and not nopick and not noarr:
         return
     now_n = now_ist().replace(tzinfo=None)
     with st.container(border=True):
@@ -2478,6 +2530,12 @@ def show_pilot_bills_alert(kp="pba"):
             st.dataframe(pd.DataFrame([{"ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor", ""),
                                         "For": a.get("area", ""), "Ordered": fmt_age(a["_age"]) + " ago",
                                         "Ordered by": a.get("order_by", "")} for a in nopick]),
+                         hide_index=True, width='stretch')
+        if noarr:
+            st.warning(f"🚚 {len(noarr)} 'Distributor Delivers' order(s) not arrived for 4h+ — call the distributor")
+            st.dataframe(pd.DataFrame([{"ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor", ""),
+                                        "For": a.get("area", ""), "Ordered": fmt_age(a["_age"]) + " ago",
+                                        "Ordered by": a.get("order_by", "")} for a in noarr]),
                          hide_index=True, width='stretch')
 
 
@@ -7326,11 +7384,11 @@ def form_customer_delivery():
     with c1: area = st.selectbox("Area", ["All Areas"] + load_areas(), key="cd_area")
     with c2: show_done = st.toggle("Show already-marked orders", key="cd_done")
     since = IST.localize(datetime.combine(today_ist() - timedelta(days=7), datetime.min.time())).isoformat()
+    def build(q):
+        q = q.eq("removed", False).gte("imported_at", since)
+        return q.eq("area", area) if area != "All Areas" else q
     try:
-        q = supabase.table("customer_order_lines").select("*").eq("removed", False).gte("imported_at", since)
-        if area != "All Areas":
-            q = q.eq("area", area)
-        lines = q.execute().data or []
+        lines = fetch_all("customer_order_lines", build)     # paged: more than 1000 lines are no longer cut off
     except Exception as e:
         st.error(f"Could not load customer orders ({e})")
         return
@@ -7365,9 +7423,15 @@ def form_customer_delivery():
                                 "Delivery": l.get("delivery_status") or "",
                                 "Reason": l.get("delivery_reason") or ""} for l in x]),
                  hide_index=True, width='stretch')
+    not_ready = [l for l in x if not line_ready(l)]
+    sure = True
+    if not_ready:
+        st.warning(f"⏳ This order is not ready — {len(not_ready)} medicine(s) not received / not picked yet: "
+                   + ", ".join(str(l.get("item_name", "")) for l in not_ready[:5]) + ("…" if len(not_ready) > 5 else ""))
+        sure = st.checkbox("The customer really got everything — mark delivered anyway", key=f"cd_sure_{o}")
     b1, b2, b3 = st.columns([1, 2, 1])
     with b1:
-        if st.button("✅ Whole order delivered", key=f"cd_all_ok_{o}", type="primary", width='stretch'):
+        if st.button("✅ Whole order delivered", key=f"cd_all_ok_{o}", type="primary", width='stretch', disabled=not sure):
             save_delivery([(l["id"], "Delivered", None) for l in x], o)
     with b2:
         reason = st.selectbox("Reason", NOT_DELIVERED_REASONS, key=f"cd_reason_{o}", label_visibility="collapsed")
@@ -7388,6 +7452,9 @@ def form_customer_delivery():
                             column_config={"id": None,
                                            "Delivery": st.column_config.SelectboxColumn("Delivery", options=DELIVERY_CHOICES, required=True),
                                            "Reason": st.column_config.SelectboxColumn("Reason (if not delivered)", options=[""] + NOT_DELIVERED_REASONS)})
+        not_ready_ids = {l["id"] for _, xx in olist for l in xx if not line_ready(l)}
+        sure_lines = st.checkbox("Allow ✅ Delivered for medicines that are not received / picked yet",
+                                 key="cd_sure_lines")
         if st.button("💾 Save medicine-wise", key="cd_save_lines", type="primary"):
             old = {r["id"]: (r["Delivery"], r["Reason"]) for r in rows}
             changes, missing = [], 0
@@ -7399,8 +7466,12 @@ def form_customer_delivery():
                     continue
                 changes.append((int(r["id"]), "Delivered" if r["Delivery"].startswith("✅") else "Not Delivered",
                                 None if r["Delivery"].startswith("✅") else r["Reason"]))
+            early = [c for c in changes if c[1] == "Delivered" and c[0] in not_ready_ids]
             if missing:
                 st.error(f"{missing} medicine(s) marked Not Delivered without a reason — pick a reason.")
+            elif early and not sure_lines:
+                st.error(f"⏳ {len(early)} medicine(s) marked Delivered are not received / picked yet. "
+                         "Check again, or tick the box above to allow it.")
             elif changes:
                 st.session_state["cd_ver"] = ver + 1
                 save_delivery(changes, "medicine-wise")
