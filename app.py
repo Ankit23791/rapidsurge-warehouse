@@ -562,7 +562,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v14-Oct 9:30 PM"
+APP_VERSION = "v14-Oct 10:45 PM"
 
 def show_sidebar():
     with st.sidebar:
@@ -2266,7 +2266,7 @@ def arrival_label(a, now=None, live=True):
 
 
 # ── 🤝 PILOT HANDOVER + 📦 WHAT EACH DELIVERY PILOT IS CARRYING ───────────────
-ARR_IN_TRANSIT = ["Picked Up", "Picked", "Picked Up - In Transit", "Handed Over", "Delivered"]
+ARR_IN_TRANSIT = ["Picked Up", "Picked", "Picked Up - In Transit", "Handed Over", "Delivered", "Porter Booked"]
 
 
 def pilots_carrying():
@@ -2294,7 +2294,7 @@ def pilots_carrying():
         k = str(a.get("arrangement_no"))
         h = last.get(k)
         holder = (h or {}).get("to_person") or a.get("pickup_by")
-        if not holder:
+        if not holder or holder == "Distributor":
             continue
         hr = last_real.get(k)
         since = _naive(to_ist((hr or {}).get("at") or a.get("picked_up_at")))
@@ -3465,8 +3465,60 @@ def show_pickup_images():
                        f"Delivery by: {d.get('delivery_by','')} · Porter: {d.get('porter_no') or '—'} · "
                        f"Remarks: {d.get('remarks') or '—'}")
 
+def porter_direct_pickup():
+    """porter picks up straight from the distributor (nobody of ours there): purchase confirms the count by phone"""
+    lo = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+    try:
+        bks = fetch_all("porter_bookings", lambda q: q.eq("status", "Booked").gte("date", lo))
+    except Exception:
+        return
+    if not bks:
+        return
+    msg = st.session_state.pop("pdp_msg", None)
+    if msg:
+        st.success(msg)
+    with st.expander(f"📞 Porter picked up straight from the distributor? Confirm the count ({len(bks)} booked)", expanded=False):
+        st.caption("When the porter collects from the distributor (no pilot there), call the distributor / porter and "
+                   "enter how many bills and polythene he took. The stock team checks this count when he arrives.")
+        ver = st.session_state.get("pdp_v", 0)
+        opts = {f"🚛 {b.get('porter_no')} — {b.get('arrangement_nos', '')} (#{b.get('id')})": b for b in bks}
+        pick = st.selectbox("Porter booking *", list(opts), key=f"pdp_pick_{ver}")
+        b = opts[pick]
+        n_arr = len([x for x in str(b.get("arrangement_nos") or "").split(",") if x.strip()])
+        with st.form(f"pdp_form_{ver}"):
+            c1, c2 = st.columns(2)
+            with c1:
+                nb = st.number_input("Bills the porter took *", 0, 200, max(1, n_arr), key=f"pdp_b_{ver}")
+            with c2:
+                npoly = st.number_input("Polythene the porter took *", 0, 200, 1, key=f"pdp_p_{ver}")
+            src = st.text_input("Who confirmed? *", placeholder="e.g. distributor Ramesh on phone / porter", key=f"pdp_src_{ver}")
+            pic = st.file_uploader("Screenshot / photo from distributor (optional)", type=["jpg", "jpeg", "png"], key=f"pdp_img_{ver}")
+            go = st.form_submit_button("✅ Porter picked up", type="primary")
+        if not go:
+            return
+        if not src.strip():
+            st.error("Write who confirmed the count.")
+            return
+        img = upload_image(pic, "porter_direct") if pic is not None else ""
+        try:
+            supabase.table("porter_bookings").update({
+                "status": "Handed Over", "no_bills": str(nb), "no_polythene": str(npoly), "handover_time": time_str(),
+                "handover_by": f"{st.session_state.name} (confirmed by {src.strip()})", "handover_image": img}).eq("id", b["id"]).execute()
+            for a in [x.strip() for x in str(b.get("arrangement_nos") or "").split(",") if x.strip()]:
+                supabase.table("arrangements").update({"status": "Given to Porter - In Transit"}).eq("arrangement_no", a).execute()
+            log_simple_task("Porter Direct Pickup", {"porter_no": b.get("porter_no"), "arrangement_nos": b.get("arrangement_nos"),
+                                                     "no_bills": str(nb), "no_polythene": str(npoly), "confirmed_by": src.strip()})
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+            return
+        st.session_state["pdp_v"] = ver + 1
+        st.session_state["pdp_msg"] = f"✅ {b.get('porter_no')}: {nb} bill(s) · {npoly} polythene on the way — stock team will check the count."
+        st.rerun()
+
+
 def form_book_porter():
     st.subheader("🚛 Book Porter")
+    porter_direct_pickup()
 
     # Load pending arrangements
     try:
@@ -6606,11 +6658,30 @@ LINE_ICON = {"Closed": "🧹 Closed (old)", "Pending": "⏳ Pending", "Partly Ar
              "In Store": "🏪 In Store", "Received": "✅ Received", "Short": "⚠️ Short",
              "Not Available": "❌ Not Available"}
 
+def line_ready(l):
+    """a customer medicine is ready for the call: received / not available / short — or In Store AND picked from the shelf"""
+    stt = l.get("status")
+    if stt == "In Store":
+        return l.get("store_check") == "Picked"
+    return stt in ("Received", "Not Available", "Short", "Closed")
+
+
+def line_ready_at(l):
+    return to_ist(l.get("store_checked_at") if l.get("status") == "In Store" else l.get("completed_at"))
+
+
+def line_stage(l):
+    """status for the order tracker: In Store not yet picked from the shelf counts as still open"""
+    if l.get("status") == "In Store" and l.get("store_check") != "Picked":
+        return "To Pick"
+    return l.get("status", "Pending")
+
+
 def order_status(statuses):
     s = list(statuses)
     if all(x == "Pending" for x in s):
         return "⚪ Not Started"
-    if any(x in ("Pending", "Partly Arranged", "Arranged") for x in s):
+    if any(x in ("Pending", "Partly Arranged", "Arranged", "To Pick") for x in s):
         return "🔄 In Progress"
     if any(x in ("Not Available", "Short") for x in s):
         return "⚠️ Done – Partial"
@@ -6679,11 +6750,11 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
 
     order_rows = []
     for ono, ls in orders.items():
-        statuses = [l.get("status", "Pending") for l in ls]
+        statuses = [line_stage(l) for l in ls]
         stt = order_status(statuses)
         t0 = min([to_ist(l.get("imported_at")) for l in ls if to_ist(l.get("imported_at"))] or [now])
         done = stt in ("✅ Ready", "⚠️ Done – Partial")
-        t_end = max([to_ist(l.get("completed_at")) for l in ls if to_ist(l.get("completed_at"))] or [now]) if done else now
+        t_end = max([line_ready_at(l) for l in ls if line_ready_at(l)] or [now]) if done else now
         mins = max(0, int((t_end - t0).total_seconds() // 60))
         row = {
             "⏰": "🔴" if mins >= 180 else ("🟢" if done else age_flag(mins)),
@@ -6699,7 +6770,7 @@ def show_customer_order_tracker(kp="trk", show_phone=False):
             "Deliver by": (f"{di[0]} {ls[0].get('delivery_time')} ({di[2]})" if di and not done
                            else (ls[0].get("delivery_time") or "")),
             "Items": len(ls),
-            "🏪 Store": statuses.count("In Store"),
+            "🏪 Store": statuses.count("In Store") + statuses.count("To Pick"),
             "📦 Arranged": sum(1 for s in statuses if s in ("Arranged", "Partly Arranged")),
             "✅ Received": statuses.count("Received"),
             "⏳ Pending": statuses.count("Pending"),
@@ -6984,11 +7055,20 @@ def order_journey(order_no):
             add(None, f"⏳ Now: {nxt}", "", a_no, info=arr.get("status", ""))
 
     # 4) all medicines ready, then the call
-    READY = ("In Store", "Received", "Not Available", "Short", "Closed")
-    if all(l.get("status") in READY for l in lines):
-        done_t = [_j_ts(l.get("completed_at")) for l in lines if l.get("completed_at")]
+    picked = [l for l in lines if l.get("status") == "In Store" and l.get("store_checked_at")]
+    if picked:
+        nf = [l for l in picked if l.get("store_check") != "Picked"]
+        add(max(_j_ts(l["store_checked_at"]) for l in picked), "🏪 Picked from the shelf",
+            ", ".join(sorted({l.get("store_checked_by") or "" for l in picked} - {""})),
+            info=f"{len(picked) - len(nf)} picked" + (f" · ⚠️ {len(nf)} not found" if nf else ""))
+    to_pick = [l for l in lines if l.get("status") == "In Store" and l.get("store_check") != "Picked"]
+    if to_pick:
+        add(None, f"⏳ Now: {len(to_pick)} in-store medicine(s) to pick from the shelf", "",
+            info=", ".join(l.get("item_name", "") for l in to_pick[:5]))
+    if all(line_ready(l) for l in lines):
+        done_t = [_naive(line_ready_at(l)) for l in lines if line_ready_at(l)]
         add(max(done_t) if done_t else None, "✅ All medicines ready", "",
-            info="everything in store / received")
+            info="everything picked from the shelf / received")
     called = [l for l in lines if l.get("delivery_status")]
     if called:
         n_ok = sum(1 for l in called if l.get("delivery_status") == "Delivered")
@@ -7180,9 +7260,9 @@ def form_customer_delivery():
         return
 
     def ready(x):
-        return all(l.get("status") in ("In Store", "Received", "Not Available", "Short") for l in x)
+        return all(line_ready(l) for l in x)
     olist = sorted(orders.items(), key=lambda kv: (not ready(kv[1]), str(min(l.get("imported_at", "") for l in kv[1]))))
-    st.markdown(f"**{len(olist)} orders** · 🟢 ready = all medicines in store / received")
+    st.markdown(f"**{len(olist)} orders** · 🟢 ready = in-store medicines picked from the shelf + the rest received")
 
     # quick whole-order action
     labels = {f"{'🟢' if ready(x) else '⏳'} #{o} — {x[0].get('customer_name','')} — {x[0].get('customer_phone','')} — {len(x)} medicine(s)": o
@@ -8085,8 +8165,8 @@ def clock_out_panel(s, active_key):
         with st.container(border=True):
             st.error(f"🛑 You still have {len(held)} arrangement bill(s): "
                      + " · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')} → {a.get('area', '')}" for a in held)
-                     + ". Give them to a warehouse (stock team takes the 📥 photo) or hand them to another pilot "
-                       "(🤝 on your home screen) before clocking out.")
+                     + ". Give them to a warehouse (stock team takes the 📥 photo), hand them to another pilot "
+                       "(🤝 on your home screen) or to the booked porter (🚛 Handover to Porter) before clocking out.")
             show_overnight_form(st.session_state.name, held, "on_out")
             if st.button("✖️ Not now", key="att_out_no_held", width='stretch'):
                 st.session_state["att_confirm_out"] = False
@@ -10588,9 +10668,11 @@ def show_incoming_arrangements(area, full=False):
     except Exception:
         _pbk = []
     for b in _pbk:
+        _with = sorted({holder[str(a.get("arrangement_no"))][0] for a in b.get("_arrs") or []
+                        if str(a.get("arrangement_no")) in holder and not str(holder[str(a.get("arrangement_no"))][0]).startswith("🚛")})
         for a in b.get("_arrs") or []:
             holder.setdefault(str(a.get("arrangement_no")), (f"🚛 {b.get('porter_no') or 'Porter'}", a))
-        st.info(f"{porter_label(b)}: " + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}"
+        st.info(f"{porter_label(b)}" + (f" (will collect from {', '.join(_with)})" if _with and b.get("status") == "Booked" else "") + ": " + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}"
                                                      for a in b.get("_arrs") or []) or "—")
                 + " — when he arrives: 📥 Bills arrived → Porter → pick this booking → ⬇️ Fill these bills")
     coming = {}
