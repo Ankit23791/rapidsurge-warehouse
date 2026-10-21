@@ -629,7 +629,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v18.1-Oct sidebar fix"
+APP_VERSION = "v18.3-Oct PharmaRack format"
 
 def show_sidebar():
     with st.sidebar:
@@ -10055,6 +10055,63 @@ def _pr_already_imported(order_nos):
     return out
 
 
+PR_SAMPLE = pd.DataFrame([
+    {"Order No": "PR1045821", "Order Date": "2026-10-21", "Store": "Jai Medical Agency", "Product": "Atorva 20 Tablet 15'S",
+     "Product Code": "ATO20", "Qty": 6, "Free": 1, "Scheme": "5+1", "PTR": 85.50, "Amount": 513.00, "Total": 1213.00},
+    {"Order No": "PR1045821", "Order Date": "2026-10-21", "Store": "Jai Medical Agency", "Product": "Pan 40 Tablet 15'S",
+     "Product Code": "PAN40", "Qty": 10, "Free": 0, "Scheme": "", "PTR": 70.00, "Amount": 700.00, "Total": 1213.00},
+])
+
+
+def pharmarack_template():
+    notes = pd.DataFrame({"How to fill": [
+        "Normally you upload the file PharmaRack gives you after placing the order — you don't need to type it.",
+        "Required columns: Product and Qty. Store = distributor name (as in the app's distributor list).",
+        "Order No groups the rows of one order. One file can have one order or many orders.",
+        "Optional: Order Date, Product Code, Free, Scheme, PTR, Amount, Total.",
+        "Header spelling can vary a little: Product Name / Item Name, Quantity, Order No.",
+        "The header row does not have to be the first row (top 15 rows are searched).",
+        "File type: .xlsx, .xls or .csv. Delete the two example rows before uploading.",
+        "Store: pick from the drop-down, or copy a name from the 'Distributors' sheet (the app's distributor list).",
+    ]})
+    names = sorted(DISTRIBUTORS, key=str.lower)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        PR_SAMPLE.to_excel(w, index=False, sheet_name="PharmaRack Order")
+        notes.to_excel(w, index=False, sheet_name="How to fill")
+        pd.DataFrame({"Distributor (use this exact name in Store)": names}).to_excel(w, index=False, sheet_name="Distributors")
+        try:
+            from openpyxl.worksheet.datavalidation import DataValidation
+            ws = w.sheets["PharmaRack Order"]
+            col = get_column_letter_safe(list(PR_SAMPLE.columns).index("Store") + 1)
+            dv = DataValidation(type="list", formula1=f"=Distributors!$A$2:$A${len(names) + 1}", allow_blank=True,
+                                showErrorMessage=False)
+            dv.prompt, dv.promptTitle, dv.showInputMessage = "Pick the distributor", "Store", True
+            ws.add_data_validation(dv)
+            dv.add(f"{col}2:{col}500")
+            for sheet, width in (("PharmaRack Order", 22), ("Distributors", 48), ("How to fill", 110)):
+                for c in w.sheets[sheet].columns:
+                    w.sheets[sheet].column_dimensions[c[0].column_letter].width = width
+        except Exception:
+            pass                                   # drop-down is a convenience; the list sheet is always there
+    return buf.getvalue()
+
+
+def get_column_letter_safe(n):
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(n)
+
+
+def show_pharmarack_format(kp="pr_fmt"):
+    with st.expander("📄 File format — what the PharmaRack file should look like"):
+        st.caption("**Product** and **Qty** are required · **Store** = distributor · **Order No** groups one order's rows · "
+                   "other columns optional. Header spelling can vary a little (Product Name, Quantity, Order No). "
+                   "The Excel has a **Distributors** sheet with every distributor name and a drop-down in the Store column.")
+        st.dataframe(PR_SAMPLE, hide_index=True, width='stretch')
+        st.download_button("⬇️ Download format (Excel)", pharmarack_template(), "pharmarack-order-format.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=kp)
+
+
 def _pr_label(l):
     return f"{l.get('item_name', '')} · {l.get('pack_size', '')} · R{l.get('round')} #{l['id']}"
 
@@ -10063,6 +10120,7 @@ def _pharmarack_upload(area, d, pending, by_id, start):
     st.caption("Upload the order file(s) you downloaded from PharmaRack after placing the order — one file per order, "
                "as many files as you like. Each order's distributor is read from the **Store** column, and each "
                "product is matched to the medicine in today's order sheet. Check the matches, then save.")
+    show_pharmarack_format()
     ver = st.session_state.get("pr_ver", 0)
     files = st.file_uploader("PharmaRack order file(s) (.csv / .xlsx)", type=["csv", "xlsx", "xls"],
                              accept_multiple_files=True, key=f"pr_files_{ver}")
