@@ -625,7 +625,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v16-Oct arrangement fixes"
+APP_VERSION = "v18-Oct order follow-up"
 
 def show_sidebar():
     with st.sidebar:
@@ -834,7 +834,10 @@ def form_purchase_order():
             no_sku      = st.number_input("No of SKUs", min_value=0, step=1)
         with c2:
             mode        = st.selectbox("Mode", ["Through Call","Pharma Rack","Excel Send"], key="po_mode")
-            urgency     = st.selectbox("Urgency", ["Normal","Urgent","Very Urgent"], key="po_urgency")
+            urgency     = st.selectbox("Urgency", ["Regular", "Very Urgent"], key="po_urgency",
+                                       help="🔴 Very Urgent = must be in the software today · Regular = by tomorrow")
+            po_inv      = st.text_input("Invoice No (if you have it now)", key="po_inv",
+                                        help="Can be added later in 🚚 Order Follow-up")
         remarks = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
             if po_area == "— Select Area —":
@@ -851,7 +854,8 @@ def form_purchase_order():
                     "task_type": "Purchase Order",
                     "details": {"distributor": distributor, "area": po_area, "order_type": order_type,
                                "no_sku": str(no_sku), "mode": mode, "urgency": urgency,
-                               "remarks": remarks},
+                               "remarks": remarks,
+                               **({"fu": True, **fu_invoice_fields(po_inv)} if order_type == "Regular" else {})},
                     "start_time": start.strftime("%I:%M:%S %p"),
                     "end_time": end_time, "duration_mins": str(duration),
                     "status": "Completed"
@@ -4791,6 +4795,13 @@ def show_user_page():
                 st.session_state.purchase_active_form = "invoice"
                 st.rerun()
 
+            n_fu, n_fu_red = fu_counts(st.session_state.name)
+            if st.button("🚚 Order Follow-up" + (f" ({n_fu}" + (f" · 🔴{n_fu_red}" if n_fu_red else "") + ")" if n_fu else ""),
+                         width='stretch', key="p_followup",
+                         type="primary" if n_fu_red or st.session_state.purchase_active_form == "followup" else "secondary"):
+                st.session_state.purchase_active_form = "followup"
+                st.rerun()
+
             st.markdown("### 🧾 Customer Orders")
             if st.button("📥 Import Orders", width='stretch', key="p_import",
                 type="primary" if st.session_state.purchase_active_form=="import" else "secondary"):
@@ -4879,6 +4890,7 @@ def show_user_page():
                 "return":      form_purchase_return,
                 "arrangement": form_arrangement,
                 "invoice":     form_add_invoice,
+                "followup":    show_order_followup,
                 "bounce_c":    form_bounce_center,
                 "pharma":      form_pharmarack,
                 "bounce":      form_bounce_medicine,
@@ -4922,6 +4934,10 @@ def show_user_page():
                              type="primary" if n_b else "secondary"):
                     st.session_state.purchase_active_form = "bounce_c"
                     st.rerun()
+            if st.button("🚚 Order Follow-up" + (f" ({n_fu}" + (f" · 🔴{n_fu_red}" if n_fu_red else "") + ")" if n_fu else ""),
+                         key="mp_followup", use_container_width=True, type="primary" if n_fu_red else "secondary"):
+                st.session_state.purchase_active_form = "followup"
+                st.rerun()
             c1,c2 = st.columns(2)
             with c1:
                 if st.button("↩️ Return", key="mp_return", use_container_width=True):
@@ -5148,6 +5164,7 @@ def show_user_page():
             # Dashboard
             work_area = st.session_state.get("work_area","All Areas")
             show_live_pending_bills(work_area, f"#### ⏳ Pending bills — {work_area}")
+            show_import_due(work_area)
             st.caption("Full journey of every bill (pending and placed): 🧾 Bills Register in the menu.")
             st.divider()
             show_incoming_arrangements(work_area)
@@ -9148,7 +9165,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League'])
+    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up'])
     if _nav == '📅 Daily Summary': show_daily_summary("mgr_ds")
     if _nav == '🔎 Reviews': show_reviews("mgr_rv")
     if _nav == '👥 All Staff Work': show_all_staff_work("mgr_asw")
@@ -9163,6 +9180,7 @@ def show_manager_team_view():
     if _nav == '🚚 Distributors': show_distributors_admin("mgr_dist")
     if _nav == '🛵 Delivery KM': show_delivery_km("mgr_dkm")
     if _nav == '🏆 League': show_league("mgr_lg")
+    if _nav == '🚚 Order Follow-up': show_order_followup("mgr_fu")
 
 # ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
 DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
@@ -9701,6 +9719,13 @@ def _order_by_distributor(area, d, pending, by_id):
     picked = ed[ed["Order?"] == True]
     n = len(picked)
     strips = float(picked["Order Qty"].fillna(0).sum()) if n else 0
+    u1, u2 = st.columns(2)
+    with u1:
+        os_urg = st.radio("Urgency *", FU_URGENCY, horizontal=True, key=f"os_urg_{ver}",
+                          help="🔴 Very Urgent = must be in the software today · 🟢 Regular = by tomorrow")
+    with u2:
+        os_inv = st.text_input("Invoice No (if you have it now)", key=f"os_inv_{ver}",
+                               help="Can be added later in 🚚 Order Follow-up")
     if st.button(f"💾 Save order — {dist} ({n} SKUs, {_qty_txt(strips)} strips)", type="primary", key="os_save",
                  disabled=n == 0, width='stretch'):
         errs = []
@@ -9723,7 +9748,8 @@ def _order_by_distributor(area, d, pending, by_id):
                 "date": date_str(), "time": time_str(), "person": st.session_state.name, "team": "Purchase",
                 "task_type": "Purchase Order",
                 "details": {"distributor": dist, "area": area, "order_type": "Regular", "no_sku": str(n),
-                            "strips": _qty_txt(strips), "mode": mode, "urgency": "Normal", "source": "Order Sheet",
+                            "strips": _qty_txt(strips), "mode": mode, "urgency": fu_urgency_value(os_urg), "source": "Order Sheet",
+                            "fu": True, **fu_invoice_fields(os_inv),
                             "sheet_date": d, "off_top3": str(off_top), "remarks": ""},
                 "start_time": start.strftime("%I:%M:%S %p"), "end_time": end_time,
                 "duration_mins": str(duration), "status": "Completed"}).execute().data
@@ -9738,7 +9764,8 @@ def _order_by_distributor(area, d, pending, by_id):
                     "off_top_reason": r["Why not top 3?"] or None, "note": str(r["Note"] or "").strip() or None,
                     "po_task_id": task_id, "marked_by": st.session_state.name, "marked_at": now_s}).eq("id", l["id"]).execute()
             st.session_state["os_ver"] = ver + 1
-            st.session_state["os_msg2"] = f"✅ Order saved — {dist}: {n} SKUs, {_qty_txt(strips)} strips"
+            st.session_state["os_msg2"] = (f"✅ Order saved — {dist}: {n} SKUs, {_qty_txt(strips)} strips · "
+                                           f"{fu_urgency_value(os_urg)} — follow it in 🚚 Order Follow-up")
             st.rerun()
         except Exception as e:
             st.error(f"Error: {e}")
@@ -10133,6 +10160,9 @@ def _pharmarack_upload(area, d, pending, by_id, start):
         plans.append((o, dist, ed, rows))
 
     st.markdown("---")
+    pr_urg = st.radio("Urgency of these orders *", FU_URGENCY, horizontal=True, key=f"pr_urg_{ver}",
+                      help="🔴 Very Urgent = must be in the software today · 🟢 Regular = by tomorrow. "
+                           "Add the invoice numbers later in 🚚 Order Follow-up.")
     tot_lines = sum(len(o["lines"]) for o, _, _, _ in plans)
     if not st.button(f"💾 Save {len(plans)} PharmaRack order(s) — {tot_lines} items", type="primary",
                      key=f"pr_save_{ver}", width='stretch'):
@@ -10190,7 +10220,7 @@ def _pharmarack_upload(area, d, pending, by_id, start):
                 "task_type": "Purchase Order",
                 "details": {"distributor": dist, "area": area, "order_type": "Regular",
                             "no_sku": str(len(o["lines"])), "strips": _qty_txt(sum(p["qty"] for p in o["lines"])),
-                            "mode": "Pharma Rack", "urgency": "Normal", "source": "PharmaRack Upload",
+                            "mode": "Pharma Rack", "urgency": fu_urgency_value(pr_urg), "source": "PharmaRack Upload", "fu": True,
                             "pharmarack_order_no": o["order_no"], "pharmarack_store": o["store"],
                             "order_date": o["order_date"], "amount": f"{o['total']:.2f}", "file": o["file"],
                             "sheet_date": d, "matched": str(len(marked)), "not_in_sheet": str(len(extra)),
@@ -10231,6 +10261,401 @@ def _pharmarack_upload(area, d, pending, by_id, start):
     st.session_state["pr_ver"] = ver + 1
     st.session_state["os_msg2"] = "✅ PharmaRack orders saved — " + " · ".join(summary)
     st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🚚 NORMAL ORDER FOLLOW-UP — every normal order is followed: ordered → bill arrived → uploaded to the software
+# Owner: the person who ordered until the bill reaches the warehouse (chases the distributor),
+#        then the stock team of that area (uploads it to the software).
+# Deadline: 🔴 Very Urgent = in the software the same day · 🟢 Regular = by the next day (both by the day-end time)
+# Stored in the Purchase Order task's details (no new table): fu, urgency, invoice_no, fu_notes, fu_closed
+# ══════════════════════════════════════════════════════════════════════════════
+FU_URGENCY = ["🟢 Regular", "🔴 Very Urgent"]
+FU_DAY_END_CHOICES = ["18:00", "19:00", "20:00", "20:30", "21:00", "22:00"]
+FU_ARRIVE_BEFORE_H = 2          # the bill should reach the warehouse this long before the deadline (time to upload)
+FU_FOLLOWUP_MINS = 60           # a late order needs a follow-up note at least this often
+FU_DAYS = 7                     # orders followed for this many days
+FU_CLOSE_REASONS = ["Distributor cancelled / out of stock", "Ordered again from another distributor",
+                    "Order placed by mistake", "Other"]
+FU_STAGE = {"ordered": "🕐 Waiting for bill", "arrived": "📥 Arrived — upload pending",
+            "imported": "✅ In software", "closed": "✖️ Closed"}
+
+
+def fu_urgency_value(choice):
+    return "Very Urgent" if "Very" in str(choice) else "Regular"
+
+
+def fu_invoice_fields(inv):
+    """details to save when the invoice number is typed at order time"""
+    inv = str(inv or "").strip()
+    return {"invoice_no": inv, "invoice_added_by": st.session_state.name, "invoice_added_at": now_iso()} if inv else {}
+
+
+def fu_day_end():
+    v = str(get_app_setting("fu_day_end", "21:00") or "21:00")
+    try:
+        h, m = v.split(":")
+        return int(h), int(m)
+    except Exception:
+        return 21, 0
+
+
+def fu_deadline(ordered_at, urgency, day_end=None):
+    """Very Urgent: same day by day-end (ordered after day-end -> next day). Regular: next day by day-end."""
+    h, m = day_end or fu_day_end()
+    same = ordered_at.replace(hour=h, minute=m, second=0, microsecond=0)
+    if urgency == "Very Urgent":
+        return same if ordered_at < same else same + timedelta(days=1)
+    return same + timedelta(days=1)
+
+
+def fu_arrive_by(ordered_at, deadline):
+    """the bill should reach the warehouse FU_ARRIVE_BEFORE_H before the deadline (but not sooner than 1 h after ordering)"""
+    return min(deadline, max(deadline - timedelta(hours=FU_ARRIVE_BEFORE_H), ordered_at + timedelta(hours=1)))
+
+
+def fu_invoices(v):
+    """'INV-12, inv 13' -> ['inv12', 'inv13'] (several invoices for one order: comma / semicolon / new line)"""
+    return [x for x in (_bill_norm(p) for p in re.split(r"[,;\n]+", str(v or ""))) if x]
+
+
+def _fu_raw(days=FU_DAYS):
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    orders = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Purchase Order").gte("date", lo))
+              if (t.get("details") or {}).get("fu") and t.get("status") != "In Progress"]
+    if not orders:
+        return orders, [], [], []
+    regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", lo))
+    ups = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Bill Upload (Software)").gte("date", lo))
+    try:
+        photos = fetch_all("bill_arrivals", lambda q: q.gte("date", lo))
+    except Exception:
+        photos = []
+    return orders, regs, ups, photos
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fu_raw_cached():
+    return _fu_raw()
+
+
+def fu_records(raw=None, now_n=None):
+    """one record per followed normal order, with its stage, deadline, flag and who is holding it"""
+    orders, regs, ups, photos = raw if raw is not None else _fu_raw()
+    now_n = now_n or _now_n()
+    day_end = fu_day_end()
+    norm = lambda s: str(s or "").strip().lower()
+    reg_by = {}
+    for r in sorted(regs, key=lambda r: int(r.get("id") or 0)):
+        d = r.get("details") or {}
+        if d.get("order_type") == "Arrangement" or d.get("arrangement_no"):
+            continue
+        k = (norm(d.get("distributor")), _bill_norm(d.get("bill_no")))
+        if k[1]:
+            reg_by.setdefault(k, r)
+    up_by_reg, up_by_bill = {}, {}
+    for u in sorted(ups, key=lambda u: int(u.get("id") or 0)):
+        if u.get("status") == "In Progress":
+            continue
+        d = u.get("details") or {}
+        if d.get("reg_id"):
+            up_by_reg.setdefault(str(d["reg_id"]), u)
+        k = (norm(d.get("distributor")), _bill_norm(d.get("bill_no")))
+        if k[1]:
+            up_by_bill.setdefault(k, u)
+    credits = sorted([dict(p, _left=int(_to_float(p.get("bills"), 0)), _at=_naive(to_ist(p.get("arrived_at"))))
+                      for p in photos if p.get("order_type") in (None, "", "Normal Order")],
+                     key=lambda p: (p["_at"] is None, p["_at"] or datetime.min))
+
+    def take_photo(dist, area, after):
+        for c in credits:
+            if c["_left"] > 0 and norm(c.get("distributor")) == norm(dist) and c.get("area") == area \
+                    and c["_at"] and c["_at"] >= after:
+                c["_left"] -= 1
+                return c["_at"]
+        return None
+
+    out, claimed = [], set()
+    for t in sorted(orders, key=lambda t: (_task_dt(t, "end_time") or _task_dt(t, "time") or datetime.min, t.get("id") or 0)):
+        d = t.get("details") or {}
+        at = _task_dt(t, "end_time") or _task_dt(t, "time")
+        if not at:
+            continue
+        urg = "Very Urgent" if d.get("urgency") == "Very Urgent" else "Regular"
+        dl = fu_deadline(at, urg, day_end)
+        arr_by = fu_arrive_by(at, dl)
+        dist, area = d.get("distributor", ""), d.get("area", "")
+        invs = fu_invoices(d.get("invoice_no"))
+        regs_m, ups_m = [], []
+        for inv in invs:
+            r = reg_by.get((norm(dist), inv))
+            if r:
+                regs_m.append(r)
+                claimed.add(r.get("id"))
+            ups_m.append((up_by_reg.get(str(r.get("id"))) if r else None) or up_by_bill.get((norm(dist), inv)))
+        arrived_at, src = None, ""
+        for r in regs_m:
+            rd = r.get("details") or {}
+            ta = (_naive(to_ist(rd.get("arrived_at"))) if rd.get("arrived_at") else None) or _task_dt(r, "time")
+            if ta and (arrived_at is None or ta < arrived_at):
+                arrived_at, src = ta, "🧾 bill entered"
+        photo_at = take_photo(dist, area, at)            # always use up this order's 📥 photo (so no other order takes it)
+        if arrived_at is None and photo_at:
+            arrived_at, src = photo_at, "📥 photo (add invoice no to confirm)"
+        if arrived_at is None and any(ups_m):            # uploaded without a register entry -> it did arrive
+            arrived_at, src = min(_task_dt(u, "start_time") or now_n for u in ups_m if u), "📤 upload"
+        imported_at = None
+        if invs and all(ups_m):
+            imported_at = max(_task_dt(u, "end_time") or _task_dt(u, "time") or now_n for u in ups_m)
+        closed = d.get("fu_closed")
+        stage = "closed" if closed else "imported" if imported_at else "arrived" if arrived_at else "ordered"
+        target = arr_by if stage == "ordered" else dl
+        mins_left = int((target - now_n).total_seconds() // 60)
+        if stage in ("ordered", "arrived"):
+            flag = "🔴" if mins_left < 0 else "🟡" if mins_left <= 60 else "🟢"
+        elif stage == "imported":
+            flag = "✅" if imported_at <= dl else "🔴"
+        else:
+            flag = "✖️"
+        notes = d.get("fu_notes") or []
+        last_note = max((_naive(to_ist(n.get("at"))) for n in notes if n.get("at")), default=None)
+        need_fu = stage == "ordered" and now_n > arr_by and \
+            (last_note is None or (now_n - last_note).total_seconds() > FU_FOLLOWUP_MINS * 60)
+        out.append({"id": t.get("id"), "task": t, "d": d, "person": t.get("person", ""), "at": at, "urg": urg,
+                    "deadline": dl, "arr_by": arr_by, "dist": dist, "area": area, "skus": d.get("no_sku", ""),
+                    "source": d.get("source") or "Purchase Order", "invoice": d.get("invoice_no") or "", "invs": invs,
+                    "arrived_at": arrived_at, "arr_src": src, "imported_at": imported_at, "stage": stage, "flag": flag,
+                    "mins_left": mins_left, "notes": notes, "last_note": last_note, "need_fu": need_fu, "closed": closed,
+                    "holder": t.get("person", "") if stage == "ordered" else (f"Stock — {area}" if stage == "arrived" else ""),
+                    "candidates": []})
+    # bills from the same distributor entered after the order that no order has claimed -> help to fill the invoice no
+    for rec in out:
+        if rec["stage"] not in ("ordered", "arrived") or rec["invs"]:
+            continue
+        for k, r in reg_by.items():
+            rd = r.get("details") or {}
+            ta = _task_dt(r, "time")
+            if k[0] == norm(rec["dist"]) and r.get("id") not in claimed and ta and ta >= rec["at"] \
+                    and (not rd.get("area") or rd.get("area") == rec["area"]):
+                rec["candidates"].append(str(rd.get("bill_no")))
+    return out
+
+
+def fu_counts(person=None):
+    """(open orders waiting for the bill, of them late / needing a follow-up) — for the menu button"""
+    try:
+        recs = fu_records(_fu_raw_cached())
+    except Exception:
+        return 0, 0
+    mine = [r for r in recs if r["stage"] == "ordered" and (person is None or r["person"] == person)]
+    return len(mine), sum(1 for r in mine if r["flag"] == "🔴" or r["need_fu"])
+
+
+def _fu_patch(task_id, fn):
+    """read the order fresh (no cache), change its details, save"""
+    rows = _sb_real.table("daily_tasks").select("id,details").eq("id", task_id).execute().data or []
+    if not rows:
+        raise Exception("order not found")
+    d = dict(rows[0].get("details") or {})
+    fn(d)
+    supabase.table("daily_tasks").update({"details": d}).eq("id", task_id).execute()
+    _fu_raw_cached.clear()
+
+
+def _fu_due_txt(r, now_n):
+    if r["stage"] == "ordered":
+        what, t = "bill by", r["arr_by"]
+    elif r["stage"] == "arrived":
+        what, t = "upload by", r["deadline"]
+    elif r["stage"] == "imported":
+        late = int((r["imported_at"] - r["deadline"]).total_seconds() // 60)
+        return "on time" if late <= 0 else f"late by {fmt_age(late)}"
+    else:
+        return ""
+    left = r["mins_left"]
+    return f"{what} {_fmt_when(t, now_n)} — " + (f"LATE {fmt_age(-left)}" if left < 0 else f"{fmt_age(left)} left")
+
+
+def show_order_followup(kp="fu"):
+    st.subheader("🚚 Normal Order Follow-up")
+    h, m = fu_day_end()
+    st.caption(f"Every normal order is followed until its bill is in the software. 🔴 **Very Urgent** → uploaded the "
+               f"same day · 🟢 **Regular** → by the next day (day ends {_hm_txt((h, m))}). Until the bill reaches the "
+               f"warehouse, **the person who ordered** chases the distributor; after that **the stock team** uploads it.")
+    msg = st.session_state.pop(f"{kp}_msg", None)
+    if msg:
+        st.success(msg)
+    try:
+        recs = fu_records()
+    except Exception as e:
+        st.error(f"Could not load the orders: {e}")
+        return
+    me, now_n = st.session_state.name, _now_n()
+    boss = st.session_state.get("role") in ("admin", "manager") or st.session_state.get("team") != "Purchase"
+    c1, c2 = st.columns(2)
+    with c1:
+        scope = st.radio("Show", ["My orders", "Everyone"], index=1 if boss else 0, horizontal=True, key=f"{kp}_scope")
+    with c2:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    sel = [r for r in recs if (scope == "Everyone" or r["person"] == me) and (area == "All Areas" or r["area"] == area)]
+    open_ = sorted([r for r in sel if r["stage"] in ("ordered", "arrived")], key=lambda r: (r["mins_left"], r["at"]))
+    done = [r for r in sel if r["stage"] in ("imported", "closed")]
+    today_done = [r for r in done if r["stage"] == "imported" and r["imported_at"].date() == now_n.date()]
+    mc = st.columns(5)
+    mc[0].metric("📦 Open", len(open_))
+    mc[1].metric("🔴 Late", sum(1 for r in open_ if r["flag"] == "🔴"))
+    mc[2].metric("📞 Need follow-up", sum(1 for r in open_ if r["need_fu"]))
+    mc[3].metric("🧾 No invoice no", sum(1 for r in open_ if not r["invs"]))
+    mc[4].metric("✅ In software today", len(today_done),
+                 f"{sum(1 for r in today_done if r['flag'] == '✅')} on time" if today_done else None, delta_color="off")
+    if not open_:
+        st.success("🎉 No open normal orders.")
+    else:
+        st.dataframe(pd.DataFrame([{
+            "⏰": r["flag"] + (" 📞" if r["need_fu"] else ""),
+            "Urgency": "🔴 Very Urgent" if r["urg"] == "Very Urgent" else "🟢 Regular",
+            "Ordered": _fmt_when(r["at"], now_n), "Distributor": r["dist"], "Area": r["area"], "SKUs": r["skus"],
+            "By": r["person"], "Stage": FU_STAGE[r["stage"]], "Due": _fu_due_txt(r, now_n), "Holding": r["holder"],
+            "Invoice No": r["invoice"] or "⏳ not added",
+            "Bills from this distributor": ", ".join(r["candidates"][:4]),
+            "Last follow-up": (_fmt_when(r["last_note"], now_n) + " — " + str(r["notes"][-1].get("note", ""))[:40])
+            if r["last_note"] else ""} for r in open_]), hide_index=True, width='stretch')
+        st.caption("📞 = late and no follow-up in the last hour — call the distributor and write what they said. "
+                   "'Bills from this distributor' = bills entered at the warehouse after this order — "
+                   "check the distributor software and add the right invoice number.")
+        _fu_action_panel(kp, open_, now_n)
+    if done:
+        with st.expander(f"✅ In software / closed — last {FU_DAYS} days ({len(done)})"):
+            st.dataframe(pd.DataFrame([{
+                "Result": ("✅ on time" if r["flag"] == "✅" else "🔴 " + _fu_due_txt(r, now_n)) if r["stage"] == "imported"
+                else "✖️ " + str((r["closed"] or {}).get("reason", "")),
+                "Urgency": r["urg"], "Distributor": r["dist"], "Area": r["area"], "By": r["person"],
+                "Ordered": _fmt_when(r["at"], now_n), "Arrived": _fmt_when(r["arrived_at"], now_n),
+                "In software": _fmt_when(r["imported_at"], now_n),
+                "Order → software": fmt_age(int((r["imported_at"] - r["at"]).total_seconds() // 60)) if r["imported_at"] else "",
+                "Invoice No": r["invoice"]} for r in sorted(done, key=lambda r: r["at"], reverse=True)]),
+                hide_index=True, width='stretch')
+    if scope == "Everyone" and sel:
+        _fu_team_summary(sel, now_n)
+    if st.session_state.get("role") == "admin":
+        with st.expander("⚙️ Day-end time (deadline for 'same day' / 'next day')"):
+            cur = "%02d:%02d" % (h, m)
+            ch = st.selectbox("Bills must be in the software by", FU_DAY_END_CHOICES,
+                              index=FU_DAY_END_CHOICES.index(cur) if cur in FU_DAY_END_CHOICES else 4,
+                              format_func=lambda x: _hm_txt(tuple(int(i) for i in x.split(":"))), key=f"{kp}_dayend")
+            if ch != cur and st.button("Save day-end time", key=f"{kp}_dayend_save"):
+                set_app_setting("fu_day_end", ch)
+                st.session_state[f"{kp}_msg"] = f"✅ Day-end time set to {_hm_txt(tuple(int(i) for i in ch.split(':')))}"
+                st.rerun()
+
+
+def _fu_action_panel(kp, open_, now_n):
+    """pick one order: add invoice no · log a follow-up · close it"""
+    with st.container(border=True):
+        st.markdown("**✏️ Update an order — invoice no · follow-up · close**")
+        opts = {f"{r['flag']} {r['dist']} · {r['area']} · {_fmt_when(r['at'], now_n)} · {r['person']} (#{r['id']})": r
+                for r in open_}
+        r = opts[st.selectbox("Order", list(opts), key=f"{kp}_pick")]
+        oid = r["id"]
+        if r["notes"]:
+            st.caption("Follow-ups: " + " · ".join(
+                f"{_fmt_when(_naive(to_ist(n.get('at'))), now_n)} {n.get('by', '')}: {n.get('note', '')}" for n in r["notes"][-5:]))
+        c1, c2 = st.columns(2)
+        with c1:
+            inv = st.text_input("🧾 Invoice No (several: separate with commas)", value=r["invoice"], key=f"{kp}_inv_{oid}",
+                                help="Check the distributor software / PharmaRack for the invoice number")
+            if r["candidates"]:
+                st.caption("Bills entered from this distributor after the order: " + ", ".join(r["candidates"][:6]))
+            if st.button("💾 Save invoice no", key=f"{kp}_inv_save_{oid}"):
+                if inv.strip() == r["invoice"].strip():
+                    st.info("Nothing changed — type the invoice number first.")
+                    return
+                def f(d, inv=inv.strip()):
+                    d["invoice_no"] = inv or None
+                    d["invoice_added_by"], d["invoice_added_at"] = st.session_state.name, now_iso()
+                _fu_patch(oid, f)
+                log_simple_task("Invoice No Added", {"distributor": r["dist"], "order_task_id": str(oid), "invoice_no": inv.strip()})
+                st.session_state[f"{kp}_msg"] = f"✅ Invoice no saved for {r['dist']}"
+                st.rerun()
+        with c2:
+            note = st.text_input("📞 Follow-up — what did the distributor say?", key=f"{kp}_note_{oid}",
+                                 placeholder="e.g. Called Ramesh — bill coming with the 4 PM delivery")
+            if st.button("📞 Save follow-up", key=f"{kp}_note_save_{oid}"):
+                if not note.strip():
+                    st.error("Write what the distributor said.")
+                else:
+                    def f(d, note=note.strip()):
+                        d["fu_notes"] = list(d.get("fu_notes") or []) + [{"at": now_iso(), "by": st.session_state.name, "note": note}]
+                    _fu_patch(oid, f)
+                    log_simple_task("Order Follow-up", {"distributor": r["dist"], "order_task_id": str(oid), "note": note.strip()})
+                    st.session_state[f"{kp}_msg"] = f"📞 Follow-up saved for {r['dist']}"
+                    st.rerun()
+        if st.toggle("✖️ Not coming — close this order", key=f"{kp}_close_{oid}"):
+            reason = st.selectbox("Reason *", FU_CLOSE_REASONS, key=f"{kp}_reason_{oid}")
+            cnote = st.text_input("Note" + (" *" if reason == "Other" else ""), key=f"{kp}_cnote_{oid}")
+            if st.button("✖️ Close order", key=f"{kp}_close_save_{oid}"):
+                if reason == "Other" and not cnote.strip():
+                    st.error("Write a note for 'Other'.")
+                else:
+                    def f(d):
+                        d["fu_closed"] = {"at": now_iso(), "by": st.session_state.name, "reason": reason,
+                                          "note": cnote.strip() or None}
+                    _fu_patch(oid, f)
+                    st.session_state[f"{kp}_msg"] = f"✖️ Order closed — {r['dist']}: {reason}"
+                    st.rerun()
+
+
+def _fu_team_summary(sel, now_n):
+    with st.expander("👥 By person & distributor", expanded=False):
+        people = {}
+        for r in sel:
+            p = people.setdefault(r["person"], {"Person": r["person"], "Open": 0, "🔴 Late": 0, "📞 Need follow-up": 0,
+                                                 "In software": 0, "On time": 0, "_h": []})
+            if r["stage"] in ("ordered", "arrived"):
+                p["Open"] += 1
+                p["🔴 Late"] += r["flag"] == "🔴"
+                p["📞 Need follow-up"] += r["need_fu"]
+            elif r["stage"] == "imported":
+                p["In software"] += 1
+                p["On time"] += r["flag"] == "✅"
+                p["_h"].append((r["imported_at"] - r["at"]).total_seconds() / 3600)
+        rows = []
+        for p in sorted(people.values(), key=lambda p: (-p["🔴 Late"], p["Person"])):
+            hrs = p.pop("_h")
+            p["Avg order → software"] = f"{sum(hrs) / len(hrs):.1f} h" if hrs else ""
+            p["On time %"] = f"{round(100 * p['On time'] / p['In software'])}%" if p["In software"] else ""
+            rows.append(p)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+        dists = {}
+        for r in sel:
+            if r["arrived_at"] and r["stage"] != "closed":
+                dists.setdefault(r["dist"], []).append((r["arrived_at"] - r["at"]).total_seconds() / 3600)
+        if dists:
+            st.markdown("**🚚 How fast distributors deliver (order → bill at warehouse)**")
+            st.dataframe(pd.DataFrame([{"Distributor": k, "Orders": len(v), "Avg": f"{sum(v) / len(v):.1f} h",
+                                        "Slowest": f"{max(v):.1f} h"} for k, v in
+                                       sorted(dists.items(), key=lambda kv: -sum(kv[1]) / len(kv[1]))]),
+                         hide_index=True, width='stretch')
+
+
+def show_import_due(area="All Areas"):
+    """stock home: normal-order bills that arrived and must go into the software (with their deadline)"""
+    try:
+        recs = [r for r in fu_records(_fu_raw_cached()) if r["stage"] == "arrived"
+                and (area in ("All Areas", None, "") or r["area"] == area)]
+    except Exception:
+        return
+    if not recs:
+        return
+    now_n = _now_n()
+    recs.sort(key=lambda r: (r["mins_left"], r["at"]))
+    late = sum(1 for r in recs if r["flag"] == "🔴")
+    st.markdown(f"#### 📤 Normal orders to upload to software — {len(recs)}" + (f" · 🔴 {late} late" if late else ""))
+    st.dataframe(pd.DataFrame([{"⏰": r["flag"], "Urgency": "🔴 Very Urgent" if r["urg"] == "Very Urgent" else "🟢 Regular",
+                                "Distributor": r["dist"], "Invoice No": r["invoice"] or "—",
+                                "Arrived": _fmt_when(r["arrived_at"], now_n), "Due": _fu_due_txt(r, now_n),
+                                "Ordered by": r["person"]} for r in recs]), hide_index=True, width='stretch')
+    st.caption("Do 📒 Register Entry → ✔️ Bill Check → 📤 Bill Upload. 🔴 Very Urgent bills must be in the software today.")
 
 
 # ── NORMAL ORDER REPORT (admin / manager) ─────────────────────────────────────
@@ -13654,7 +14079,8 @@ def section_nav(kp, labels):
 # ✅ DAILY CHECKLIST for managers (Dharmendra) — live numbers + Done with note
 # ══════════════════════════════════════════════════════════════════════════════
 CHECK_ITEMS = [("location", "📍 Rack locations updated in the billing software"),
-               ("bounce", "🔁 Bounce medicines checked")]
+               ("bounce", "🔁 Bounce medicines checked"),
+               ("extra", "🛒 Purchase orders checked — no extra / wrong items")]
 
 
 def checklist_people():
@@ -13716,6 +14142,8 @@ def show_daily_checklist():
                 _check_location(d)
             elif key == "bounce":
                 _check_bounce(d)
+            elif key == "extra":
+                _check_extra(d)
             st.divider()
 
 
@@ -13776,6 +14204,147 @@ def _check_bounce(d):
             st.rerun()
 
 
+# ── 🛒 EXTRA / WRONG PURCHASE ORDERS (checklist item) ─────────────────────────
+EXTRA_KINDS = [("twice",   "🔂 Ordered more than the customer needs (ordered twice)"),
+               ("removed", "🗑️ Ordered, but the customer item was removed / cancelled"),
+               ("instore", "🏪 Ordered, but the item was also marked In Store / Not Available"),
+               ("unlinked", "➕ Extra medicines not from any customer order (stock top-up / typed extra)")]
+
+def extra_order_findings(day):
+    """arrangement orders placed on `day` (YYYY-MM-DD) that may contain extra items -> {kind: [rows]}"""
+    out = {k: [] for k, _ in EXTRA_KINDS}
+    arrs = fetch_all("arrangements", lambda q: q.eq("order_placed_date", day))
+    if not arrs:
+        return out
+    by_no = {str(a.get("arrangement_no")): a for a in arrs}
+    als = []
+    for part in _chunks(list(by_no), 80):
+        als += fetch_all("arrangement_lines", lambda q, p=part: q.in_("arrangement_no", p))
+    line_ids = sorted({int(a["line_id"]) for a in als if a.get("line_id") not in (None, "")})
+    lines, all_als = {}, []
+    for part in _chunks(line_ids, 80):
+        for l in fetch_all("customer_order_lines", lambda q, p=part: q.in_("id", p)):
+            lines[int(l["id"])] = l
+        all_als += fetch_all("arrangement_lines", lambda q, p=part: q.in_("line_id", p))   # every day, not only today
+    eff = lambda a: max(0.0, _to_float(a.get("qty_ordered"), 0) - _to_float(a.get("qty_bounced"), 0))
+
+    def row(a, l, **extra):
+        arr = by_no.get(str(a.get("arrangement_no")), {})
+        return {"ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor") or arr.get("distributor", ""),
+                "Ordered by": a.get("ordered_by") or arr.get("order_by", ""), "Order #": a.get("order_no", ""),
+                "Customer": (l or {}).get("customer_name", ""), "Medicine": a.get("item_name", ""),
+                "Area": a.get("area") or arr.get("area", ""), **extra}
+
+    # 1. ordered more than needed (same customer item in 2+ orders, or more qty than the customer wants)
+    per_line = {}
+    for a in all_als:
+        if a.get("line_id") not in (None, ""):
+            per_line.setdefault(int(a["line_id"]), []).append(a)
+    seen = set()
+    for a in als:
+        lid = a.get("line_id")
+        if lid in (None, "") or int(lid) in seen:
+            continue
+        lid = int(lid)
+        l = lines.get(lid)
+        need = _to_float((l or {}).get("qty"), 0)
+        got = per_line.get(lid, [])
+        ordered = sum(eff(x) for x in got)
+        if l and ordered > need + 0.001:
+            seen.add(lid)
+            out["twice"].append(row(a, l, **{"Needed": _qty_txt(need), "Ordered (all orders)": _qty_txt(ordered),
+                                             "Extra": _qty_txt(ordered - need),
+                                             "In orders": ", ".join(sorted({str(x.get("arrangement_no")) for x in got}))}))
+    # 2. customer item removed / cancelled after it was ordered   3. also marked In Store / Not Available
+    for a in als:
+        lid = a.get("line_id")
+        l = lines.get(int(lid)) if lid not in (None, "") else None
+        if not l or eff(a) <= 0:
+            continue
+        if l.get("removed") or l.get("status") == "Removed":
+            out["removed"].append(row(a, l, **{"Ordered": _qty_txt(eff(a)), "Item status": l.get("status", "")}))
+            continue
+        note = l.get("remainder_note")
+        # part ordered + "rest is In Store", but the full qty got ordered anyway
+        part_conflict = note in ("In Store", "Not Available") and \
+            _to_float(l.get("qty_arranged"), 0) > _to_float(l.get("qty"), 0) - 0.001
+        # whole item marked In Store / Not Available (decided_by set) and still ordered;
+        # "Not found" on the shelf -> re-order is correct, not a mistake
+        full_conflict = not note and l.get("decided_by") and l.get("store_check") != "Not found"
+        if (part_conflict or full_conflict) and str(a.get("arrangement_no")) not in [r["ARR #"] for r in out["instore"]
+                                                                                    if r["Order #"] == a.get("order_no")
+                                                                                    and r["Medicine"] == a.get("item_name")]:
+            out["instore"].append(row(a, l, **{"Ordered": _qty_txt(eff(a)),
+                                                "Marked": note or "In Store / Not Available",
+                                                "Marked by": l.get("decided_by", "")}))
+    # 4. medicines in the order that are not customer items
+    linked = {}
+    for a in als:
+        linked.setdefault(str(a.get("arrangement_no")), set()).add(a.get("line_id"))
+    for no, arr in by_no.items():
+        n_med = int(_to_float(arr.get("no_medicines"), 0))
+        n_link = len(linked.get(no, set()))
+        if n_med > n_link:
+            out["unlinked"].append({"ARR #": no, "Distributor": arr.get("distributor", ""), "Ordered by": arr.get("order_by", ""),
+                                    "Area": arr.get("area", ""), "Medicines in order": n_med, "Customer items": n_link,
+                                    "Extra (not customer)": n_med - n_link, "_img": arr.get("order_image") or ""})
+    return out
+
+
+def _check_extra(d):
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        day = st.date_input("Orders placed on", value=today_ist(), max_value=today_ist(),
+                            min_value=today_ist() - timedelta(days=7), key="chk_ex_day")
+    day_s = day.strftime("%Y-%m-%d")
+    try:
+        f = extra_order_findings(day_s)
+    except Exception as e:
+        st.error(f"Could not load the orders: {e}")
+        return
+    total = sum(len(v) for v in f.values())
+    cols = st.columns(len(EXTRA_KINDS))
+    for col, (k, label) in zip(cols, EXTRA_KINDS):
+        col.metric(label.split(" ")[0] + " " + {"twice": "Ordered twice", "removed": "Cancelled item",
+                                               "instore": "Also In Store", "unlinked": "Not customer"}[k], len(f[k]))
+    if not total:
+        st.success("✅ Nothing suspicious found in these orders.")
+    for k, label in EXTRA_KINDS:
+        if not f[k]:
+            continue
+        st.markdown(f"**{label}** — {len(f[k])}")
+        df = pd.DataFrame(f[k])
+        st.dataframe(df.drop(columns=[c for c in df.columns if c.startswith("_")]), hide_index=True, width='stretch')
+        if k == "unlinked":
+            st.caption("Not always a mistake — stock top-ups are allowed. Open the order photo and confirm each extra "
+                       "medicine was really needed.")
+            for r in f[k]:
+                if r.get("_img") and st.toggle(f"📸 Order photo {r['ARR #']}", key=f"chk_ex_img_{r['ARR #']}"):
+                    show_image(r["_img"], r["ARR #"])
+    if d and (d.get("result") or {}).get("day") == day_s:
+        res = d.get("result") or {}
+        st.caption(f"Checked: {res.get('found', 0)} flagged · {res.get('verdict', '')}"
+                   + (f"  ·  📝 {d['note']}" if d.get("note") else ""))
+        if not st.toggle("Update", key="chk_ex_edit"):
+            return
+    with st.form("chk_ex_form"):
+        verdict = st.radio("Result *", ["✅ No extra / wrong items", "⚠️ Extra items found — action taken"],
+                           index=1 if total else 0, key="chk_ex_verdict")
+        looked = st.checkbox("I looked at every flagged row above" if total else
+                             "I also checked the order photos / distributor bills", key="chk_ex_looked")
+        note = st.text_input("Note — what was extra, who ordered it, what was done (return / cancel / keep as stock)",
+                             key="chk_ex_note")
+        if st.form_submit_button("✅ Done", type="primary"):
+            if not looked:
+                st.error("Tick the box to confirm you checked.")
+            elif verdict.startswith("⚠️") and not note.strip():
+                st.error("Write what was extra and what action was taken.")
+            else:
+                _save_check("extra", {"day": day_s, "found": total, "verdict": verdict,
+                                      **{k: len(v) for k, v in f.items()}}, note)
+                st.rerun()
+
+
 def show_checklist_status(day_s, kp="cls"):
     """admin / managers: who did the daily checklist (Daily Summary → Team)"""
     st.markdown("#### ✅ Manager daily checklist")
@@ -13823,7 +14392,7 @@ def show_admin_page():
     pending_reviews_banner()
     st.divider()
 
-    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos'])
+    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up'])
 
     if _nav == '📅 Daily Summary':
         show_daily_summary("adm_ds")
@@ -13839,6 +14408,9 @@ def show_admin_page():
 
     if _nav == '🛵 Delivery KM':
         show_delivery_km("adm_dkm")
+
+    if _nav == '🚚 Order Follow-up':
+        show_order_followup("adm_fu")
 
     if _nav == '🎯 My Day':
         show_my_day("md")
