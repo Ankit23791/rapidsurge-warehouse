@@ -83,6 +83,15 @@ header {visibility: hidden;}
 [data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stSidebarCollapseButton"] {
     visibility: visible !important;
 }
+/* no focus frame around the whole page area (a grey box appeared on some browsers after clicking / scrolling) */
+[data-testid="stApp"]:focus, [data-testid="stApp"]:focus-visible,
+[data-testid="stAppViewContainer"]:focus, [data-testid="stAppViewContainer"]:focus-visible,
+[data-testid="stMain"]:focus, [data-testid="stMain"]:focus-visible,
+[data-testid="stMainBlockContainer"]:focus, [data-testid="stMainBlockContainer"]:focus-visible,
+[data-testid="stAppViewBlockContainer"]:focus, [data-testid="stAppViewBlockContainer"]:focus-visible,
+section.main:focus, section.main:focus-visible {
+    outline: none !important; box-shadow: none !important;
+}
 
 /* ── COMMANDO THEME: navy #0B1F33 · olive #4B5D2E · gold #C9A227 ── */
 h1, h2 { font-family: 'Oswald', sans-serif !important; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -629,7 +638,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v18.3-Oct PharmaRack format"
+APP_VERSION = "v18.4-Oct sheet distributor names"
 
 def show_sidebar():
     with st.sidebar:
@@ -9354,7 +9363,7 @@ def _parse_best(v):
     rest = " ".join(parts[1:])
     m = re.search(r"(-?\d+(?:\.\d+)?)\s*%", rest)
     scheme = (rest[m.end():] if m else rest).strip()
-    return {"name": parts[0], "margin": float(m.group(1)) if m else None,
+    return {"name": clean_dist_name(parts[0]), "margin": float(m.group(1)) if m else None,
             "scheme": "" if scheme in ("-", "—") else scheme}
 
 def _parse_offer(v):
@@ -9370,6 +9379,13 @@ def _parse_offer(v):
     scheme = parts[0] if not parts[0].lower().startswith(("mgn", "qty")) else ""
     return {"margin": float(m.group(1)) if m else None, "qty": float(q.group(1)) if q else None,
             "scheme": "" if scheme in ("-", "—") else scheme}
+
+def clean_dist_name(c):
+    """'M/S Star pharma.3' -> 'M/S Star pharma' (Excel / pandas add '.1', '.2' … to repeated headers),
+    then the app's own spelling when it is the same distributor (capital letters / spaces / dots differ)"""
+    n = re.sub(r"\.\d+$", "", str(c or "").strip()).strip()
+    known = {_norm_col(d): d for d in DISTRIBUTORS}
+    return known.get(_norm_col(n), n)
 
 def parse_order_sheet(uploaded):
     """-> (lines, distributor column names, rows skipped (order 0), error)"""
@@ -9405,7 +9421,7 @@ def parse_order_sheet(uploaded):
         for c in dist_cols:
             o = _parse_offer(r.get(c))
             if o:
-                offers[str(c).strip()] = o
+                offers.setdefault(clean_dist_name(c), o)       # repeated column of the same distributor -> first one with data
         line = {"item_key": key, "item_name": item, "pack_size": pack,
                 "closing_stock": _to_float(g("closing_stock"), 0), "closing_strip": _to_float(g("closing_strip"), 0),
                 "item_type": _clean_str(g("item_type")) or "Ok", "med_type": _clean_str(g("med_type")),
@@ -9413,7 +9429,7 @@ def parse_order_sheet(uploaded):
                 "offers": offers}
         seen[key] = line
         lines.append(line)
-    return lines, [str(c).strip() for c in dist_cols], skipped, None
+    return lines, list(dict.fromkeys(clean_dist_name(c) for c in dist_cols)), skipped, None
 
 def order_sheet_template():
     names = [d for d in DISTRIBUTORS]
@@ -9588,9 +9604,9 @@ def _order_sheet_upload(area):
         if err:
             st.error(err)
         elif lines:
-            known = {n.lower() for n in DISTRIBUTORS}
+            known = {_norm_col(n) for n in DISTRIBUTORS}
             found = set(dcols) | {b["name"] for l in lines for b in l["best"]}
-            new_d = sorted(n for n in found if n.lower() not in known)
+            new_d = sorted({_norm_col(n): n for n in found if _norm_col(n) not in known}.values())
             no_dist = sum(1 for l in lines if not l["best"] and not l["offers"])
             st.info(f"📄 **{len(lines)} medicines** to order · {sum(l['order_qty'] for l in lines):,.0f} strips"
                     + (f" · {no_dist} with no distributor" if no_dist else "")
