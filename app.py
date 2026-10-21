@@ -79,6 +79,10 @@ section[data-testid="stSidebar"] p {
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+/* keep the "open sidebar" arrow visible — it sits inside the hidden header; without it a closed sidebar can't be reopened */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stSidebarCollapseButton"] {
+    visibility: visible !important;
+}
 
 /* ── COMMANDO THEME: navy #0B1F33 · olive #4B5D2E · gold #C9A227 ── */
 h1, h2 { font-family: 'Oswald', sans-serif !important; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -625,7 +629,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v18-Oct order follow-up"
+APP_VERSION = "v18.1-Oct sidebar fix"
 
 def show_sidebar():
     with st.sidebar:
