@@ -161,14 +161,22 @@ def mission_banner(sub=""):
                 f'<div class="mb-quote">“{q}”</div>' + (f'<div class="mb-sub">{sub}</div>' if sub else "") + '</div>',
                 unsafe_allow_html=True)
 
-def parse_task_time(s):
-    """Read a task start/end time saved as '07:39:12 PM' (new) or '07:39 PM' (old)"""
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=50000)
+def _parse_task_time_str(s):
     for fmt in ("%I:%M:%S %p", "%I:%M %p"):
         try:
-            return datetime.strptime(str(s).strip(), fmt)
+            return datetime.strptime(s, fmt)
         except Exception:
             pass
     return None
+
+
+def parse_task_time(s):
+    """Read a task start/end time saved as '07:39:12 PM' (new) or '07:39 PM' (old) — remembered, times repeat a lot"""
+    return _parse_task_time_str(str(s).strip())
 
 def task_secs(row):
     """Duration of a task in seconds (exact for new records, whole minutes for old ones)"""
@@ -638,7 +646,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v18.4-Oct sheet distributor names"
+APP_VERSION = "v19-Oct staff & area summary"
 
 def show_sidebar():
     with st.sidebar:
@@ -9178,7 +9186,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up'])
+    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
     if _nav == '📅 Daily Summary': show_daily_summary("mgr_ds")
     if _nav == '🔎 Reviews': show_reviews("mgr_rv")
     if _nav == '👥 All Staff Work': show_all_staff_work("mgr_asw")
@@ -9194,6 +9202,7 @@ def show_manager_team_view():
     if _nav == '🛵 Delivery KM': show_delivery_km("mgr_dkm")
     if _nav == '🏆 League': show_league("mgr_lg")
     if _nav == '🚚 Order Follow-up': show_order_followup("mgr_fu")
+    if _nav == '📋 Staff & Area Summary': show_reports("mgr_rep")
 
 # ── DISTRIBUTOR LIST (master) ─────────────────────────────────────────────────
 DIST_XL_COLS = ["Name", "Address", "GST No", "Mobile", "Email", "Usual Margin %", "Active"]
@@ -14458,6 +14467,765 @@ def show_checklist_status(day_s, kp="cls"):
             st.success("Saved")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 📋 REPORTS — 👤 Staff summary (what each person did) · 📍 Area summary (where we are lagging)
+# Read-only: built from daily_tasks, attendance_log, work_area_log, bill_arrivals, bounce_items,
+# customer_order_lines and the normal-order follow-up. No new tables.
+# ══════════════════════════════════════════════════════════════════════════════
+REP_PERIODS = ["Today", "Yesterday", "This week", "Last 10 days", "Weekly (last 4 weeks)",
+               "Monthly (last 3 months)", "📅 Custom dates"]
+REP_REST_MINS = 15          # no task and no break for this long (between clock-in and clock-out) = rest time
+REP_FLAG = 0.25             # 25% worse / better than the area's own last-4-weeks average -> 🔴 / 🟢
+REP_BASE_DAYS = 28
+REP_BASE_MIN_DAYS = 5       # flags start once the area has this many working days in the last 4 weeks
+
+
+def _ds(d):
+    return d.strftime("%Y-%m-%d")
+
+
+def _rep_weeks(lo, hi):
+    out, s = [], lo - timedelta(days=lo.weekday())
+    while s <= hi:
+        e = s + timedelta(days=6)
+        a, b = max(s, lo), min(e, hi)
+        out.append((f"{a.strftime('%d %b')}–{b.strftime('%d %b')}", a, b))
+        s = e + timedelta(days=1)
+    return out
+
+
+def _rep_months(lo, hi):
+    out, s = [], lo.replace(day=1)
+    while s <= hi:
+        nxt = (s.replace(day=28) + timedelta(days=4)).replace(day=1)
+        out.append((s.strftime("%b %Y"), max(s, lo), min(nxt - timedelta(days=1), hi)))
+        s = nxt
+    return out
+
+
+def rep_buckets(choice, today, custom=None):
+    """-> (lo, hi, [(label, from, to)]) for a period choice"""
+    if choice == "Today":
+        lo = hi = today
+    elif choice == "Yesterday":
+        lo = hi = today - timedelta(days=1)
+    elif choice == "This week":
+        lo, hi = today - timedelta(days=today.weekday()), today
+    elif choice == "Last 10 days":
+        lo, hi = today - timedelta(days=9), today
+    elif choice.startswith("Weekly"):
+        lo, hi = today - timedelta(days=today.weekday()) - timedelta(weeks=3), today
+        return lo, hi, _rep_weeks(lo, hi)
+    elif choice.startswith("Monthly"):
+        m = today.replace(day=1)
+        for _ in range(2):
+            m = (m - timedelta(days=1)).replace(day=1)
+        return m, today, _rep_months(m, today)
+    else:
+        lo, hi = custom
+        if (hi - lo).days > 13:
+            return lo, hi, _rep_weeks(lo, hi)
+    days = [(d.strftime("%a %d/%m"), d, d) for d in (lo + timedelta(days=i) for i in range((hi - lo).days + 1))]
+    return lo, hi, days
+
+
+def report_period(kp):
+    today = today_ist()
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        choice = st.selectbox("Period", REP_PERIODS, key=f"{kp}_per")
+    custom = None
+    if choice.startswith("📅"):
+        with c2:
+            v = st.date_input("From – to", value=(today - timedelta(days=6), today), max_value=today, key=f"{kp}_dates")
+        v = list(v) if isinstance(v, (list, tuple)) else [v]
+        custom = (v[0], v[-1]) if v else (today, today)
+    lo, hi, buckets = rep_buckets(choice, today, custom)
+    with c2 if not custom else st.container():
+        st.caption(f"📅 {lo.strftime('%d %b %Y')} → {hi.strftime('%d %b %Y')} · {(hi - lo).days + 1} day(s)")
+    return lo, hi, buckets
+
+
+def _rep_load_people(lo_s, hi_s):
+    tasks = fetch_all("daily_tasks", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    try:
+        att = fetch_all("attendance_log", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        att = []
+    try:
+        wal = fetch_all("work_area_log", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        wal = []
+    return tasks, att, wal
+
+
+@_lru_cache(maxsize=5000)
+def _rep_day0(day_s):
+    return datetime.strptime(day_s, "%Y-%m-%d")
+
+
+def _rep_dt(day_s, tstr):
+    t = parse_task_time(tstr)
+    if not t:
+        return None
+    return _rep_day0(str(day_s)[:10]).replace(hour=t.hour, minute=t.minute, second=t.second)
+
+
+def _rep_span(t):
+    s = _rep_dt(t.get("date"), t.get("start_time")) or _rep_dt(t.get("date"), t.get("time"))
+    e = _rep_dt(t.get("date"), t.get("end_time")) or s
+    if s and e and e < s:
+        e += timedelta(days=1)
+    return s, e
+
+
+def person_day_stats(tasks, events, day_s, now_n=None):
+    """one person, one day -> clock in/out, present, work (overlaps once), lunch, other breaks, rest (15+ min idle)"""
+    now_n = now_n or _now_n()
+    events = sorted(events, key=lambda e: str(e.get("at")))
+    s = att_state(events)
+    cin, cout = _naive(s["clock_in"]), _naive(s["clock_out"])
+    is_today = day_s == _ds(now_n)
+    breaks, cur = [], None
+    for e in events:
+        t, ev = _naive(to_ist(e.get("at"))), e.get("event")
+        if ev == "break_start":
+            cur = (t, e.get("break_type") or "Break")
+        elif ev in ("break_end", "clock_out") and cur:
+            breaks.append((cur[0], t, cur[1]))
+            cur = None
+    if cur:
+        breaks.append((cur[0], now_n if is_today else cur[0], cur[1]))
+    done = [t for t in tasks if t.get("status") != "In Progress"]
+    spans = [p for p in (_rep_span(t) for t in done) if p[0]]
+    day_start = cin or (min(p[0] for p in spans) if spans else None)
+    day_end = cout or (now_n if is_today and cin else (max(p[1] for p in spans) if spans else None))
+    present = (day_end - cin).total_seconds() if cin and day_end and day_end > cin else 0
+    lunch = [b for b in breaks if "lunch" in str(b[2]).lower()]
+    other = [b for b in breaks if b not in lunch]
+    bsecs = lambda bs: sum(max(0, (b[1] - b[0]).total_seconds()) for b in bs)
+    rest_secs, rest_n = 0, 0
+    if cin and day_end and day_end > cin:          # rest time only between clock-in and clock-out
+        day_start = cin
+        cover = sorted([(a, b) for a, b in spans if b] + [(b[0], b[1]) for b in breaks if b[0] and b[1]])
+        cursor = day_start
+        for a, b in cover + [(day_end, day_end)]:
+            a = max(a, day_start)
+            if a > cursor and (min(a, day_end) - cursor).total_seconds() >= REP_REST_MINS * 60:
+                rest_secs += (min(a, day_end) - cursor).total_seconds()
+                rest_n += 1
+            if b > cursor:
+                cursor = b
+            if cursor >= day_end:
+                break
+    return {"cin": cin, "cout": cout, "present": present, "work": _merged_secs(spans), "tasks": len(done),
+            "lunch": bsecs(lunch), "lunch_n": len(lunch), "brk": bsecs(other), "brk_n": len(other),
+            "rest": rest_secs, "rest_n": rest_n}
+
+
+def _rep_t(secs):
+    return fmt_secs(secs) if secs else "—"
+
+
+def _rep_inr(v):
+    v = int(round(v or 0))
+    s = str(abs(v))
+    if len(s) > 3:
+        head, tail = s[:-3], s[-3:]
+        head = ",".join([head[max(0, i - 2):i] for i in range(len(head), 0, -2)][::-1])
+        s = head + "," + tail
+    return ("-" if v < 0 else "") + "₹" + s
+
+
+# ── 👤 STAFF SUMMARY ──────────────────────────────────────────────────────────
+REP_ROWS = {   # team -> [(row label, task types or a special key)]; anything else goes to "Others"
+    "Stock": [("Inventory Check", ["Inventory Check"]), ("Register Entry", ["Register Entry"]),
+              ("Bill Cross Check", ["Bill Cross Check"]), ("Bill Upload", ["Bill Upload (Software)", "Bill Upload"]),
+              ("Stock Placement", ["Stock Placement"]), ("In-Store Pick", ["In-Store Pick Check"])],
+    "Purchase": [("Order Sheet / PharmaRack", "PO_SHEET"), ("Purchase Order (other)", "PO_OTHER"),
+                 ("Arrangement Order", ["Arrangement Order", "Arrangement"]), ("Purchase Return", ["Purchase Return"]),
+                 ("Invoice No / Follow-up", ["Invoice No Added", "Order Follow-up"])],
+    "Call": [("Call Log", ["Call Log"]), ("Customer Delivery", ["Customer Delivery Update"]),
+             ("Medicine Search", ["Medicine Search"])],
+    "Delivery": [("Pickup", ["Pickup"]), ("Delivery Trip", ["Delivery Trip"])],
+}
+REP_TEAM_ORDER = ["Stock", "Purchase", "Call", "Delivery"]
+
+
+def rep_row_of(t, team):
+    tt = t.get("task_type", "")
+    for label, how in REP_ROWS.get(team, []):
+        if how in ("PO_SHEET", "PO_OTHER"):
+            if tt == "Purchase Order":
+                sheet = (t.get("details") or {}).get("source") in ("Order Sheet", "PharmaRack Upload")
+                if sheet == (how == "PO_SHEET"):
+                    return label
+        elif tt in how:
+            return label
+    return "Others"
+
+
+def rep_qty(t):
+    """SKU / item count of a task (0 when the task has none)"""
+    d = t.get("details") or {}
+    tt = t.get("task_type", "")
+    num = lambda k: int(_to_float(d.get(k), 0))
+    if tt == "Pickup":
+        return num("no_sku_received")
+    if tt == "Inventory Check":
+        return num("no_items")
+    if tt == "In-Store Pick Check":
+        return num("picked") + num("not_found")
+    return task_qty_detail(t)[0]
+
+
+def _rep_speed(secs, qty, n):
+    if secs and qty:
+        x = secs / qty
+        return f"{round(x)} secs / SKU" if x < 90 else f"{x / 60:.1f} min / SKU"
+    if secs and n:
+        return f"{secs / n / 60:.1f} min / task"
+    return ""
+
+
+@st.cache_data(ttl=300, max_entries=24, show_spinner=False)
+def _staff_cached(lo_s, hi_s, users_items):
+    lo, hi = datetime.strptime(lo_s, "%Y-%m-%d").date(), datetime.strptime(hi_s, "%Y-%m-%d").date()
+    return staff_summary_data(lo, hi, dict(users_items))
+
+
+def staff_summary_data(lo, hi, users, now_n=None):
+    """-> {person: {...}} totals for the period (users: {name: team})"""
+    now_n = now_n or _now_n()
+    tasks, att, wal = _rep_load_people(_ds(lo), _ds(hi))
+    by_pd, ev_pd, area_of = {}, {}, {}
+    for t in tasks:
+        if t.get("person") in users:
+            by_pd.setdefault((t["person"], str(t.get("date"))[:10]), []).append(t)
+    for e in att:
+        if e.get("person") in users:
+            ev_pd.setdefault((e["person"], str(e.get("date"))[:10]), []).append(e)
+    for w in sorted(wal, key=lambda w: str(w.get("chosen_at") or "")):
+        if w.get("person") in users and w.get("area"):
+            area_of.setdefault(w["person"], {})
+            area_of[w["person"]][w["area"]] = area_of[w["person"]].get(w["area"], 0) + 1
+    out = {}
+    for name, team in users.items():
+        P = {"name": name, "team": team, "days": 0, "days_active": 0, "present": 0, "work": 0, "tasks": 0, "qty": 0,
+             "lunch": 0, "lunch_n": 0, "brk": 0, "brk_n": 0, "rest": 0, "rest_n": 0, "rows": {}, "per_day": []}
+        for label, _ in REP_ROWS.get(team, []):
+            P["rows"][label] = {"n": 0, "secs": 0, "qty": 0}
+        P["rows"]["Others"] = {"n": 0, "secs": 0, "qty": 0}
+        d = lo
+        while d <= hi:
+            k = (name, _ds(d))
+            tl, el = by_pd.get(k, []), ev_pd.get(k, [])
+            if tl or el:
+                s = person_day_stats(tl, el, _ds(d), now_n)
+                P["days"] += 1 if s["cin"] else 0
+                P["days_active"] += 1
+                for f in ("present", "work", "tasks", "lunch", "lunch_n", "brk", "brk_n", "rest", "rest_n"):
+                    P[f] += s[f]
+                for t in tl:
+                    if t.get("status") == "In Progress":
+                        continue
+                    r = P["rows"].setdefault(rep_row_of(t, team), {"n": 0, "secs": 0, "qty": 0})
+                    r["n"] += 1
+                    r["secs"] += task_secs(t)
+                    q = rep_qty(t)
+                    r["qty"] += q
+                    P["qty"] += q
+                P["per_day"].append((_ds(d), s))
+            d += timedelta(days=1)
+        a = area_of.get(name) or {}
+        P["area"] = max(a, key=a.get) if a else ""
+        out[name] = P
+    return out
+
+
+def _staff_card_df(P):
+    days = max(P["days_active"], 1)           # per day = per day with any work / attendance
+    multi = days > 1
+    rows = []
+    for label, r in P["rows"].items():
+        rows.append({"Task Type": label, "No": r["n"], "Total Time": _rep_t(r["secs"]),
+                     "SKU / Qty": r["qty"] or "", "Speed": _rep_speed(r["secs"], r["qty"], r["n"]),
+                     **({"Per day": _rep_t(r["secs"] / days)} if multi else {})})
+    blank = {"Task Type": "", "No": "", "Total Time": "", "SKU / Qty": "", "Speed": "", **({"Per day": ""} if multi else {})}
+    def line(lbl, n, secs, qty=""):
+        return {**blank, "Task Type": lbl, "No": n, "Total Time": _rep_t(secs), "SKU / Qty": qty,
+                **({"Per day": _rep_t(secs / days)} if multi else {})}
+    rows += [blank,
+             line("🛠️ Work time (all tasks)", P["tasks"], P["work"], P["qty"] or ""),
+             line("🍱 Lunch time", P["lunch_n"], P["lunch"]),
+             line("☕ Break time (Tea + Personal)", P["brk_n"], P["brk"]),
+             line(f"💤 Rest time (no activity {REP_REST_MINS}+ min)", P["rest_n"], P["rest"]),
+             line("⏱️ Total time (clock-in → clock-out)", P["days"], P["present"])]
+    return pd.DataFrame(rows).astype(str)
+
+
+def _staff_compare_df(data):
+    rows = []
+    for P in data:
+        base = P["present"] - P["lunch"] - P["brk"]
+        rows.append({"Person": P["name"], "Team": P["team"], "Area": P["area"], "Days present": P["days"],
+                     "Total time": _rep_t(P["present"]), "Work time": _rep_t(P["work"]),
+                     "Rest time": _rep_t(P["rest"]), "Lunch": _rep_t(P["lunch"]), "Breaks": _rep_t(P["brk"]),
+                     "Tasks": P["tasks"], "SKU / Qty": P["qty"],
+                     "Active %": f"{round(100 * P['work'] / base)}%" if base > 0 else "—"})
+    return pd.DataFrame(rows)
+
+
+def show_staff_summary(kp="rs"):
+    st.markdown("#### 👤 Staff summary — what each person did")
+    lo, hi, _ = report_period(kp)
+    users = {u["name"]: u.get("team", "") for u in (load_users() or {}).values() if u.get("role") != "admin"}
+    teams = [t for t in REP_TEAM_ORDER if t in set(users.values())] + sorted(set(users.values()) - set(REP_TEAM_ORDER))
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        team = st.selectbox("Team", ["All teams"] + teams, key=f"{kp}_team")
+    pool = {n: t for n, t in users.items() if team == "All teams" or t == team}
+    with c2:
+        who = st.selectbox("Person", ["Everyone"] + sorted(pool), key=f"{kp}_who")
+    with c3:
+        st.write("")
+        if st.button("🔄 Refresh", key=f"{kp}_ref"):
+            _staff_cached.clear()
+            st.rerun()
+    if who != "Everyone":
+        pool = {who: pool[who]}
+    if not pool:
+        st.info("No staff in this team.")
+        return
+    try:
+        with st.spinner("Adding up the work…"):
+            data = _staff_cached(_ds(lo), _ds(hi), tuple(sorted(pool.items())))
+    except Exception as e:
+        st.error(f"Could not load the work: {e}")
+        return
+    order = lambda P: (REP_TEAM_ORDER.index(P["team"]) if P["team"] in REP_TEAM_ORDER else 9, P["name"].lower())
+    allp = sorted(data.values(), key=order)
+    seen = [P for P in allp if P["days_active"]]
+    absent = [P["name"] for P in allp if not P["days_active"]]
+    if len(pool) > 1:
+        st.markdown("**📊 Everyone at a glance**")
+        st.dataframe(_staff_compare_df(allp), hide_index=True, width='stretch')
+        st.caption(f"Active % = work time ÷ (total time − lunch − breaks). 💤 Rest = no task and no break for "
+                   f"{REP_REST_MINS}+ min between clock-in and clock-out.")
+    if absent and len(pool) > 1:
+        st.caption("No activity in this period: " + ", ".join(absent))
+    for P in seen:
+        with st.container(border=True):
+            head = f"**{P['name']}** · {P['team']}" + (f" · 📍 {P['area']}" if P["area"] else "") + \
+                f" · {P['days']} day(s) clocked in" + \
+                (f" · {P['days_active']} day(s) with work" if P["days_active"] != P["days"] else "")
+            if lo == hi and P["per_day"]:
+                s = P["per_day"][0][1]
+                head += f" · 🟢 In {s['cin'].strftime('%I:%M %p') if s['cin'] else '—'} → " \
+                        f"🔴 Out {s['cout'].strftime('%I:%M %p') if s['cout'] else ('still in' if s['cin'] else '—')}"
+            st.markdown(head)
+            st.dataframe(_staff_card_df(P), hide_index=True, width='stretch')
+    if not seen:
+        st.info("No work recorded for this period.")
+        return
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        _staff_compare_df(allp).to_excel(w, index=False, sheet_name="Summary")
+        used = {"Summary"}
+        for P in seen:
+            nm = re.sub(r"[\[\]\*\?/\\:]", "", P["name"])[:28] or "Staff"
+            base, i = nm, 2
+            while nm in used:
+                nm, i = f"{base[:25]} {i}", i + 1
+            used.add(nm)
+            pd.DataFrame([{"Task Type": f"Employee: {P['name']} ({P['team']})",
+                           "No": f"{lo.strftime('%d %b')} – {hi.strftime('%d %b %Y')}"}]).to_excel(w, index=False, sheet_name=nm)
+            _staff_card_df(P).to_excel(w, index=False, sheet_name=nm, startrow=3)
+    st.download_button("⬇️ Download Excel (one sheet per person + Summary)", buf.getvalue(),
+                       f"staff-summary-{_ds(lo)}-to-{_ds(hi)}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
+
+
+# ── 📍 AREA SUMMARY ───────────────────────────────────────────────────────────
+# (key, label, kind, better)  kind: n count · inr ₹ · t seconds · m minutes · pct % · x number · txt · sec section
+# better: "low" / "high" -> 🔴/🟢 against this area's own last-4-weeks average; None = no flag (volumes)
+AREA_METRICS = [
+    ("§in", "📥 INCOMING", "sec", None),
+    ("arrived", "Bills arrived (📥 photo)", "n", None),
+    ("entered", "Bills entered (register)", "n", None),
+    ("entered_arr", "   of which arrangement bills", "n", None),
+    ("sku", "Total SKU", "n", None),
+    ("amount", "Total invoice amount", "inr", None),
+    ("§work", "✅ WORK DONE", "sec", None),
+    ("checked", "Bills checked", "n", None),
+    ("uploaded", "Bills uploaded to software", "n", None),
+    ("placed", "Bills placed", "n", None),
+    ("pend_entry", "Pending at end — not entered", "n", "low"),
+    ("pend_check", "Pending at end — not checked", "n", "low"),
+    ("pend_upload", "Pending at end — not uploaded", "n", "low"),
+    ("pend_place", "Pending at end — not placed", "n", "low"),
+    ("§staff", "👥 STAFF & TIME", "sec", None),
+    ("staff", "Staff present (avg per day)", "x", None),
+    ("staff_hours", "Staff hours present", "t", None),
+    ("t_check", "Total bill check time", "t", None),
+    ("t_upload", "Total bill upload time", "t", None),
+    ("t_place", "Total placement time", "t", None),
+    ("avg_check", "Avg bill check time (per bill)", "t", "low"),
+    ("avg_upload", "Avg bill upload time (per bill)", "t", "low"),
+    ("avg_place", "Avg placement time (per bill)", "t", "low"),
+    ("per_hr", "Bills uploaded per staff hour", "x", "high"),
+    ("§wait", "⏳ WAITING — where bills get stuck", "sec", None),
+    ("w_entry", "Avg wait: arrival → register entry", "m", "low"),
+    ("w_check", "Avg wait: entry → bill check", "m", "low"),
+    ("w_upload", "Avg wait: check → upload", "m", "low"),
+    ("w_place", "Avg wait: upload → placement", "m", "low"),
+    ("to_soft", "Avg time: stock arrived → in software", "m", "low"),
+    ("wait2h", "Bills that waited 2 h+ at a step", "n", None),
+    ("bottleneck", "🚧 Bottleneck (longest wait)", "txt", None),
+    ("§qual", "⚠️ QUALITY", "sec", None),
+    ("issues", "Issues found at bill check", "n", None),
+    ("bounces", "Bounced / short medicines reported", "n", None),
+    ("§ord", "📦 CUSTOMER & NORMAL ORDERS", "sec", None),
+    ("cust_total", "Customer medicines due", "n", None),
+    ("cust_ontime", "Customer medicines ready on time", "pct", "high"),
+    ("fu_vu", "Normal orders in software on time — 🔴 Very Urgent", "pct", "high"),
+    ("fu_reg", "Normal orders in software on time — 🟢 Regular", "pct", "high"),
+    ("fu_late", "Normal orders late and still open", "n", None),
+]
+AREA_STAGE_LABEL = {"w_entry": "📒 Register entry", "w_check": "✔️ Bill check", "w_upload": "📤 Bill upload",
+                    "w_place": "📍 Placement"}
+
+
+def _fu_raw_between(lo_s, hi_s):
+    orders = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Purchase Order").gte("date", lo_s).lte("date", hi_s))
+              if (t.get("details") or {}).get("fu") and t.get("status") != "In Progress"]
+    if not orders:
+        return orders, [], [], []
+    regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", lo_s))
+    ups = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Bill Upload (Software)").gte("date", lo_s))
+    try:
+        photos = fetch_all("bill_arrivals", lambda q: q.gte("date", lo_s))
+    except Exception:
+        photos = []
+    return orders, regs, ups, photos
+
+
+def _rep_load_area(lo_s, hi_s):
+    """everything the area report needs from lo_s - 3 days to hi_s"""
+    pre = _ds(datetime.strptime(lo_s, "%Y-%m-%d") - timedelta(days=3))
+    D = {"journeys": build_bill_journeys(pre, hi_s, hi_s)}
+    try:
+        D["arrivals"] = fetch_all("bill_arrivals", lambda q: q.gte("date", pre).lte("date", hi_s))
+    except Exception:
+        D["arrivals"] = []
+    try:
+        lo_iso = IST.localize(datetime.strptime(lo_s, "%Y-%m-%d")).isoformat()
+        D["bounces"] = fetch_all("bounce_items", lambda q: q.gte("reported_at", lo_iso))
+    except Exception:
+        D["bounces"] = []
+    try:
+        D["lines"] = fetch_all("customer_order_lines", lambda q: q.gte("scheduled_date", lo_s).lte("scheduled_date", hi_s))
+    except Exception:
+        D["lines"] = []
+    try:
+        D["fu"] = _fu_raw_between(lo_s, hi_s)
+    except Exception:
+        D["fu"] = ([], [], [], [])
+    try:
+        D["att"] = fetch_all("attendance_log", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        D["att"] = []
+    try:
+        D["wal"] = fetch_all("work_area_log", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        D["wal"] = []
+    return D
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _area_ctx(D, now_n):
+    """pre-computed pieces shared by every column (fu records, stock staff per day)"""
+    fu = fu_records(D["fu"], now_n=now_n) if D["fu"][0] else []
+    area_of = {}
+    for w in sorted(D["wal"], key=lambda w: str(w.get("chosen_at") or "")):
+        if w.get("area"):
+            area_of[(w.get("person"), str(w.get("date"))[:10])] = w["area"]      # last choice of the day wins
+    ev = {}
+    for e in D["att"]:
+        ev.setdefault((e.get("person"), str(e.get("date"))[:10]), []).append(e)
+    last_end = {}      # latest task end per person-day (only used when someone forgot to clock out)
+    for j in D["journeys"]:
+        for t in [j["reg"]] + [s["task"] for s in j["stages"] if s.get("task")]:
+            last_end.setdefault((t.get("person"), str(t.get("date"))[:10]), []).append(t.get("end_time") or t.get("time") or "")
+    staff = {}        # date -> [(person, area, present secs)]
+    today_s = _ds(now_n)
+    for (p, d), a in area_of.items():
+        evs = sorted(ev.get((p, d), []), key=lambda e: str(e.get("at")))
+        if not any(e.get("event") == "clock_in" for e in evs):
+            continue
+        s = att_state(evs)
+        cin, cout = _naive(s["clock_in"]), _naive(s["clock_out"])
+        end = cout or (now_n if d == today_s else
+                       (_rep_dt(d, max(last_end[(p, d)], key=time_sort_key)) if last_end.get((p, d)) else None))
+        staff.setdefault(d, []).append((p, a, (end - cin).total_seconds() if cin and end and end > cin else 0))
+    return {"fu": fu, "staff": staff}
+
+
+def area_metrics(D, ctx, area, blo, bhi, now_n):
+    """all metrics of one area (None = all areas) for dates blo..bhi -> {key: value}"""
+    lo_s, hi_s = _ds(blo), _ds(bhi)
+    inb = lambda s: s is not None and lo_s <= str(s)[:10] <= hi_s
+    ina = lambda a: area in (None, "", "All Areas") or a == area
+    end = min(datetime.combine(bhi + timedelta(days=1), datetime.min.time()), now_n)
+    jb = ctx.setdefault("_j_by_area", {})
+    if area not in jb:                                   # split the bills by area once, reused by every column
+        jb[area] = [j for j in D["journeys"] if ina(j["d"].get("area"))]
+    from8 = _ds(blo - timedelta(days=8))                # bills entered up to 8 days before the column still count
+    J = [j for j in jb[area] if from8 <= str(j["reg"].get("date"))[:10] <= hi_s]
+    M = {}
+    # incoming
+    M["arrived"] = sum(int(_to_float(a.get("bills"), 0)) for a in D["arrivals"] if inb(a.get("date")) and ina(a.get("area")))
+    reg_b = [j for j in J if inb(j["reg"].get("date"))]
+    M["entered"] = len(reg_b)
+    M["entered_arr"] = sum(1 for j in reg_b if str(j["d"].get("arrangement_no") or "").strip())
+    M["sku"] = sum(int(_to_float(j["d"].get("no_items"), 0)) for j in reg_b)
+    M["amount"] = sum(_to_float(j["d"].get("bill_amount"), 0) for j in reg_b)
+    # work done in the period (each bill's step counted on the day it was done)
+    done = {0: [], 1: [], 2: []}
+    for j in J:
+        for i, s in enumerate(j["stages"]):
+            if s.get("task") and inb(s["task"].get("date")):
+                done[i].append(s["task"])
+    M["checked"], M["uploaded"], M["placed"] = len(done[0]), len(done[1]), len(done[2])
+    M["t_check"], M["t_upload"], M["t_place"] = (sum(task_secs(t) for t in done[i]) for i in (0, 1, 2))
+    M["avg_check"] = M["t_check"] / M["checked"] if M["checked"] else None
+    M["avg_upload"] = M["t_upload"] / M["uploaded"] if M["uploaded"] else None
+    M["avg_place"] = M["t_place"] / M["placed"] if M["placed"] else None
+    issues = 0
+    for t in done[0]:
+        dd = t.get("details") or {}
+        issues += sum(int(_to_float(dd.get(f), 0)) for f, _ in ISSUE_FIELDS)
+    M["issues"] = issues
+    # pending at the end of the period (bills entered in the 7 days before)
+    recent = [j for j in J if j["entered"] and end - timedelta(days=7) <= j["entered"] <= end]
+    late = lambda x: x is None or x > end
+    M["pend_check"] = sum(1 for j in recent if late(j["checked"]))
+    M["pend_upload"] = sum(1 for j in recent if late(j["uploaded"]))
+    M["pend_place"] = sum(1 for j in recent if j.get("need_pl") and late(j["placed"]))
+    entered_by_arr = {}
+    for j in J:
+        aid = str(j["d"].get("arrival_id") or "")
+        if aid and j["entered"] and j["entered"] <= end:
+            entered_by_arr[aid] = entered_by_arr.get(aid, 0) + 1
+    pe = 0
+    for a in D["arrivals"]:
+        t = _naive(to_ist(a.get("arrived_at")))
+        if ina(a.get("area")) and t and end - timedelta(days=2) <= t <= end:
+            pe += max(0, int(_to_float(a.get("bills"), 0)) - entered_by_arr.get(str(a.get("id")), 0))
+    M["pend_entry"] = pe
+    # staff
+    days = (bhi - blo).days + 1
+    rows = [r for d, rs in ctx["staff"].items() if lo_s <= d <= hi_s for r in rs if ina(r[1])]
+    M["staff"] = round(len(rows) / days, 1) if rows else 0
+    M["staff_hours"] = sum(r[2] for r in rows)
+    M["per_hr"] = round(M["uploaded"] / (M["staff_hours"] / 3600), 2) if M["staff_hours"] >= 600 else None
+    # waiting — bills that ARRIVED in the period, followed until done (even on a later day)
+    arr_b = [j for j in J if j["arrived"] and lo_s <= _ds(j["arrived"]) <= hi_s]
+    waits = {"w_entry": [], "w_check": [], "w_upload": [], "w_place": []}
+    w2 = 0
+    for j in arr_b:
+        mine = []
+        if j["entry_delay"] is not None and j["entry_delay"] >= 0:
+            mine.append(("w_entry", j["entry_delay"]))
+        prev = j["entered"] or j["arrived"]           # each step's wait starts when the step before it ended
+        for k, s in zip(("w_check", "w_upload", "w_place"), j["stages"]):
+            if not s.get("task"):
+                break
+            if s.get("start") and prev and s["start"] >= prev and (k != "w_place" or j.get("need_pl")):
+                mine.append((k, (s["start"] - prev).total_seconds() / 60))
+            prev = s.get("end") or prev
+        for k, v in mine:
+            waits[k].append(v)
+        still = j.get("next") and _stage_wait_mins(j, end) >= 120
+        w2 += 1 if (any(v >= 120 for _, v in mine) or still) else 0
+    for k, v in waits.items():
+        M[k] = _mean(v)
+    M["to_soft"] = _mean([(j["uploaded"] - j["arrived"]).total_seconds() / 60 for j in arr_b
+                          if j["uploaded"] and j["uploaded"] >= j["arrived"]])
+    M["wait2h"] = w2
+    cand = {k: M[k] for k in AREA_STAGE_LABEL if M.get(k) is not None}
+    if cand:
+        k = max(cand, key=cand.get)
+        M["bottleneck"] = f"{AREA_STAGE_LABEL[k]} — {fmt_age(int(cand[k]))} avg wait" if cand[k] >= 1 else "—"
+    else:
+        M["bottleneck"] = "—"
+    # quality
+    M["bounces"] = sum(1 for b in D["bounces"] if inb(_ds(_naive(to_ist(b.get("reported_at")))) if b.get("reported_at") else None)
+                       and ina(b.get("area")))
+    # customer orders
+    cl = [l for l in D["lines"] if inb(l.get("scheduled_date")) and ina(l.get("area")) and not l.get("removed")
+          and l.get("status") not in ("Removed", "Closed")]
+    due_now = [l for l in cl if str(l.get("scheduled_date")) <= _ds(now_n)]
+    ok = 0
+    for l in due_now:
+        due = None
+        try:
+            due = datetime.strptime(f"{l.get('scheduled_date')} {(l.get('delivery_time') or '11:59 PM').strip()}", "%Y-%m-%d %I:%M %p")
+        except Exception:
+            due = datetime.strptime(str(l.get("scheduled_date"))[:10], "%Y-%m-%d").replace(hour=23, minute=59)
+        ra = _naive(line_ready_at(l))
+        if line_ready(l) and ra and ra <= due:
+            ok += 1
+    M["cust_total"] = len(cl)
+    M["cust_ontime"] = round(100 * ok / len(due_now)) if due_now else None
+    fu = [r for r in ctx["fu"] if inb(_ds(r["at"])) and ina(r["area"]) and r["stage"] != "closed"]
+    for key, urg in (("fu_vu", "Very Urgent"), ("fu_reg", "Regular")):
+        den = [r for r in fu if r["urg"] == urg and (r["stage"] == "imported" or now_n > r["deadline"])]
+        M[key] = round(100 * sum(1 for r in den if r["stage"] == "imported" and r["flag"] == "✅") / len(den)) if den else None
+    M["fu_late"] = sum(1 for r in fu if r["stage"] in ("ordered", "arrived") and r["flag"] == "🔴")
+    return M
+
+
+def area_baseline(D, ctx, area, lo, now_n):
+    """daily average of every flagged metric over the REP_BASE_DAYS days before lo"""
+    vals, working = {}, 0
+    for i in range(1, REP_BASE_DAYS + 1):
+        d = lo - timedelta(days=i)
+        m = area_metrics(D, ctx, area, d, d, now_n)
+        if not (m["arrived"] or m["entered"] or m["checked"] or m["uploaded"]):
+            continue                                   # no bill work that day (holiday / no data) -> not in the average
+        working += 1
+        for k, _, _, better in AREA_METRICS:
+            if better and m.get(k) is not None:
+                vals.setdefault(k, []).append(m[k])
+    if working < REP_BASE_MIN_DAYS:
+        return {}                                      # too little history -> no 🔴 / 🟢 yet
+    return {k: _mean(v) for k, v in vals.items()}
+
+
+def _area_fmt(kind, v):
+    if v is None:
+        return "—"
+    if kind == "n":
+        return f"{int(v):,}"
+    if kind == "inr":
+        return _rep_inr(v)
+    if kind == "t":
+        return fmt_secs(v) if v else "0"
+    if kind == "m":
+        return fmt_age(int(round(v)))
+    if kind == "pct":
+        return f"{int(v)}%"
+    if kind == "x":
+        return f"{v:g}"
+    return str(v)
+
+
+def _area_flag(better, v, base):
+    if not better or v is None or base is None or base == 0:
+        return ""
+    if better == "low":
+        return "🔴 " if v > base * (1 + REP_FLAG) else ("🟢 " if v < base * (1 - REP_FLAG) else "")
+    return "🔴 " if v < base * (1 - REP_FLAG) else ("🟢 " if v > base * (1 + REP_FLAG) else "")
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def area_report(view, area, lo_s, hi_s, buckets, areas):
+    """-> [(column label, metrics, baseline)] — only these small results are kept in memory"""
+    now_n = _now_n()
+    lo, hi = datetime.strptime(lo_s, "%Y-%m-%d").date(), datetime.strptime(hi_s, "%Y-%m-%d").date()
+    D = _rep_load_area(_ds(lo - timedelta(days=REP_BASE_DAYS)), hi_s)
+    ctx = _area_ctx(D, now_n)
+    pick = lambda s_: datetime.strptime(s_, "%Y-%m-%d").date()
+    if view == "One area":
+        base = area_baseline(D, ctx, area, lo, now_n)
+        cols = [(lbl, area_metrics(D, ctx, area, pick(a), pick(b), now_n), base) for lbl, a, b in buckets]
+        if len(buckets) > 1:
+            cols.append(("Total / Avg", area_metrics(D, ctx, area, lo, hi, now_n), base))
+        return cols
+    return [(a, area_metrics(D, ctx, a, lo, hi, now_n), area_baseline(D, ctx, a, lo, now_n)) for a in list(areas) + ["All Areas"]]
+
+
+def area_table(cols, base):
+    """cols: [(column label, metrics dict, baseline dict or None)] -> DataFrame"""
+    rows = []
+    for k, label, kind, better in AREA_METRICS:
+        r = {"": label}
+        for name, m, b in cols:
+            r[name] = "" if kind == "sec" else _area_flag(better, m.get(k), (b or {}).get(k)) + _area_fmt(kind, m.get(k))
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def show_area_summary(kp="ra"):
+    st.markdown("#### 📍 Area summary — where we are lagging")
+    lo, hi, buckets = report_period(kp)
+    areas = load_areas()
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        view = st.radio("View", ["One area", "Compare areas"], horizontal=True, key=f"{kp}_view")
+    with c2:
+        area = st.selectbox("Area", areas + ["All Areas"], key=f"{kp}_area") if view == "One area" else None
+    with c3:
+        st.write("")
+        if st.button("🔄 Refresh", key=f"{kp}_ref"):
+            area_report.clear()
+            st.rerun()
+    try:
+        msg = "Adding up the numbers…" + (" (weekly / monthly can take up to a minute the first time)" if len(buckets) > 10
+                                          or (hi - lo).days > 20 else "")
+        with st.spinner(msg):
+            cols = area_report(view, area, _ds(lo), _ds(hi), tuple((l, _ds(a), _ds(b)) for l, a, b in buckets),
+                               tuple(areas))
+        no_hist = view == "One area" and not cols[0][2]
+        title = (f"📍 {area} · " if view == "One area" else "📍 All areas compared · ") + \
+            f"{lo.strftime('%d %b')} – {hi.strftime('%d %b %Y')}"
+    except Exception as e:
+        st.error(f"Could not build the area summary: {e}")
+        return
+    st.markdown(f"**{title}**")
+    df = area_table(cols, None)
+    st.dataframe(df, hide_index=True, width='stretch', height=min(38 * (len(df) + 1), 1500))
+    st.caption(f"🔴 / 🟢 = more than {int(REP_FLAG * 100)}% worse / better than that area's own daily average of the "
+               f"{REP_BASE_DAYS} days before this period. Work done = steps done on that day. Waiting = bills that "
+               "arrived on that day, followed until done (even the next day). Pending = bills of the last 7 days not "
+               "done at the end of the day.")
+    if view == "One area" and no_hist:
+        st.caption(f"ℹ️ 🔴 / 🟢 start once this area has {REP_BASE_MIN_DAYS} working days in the 4 weeks before the period.")
+    if view == "One area":
+        last = cols[-1][1]
+        if last.get("bottleneck") not in (None, "—"):
+            st.info(f"🚧 Biggest delay in this period: {last['bottleneck']}")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame([{"": title}]).to_excel(w, index=False, header=False, sheet_name="Area Summary")
+        df.to_excel(w, index=False, sheet_name="Area Summary", startrow=2)
+        try:
+            ws = w.sheets["Area Summary"]
+            ws.column_dimensions["A"].width = 52
+            for c in ws.iter_cols(min_col=2, max_col=ws.max_column):
+                ws.column_dimensions[c[0].column_letter].width = 22
+        except Exception:
+            pass
+    st.download_button("⬇️ Download Excel", buf.getvalue(),
+                       f"area-summary-{(area or 'all').replace(' ', '-')}-{_ds(lo)}-to-{_ds(hi)}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
+
+
+def show_reports(kp="rep"):
+    st.subheader("📋 Staff & Area Summary")
+    tab = st.radio("Report", ["👤 Staff", "📍 Area"], horizontal=True, key=f"{kp}_tab", label_visibility="collapsed")
+    if tab == "👤 Staff":
+        show_staff_summary(f"{kp}_s")
+    else:
+        show_area_summary(f"{kp}_a")
+
+
+
 def show_admin_page():
     st.title("👑 RapidSurge Warehouse — Admin")
     st.caption(f"Welcome **{st.session_state.name}** | {today_ist().strftime('%A, %d %B %Y')} | {time_str()}")
@@ -14470,7 +15238,7 @@ def show_admin_page():
     pending_reviews_banner()
     st.divider()
 
-    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up'])
+    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
 
     if _nav == '📅 Daily Summary':
         show_daily_summary("adm_ds")
@@ -14489,6 +15257,9 @@ def show_admin_page():
 
     if _nav == '🚚 Order Follow-up':
         show_order_followup("adm_fu")
+
+    if _nav == '📋 Staff & Area Summary':
+        show_reports("adm_rep")
 
     if _nav == '🎯 My Day':
         show_my_day("md")
