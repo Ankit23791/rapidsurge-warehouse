@@ -464,6 +464,7 @@ if not st.session_state.logged_in:
                     st.session_state.username  = username
                     st.session_state.name      = USERS_temp[username]["name"]
                     st.session_state.team      = USERS_temp[username]["team"]
+                    st.session_state.main_team = USERS_temp[username]["team"]
                     st.session_state.role      = USERS_temp[username]["role"]
     except Exception:
         pass
@@ -633,6 +634,7 @@ def show_login():
                 st.session_state.username = username
                 st.session_state.name = USERS_NOW[username]["name"]
                 st.session_state.team = USERS_NOW[username]["team"]
+                st.session_state.main_team = USERS_NOW[username]["team"]
                 st.session_state.role = USERS_NOW[username]["role"]
                 st.session_state.work_area = ""
                 st.session_state["fresh_login"] = True     # Stock: ask the area again after a real login
@@ -646,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v19-Oct staff & area summary"
+APP_VERSION = "v20-Oct team switch"
 
 def show_sidebar():
     with st.sidebar:
@@ -691,7 +693,10 @@ def show_sidebar():
         st.divider()
         st.markdown(f"📅 **{today_ist().strftime('%d %B %Y')}**")
         st.markdown(f"🕐 **{time_str()}**")
-        st.markdown(f"**Team:** {st.session_state.team}")
+        if st.session_state.role != "admin" and len(user_teams(st.session_state.get("username", ""), main_team())) > 1:
+            show_team_switch("side")
+        else:
+            st.markdown(f"**Team:** {st.session_state.team}")
         if st.session_state.role == "admin":
             st.success("👑 Admin")
         # Show current work area for Stock team
@@ -4247,6 +4252,7 @@ def form_porter_payment():
 
 # ── USER PAGE ─────────────────────────────────────────────────────────────────
 def show_user_page():
+    init_work_mode()
     team = st.session_state.team
     sync_form_with_link(team)
 
@@ -4261,6 +4267,7 @@ def show_user_page():
 
     # Area selection for Stock team
     if team == "Stock" and not st.session_state.work_area:
+        show_team_switch("main")
         st.title("📍 Select Your Work Area")
         st.markdown(f"### Welcome {st.session_state.name}! Which area are you working in today?")
         st.divider()
@@ -4294,6 +4301,7 @@ def show_user_page():
             st.query_params.clear()
             st.rerun()
     st.divider()
+    show_team_switch("main")
 
     show_my_shift()
     show_arrival_button()
@@ -11511,6 +11519,162 @@ def show_my_performance():
 FORM_KEYS = {"Stock": "stock_active_form", "Purchase": "purchase_active_form",
              "Call": "call_active_form", "Delivery": "delivery_active_form"}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔀 PEOPLE WHO WORK IN MORE THAN ONE TEAM (e.g. Purchase + Call, Purchase + Stock)
+# Admin gives a person extra teams (Settings → Manage Users). They switch "I'm working on" — the app then becomes
+# exactly that team's app; tasks are saved under that team. Stored in app_settings (no new table).
+# ══════════════════════════════════════════════════════════════════════════════
+SWITCH_TEAMS = ["Purchase", "Call", "Stock", "Delivery"]
+TEAM_ICON = {"Purchase": "🛒", "Call": "📞", "Stock": "📦", "Delivery": "🛵"}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _extra_teams_raw():
+    return get_app_setting("extra_teams", "{}")
+
+
+def extra_teams_map():
+    """{username: [extra teams]}"""
+    try:
+        v = json.loads(_extra_teams_raw() or "{}")
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def main_team():
+    t = st.session_state.get("main_team")
+    if not t:
+        u = (load_users() or {}).get(st.session_state.get("username", ""), {})
+        t = u.get("team") or st.session_state.get("team", "")
+        st.session_state["main_team"] = t
+    return t
+
+
+def user_teams(username, main):
+    """[main team] + extra teams of a user"""
+    ex = [t for t in extra_teams_map().get(username, []) if t in SWITCH_TEAMS and t != main]
+    return [main] + ex
+
+
+def init_work_mode():
+    """once per session: open in the team mode used last (only for people with extra teams)"""
+    if st.session_state.get("_mode_init"):
+        return
+    st.session_state["_mode_init"] = True
+    teams = user_teams(st.session_state.get("username", ""), main_team())
+    if len(teams) < 2:
+        return
+    last = get_app_setting(f"work_mode_{st.session_state.get('username', '')}", "")
+    if last in teams and last != st.session_state.get("team"):
+        st.session_state.team = last
+        if last == "Stock" and not st.session_state.get("work_area"):
+            lock = get_area_lock(st.session_state.name)
+            if lock and lock.get("area"):
+                st.session_state.work_area = lock["area"]
+                st.session_state["fresh_login"] = False
+
+
+def switch_team(new):
+    """change 'I'm working on' — not while a task timer runs; closes the hourly block"""
+    running, _ = get_active_timer()
+    if running:
+        st.session_state["_switch_err"] = (f"⏱️ Finish or cancel the running task "
+                                           f"({running.replace('_', ' ').title()}) first, then switch.")
+        st.rerun()
+    me, old = st.session_state.name, st.session_state.team
+    closed = False
+    try:
+        blk = _my_open_block_db(me)
+        if blk:
+            close_block(blk, f"Switched to {new} work")
+            closed = True
+    except Exception:
+        pass
+    _blk_reset()
+    for fk in FORM_KEYS.values():
+        st.session_state[fk] = None
+    st.session_state["show_pipeline"] = None
+    try:
+        if "f" in st.query_params:
+            del st.query_params["f"]
+    except Exception:
+        pass
+    st.session_state.team = new
+    if new == "Stock":
+        st.session_state["fresh_login"] = False
+        lock = get_area_lock(me)
+        st.session_state.work_area = lock["area"] if lock and lock.get("area") else ""
+    try:
+        set_app_setting(f"work_mode_{st.session_state.username}", new)
+    except Exception:
+        pass
+    try:
+        att_log("team_switch", break_type=new)      # audit: when the person switched (not counted as a task)
+    except Exception:
+        pass
+    st.session_state["_switch_msg"] = (f"🔀 Now working on {TEAM_ICON.get(new, '')} {new} (was {old})"
+                                       + (" — your hourly block was closed, plan the next one for this work" if closed else ""))
+    st.rerun()
+
+
+def show_team_switch(where="main"):
+    teams = user_teams(st.session_state.get("username", ""), main_team())
+    if len(teams) < 2:
+        return
+    cur = st.session_state.team
+    if where == "main":
+        for k, fn in (("_switch_msg", st.success), ("_switch_err", st.error)):
+            m = st.session_state.pop(k, None)
+            if m:
+                fn(m)
+        cols = st.columns([2] + [1] * (len(teams) - 1))
+        cols[0].markdown(f"#### 🔀 Working on: {TEAM_ICON.get(cur, '')} {cur}")
+        for col, t in zip(cols[1:], [t for t in teams if t != cur]):
+            with col:
+                if st.button(f"Switch to {TEAM_ICON.get(t, '')} {t}", key=f"sw_{where}_{t}", width='stretch'):
+                    switch_team(t)
+    else:
+        st.markdown(f"**🔀 Working on:** {TEAM_ICON.get(cur, '')} {cur}")
+        for t in [t for t in teams if t != cur]:
+            if st.button(f"Switch to {TEAM_ICON.get(t, '')} {t}", key=f"sw_{where}_{t}", width='stretch'):
+                switch_team(t)
+
+
+def show_extra_teams_admin(users_rows):
+    """Settings → Manage Users: who also works in other teams"""
+    with st.expander("🔀 People who work in more than one team", expanded=False):
+        st.caption("Give a person extra teams (e.g. Purchase + Call). They get a switch **'Working on: …'** and the app "
+                   "becomes that team's app; their tasks are saved under that team. League: main team only.")
+        m = extra_teams_map()
+        act = [u for u in users_rows if u.get("active") and u.get("role") != "admin"]
+        if m:
+            st.dataframe(pd.DataFrame([{"Person": next((u["name"] for u in act if u["username"] == k), k),
+                                        "Main team": next((u.get("team") for u in act if u["username"] == k), ""),
+                                        "Also works in": " + ".join(v)} for k, v in m.items() if v]),
+                         hide_index=True, width='stretch')
+        if not act:
+            return
+        opts = {f"{u['name']} ({u['username']}) — {u.get('team', '')}": u for u in act}
+        u = opts[st.selectbox("Person", list(opts), key="xt_user")]
+        others = [t for t in SWITCH_TEAMS if t != u.get("team")]
+        cur = [t for t in m.get(u["username"], []) if t in others]
+        sel = st.multiselect(f"Extra teams for {u['name']}", others, default=cur, key=f"xt_sel_{u['username']}")
+        if st.button("💾 Save", key="xt_save", type="primary"):
+            if sel:
+                m[u["username"]] = sel
+            else:
+                m.pop(u["username"], None)
+            try:
+                set_app_setting("extra_teams", json.dumps(m))
+                _extra_teams_raw.clear()
+                st.success(f"✅ {u['name']}: " + (f"{u.get('team')} + " + " + ".join(sel) if sel else "main team only")
+                           + " — applies at their next login")
+            except Exception as e:
+                st.error(f"Could not save: {e}")
+
+
 def get_area_lock(person):
     """Area chosen by / set for this person today (kept until they log out and log in again)"""
     try:
@@ -14653,6 +14817,15 @@ REP_TEAM_ORDER = ["Stock", "Purchase", "Call", "Delivery"]
 
 
 def rep_row_of(t, team):
+    """row label of a task; team can be one team or a list (people who work in several teams)"""
+    if isinstance(team, (list, tuple)):
+        multi = len(team) > 1
+        own = t.get("team") if t.get("team") in team else None
+        for tm in ([own] if own else []) + [x for x in team if x != own]:
+            lbl = rep_row_of(t, tm)
+            if lbl != "Others":
+                return (TEAM_ICON.get(tm, "") + " " + lbl) if multi else lbl
+        return "Others"
     tt = t.get("task_type", "")
     for label, how in REP_ROWS.get(team, []):
         if how in ("PO_SHEET", "PO_OTHER"):
@@ -14689,13 +14862,14 @@ def _rep_speed(secs, qty, n):
 
 
 @st.cache_data(ttl=300, max_entries=24, show_spinner=False)
-def _staff_cached(lo_s, hi_s, users_items):
+def _staff_cached(lo_s, hi_s, users_items, extra_items=()):
     lo, hi = datetime.strptime(lo_s, "%Y-%m-%d").date(), datetime.strptime(hi_s, "%Y-%m-%d").date()
-    return staff_summary_data(lo, hi, dict(users_items))
+    return staff_summary_data(lo, hi, dict(users_items), extra={k: list(v) for k, v in extra_items})
 
 
-def staff_summary_data(lo, hi, users, now_n=None):
-    """-> {person: {...}} totals for the period (users: {name: team})"""
+def staff_summary_data(lo, hi, users, now_n=None, extra=None):
+    """-> {person: {...}} totals for the period (users: {name: main team}; extra: {name: [extra teams]})"""
+    extra = extra or {}
     now_n = now_n or _now_n()
     tasks, att, wal = _rep_load_people(_ds(lo), _ds(hi))
     by_pd, ev_pd, area_of = {}, {}, {}
@@ -14711,10 +14885,14 @@ def staff_summary_data(lo, hi, users, now_n=None):
             area_of[w["person"]][w["area"]] = area_of[w["person"]].get(w["area"], 0) + 1
     out = {}
     for name, team in users.items():
-        P = {"name": name, "team": team, "days": 0, "days_active": 0, "present": 0, "work": 0, "tasks": 0, "qty": 0,
-             "lunch": 0, "lunch_n": 0, "brk": 0, "brk_n": 0, "rest": 0, "rest_n": 0, "rows": {}, "per_day": []}
-        for label, _ in REP_ROWS.get(team, []):
-            P["rows"][label] = {"n": 0, "secs": 0, "qty": 0}
+        teams = [team] + [x for x in extra.get(name, []) if x != team]
+        multi = len(teams) > 1
+        P = {"name": name, "team": team, "teams": teams, "days": 0, "days_active": 0, "present": 0, "work": 0,
+             "tasks": 0, "qty": 0, "lunch": 0, "lunch_n": 0, "brk": 0, "brk_n": 0, "rest": 0, "rest_n": 0,
+             "rows": {}, "per_day": [], "team_secs": {}}
+        for tm in teams:
+            for label, _ in REP_ROWS.get(tm, []):
+                P["rows"][(TEAM_ICON.get(tm, "") + " " + label) if multi else label] = {"n": 0, "secs": 0, "qty": 0}
         P["rows"]["Others"] = {"n": 0, "secs": 0, "qty": 0}
         d = lo
         while d <= hi:
@@ -14729,9 +14907,12 @@ def staff_summary_data(lo, hi, users, now_n=None):
                 for t in tl:
                     if t.get("status") == "In Progress":
                         continue
-                    r = P["rows"].setdefault(rep_row_of(t, team), {"n": 0, "secs": 0, "qty": 0})
+                    r = P["rows"].setdefault(rep_row_of(t, teams), {"n": 0, "secs": 0, "qty": 0})
                     r["n"] += 1
-                    r["secs"] += task_secs(t)
+                    secs = task_secs(t)
+                    r["secs"] += secs
+                    tm = t.get("team") if t.get("team") in teams else team
+                    P["team_secs"][tm] = P["team_secs"].get(tm, 0) + secs
                     q = rep_qty(t)
                     r["qty"] += q
                     P["qty"] += q
@@ -14768,7 +14949,8 @@ def _staff_compare_df(data):
     rows = []
     for P in data:
         base = P["present"] - P["lunch"] - P["brk"]
-        rows.append({"Person": P["name"], "Team": P["team"], "Area": P["area"], "Days present": P["days"],
+        rows.append({"Person": P["name"], "Team": " + ".join(P.get("teams") or [P["team"]]), "Area": P["area"],
+                     "Days present": P["days"],
                      "Total time": _rep_t(P["present"]), "Work time": _rep_t(P["work"]),
                      "Rest time": _rep_t(P["rest"]), "Lunch": _rep_t(P["lunch"]), "Breaks": _rep_t(P["brk"]),
                      "Tasks": P["tasks"], "SKU / Qty": P["qty"],
@@ -14779,12 +14961,17 @@ def _staff_compare_df(data):
 def show_staff_summary(kp="rs"):
     st.markdown("#### 👤 Staff summary — what each person did")
     lo, hi, _ = report_period(kp)
-    users = {u["name"]: u.get("team", "") for u in (load_users() or {}).values() if u.get("role") != "admin"}
+    allu = [u for u in (load_users() or {}).values() if u.get("role") != "admin"]
+    users = {u["name"]: u.get("team", "") for u in allu}
+    xmap = extra_teams_map()
+    uname = {u["name"]: k for k, u in (load_users() or {}).items()}
+    extra = {n: [t for t in xmap.get(uname.get(n, ""), []) if t != users[n]] for n in users}
+    extra = {n: v for n, v in extra.items() if v}
     teams = [t for t in REP_TEAM_ORDER if t in set(users.values())] + sorted(set(users.values()) - set(REP_TEAM_ORDER))
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
         team = st.selectbox("Team", ["All teams"] + teams, key=f"{kp}_team")
-    pool = {n: t for n, t in users.items() if team == "All teams" or t == team}
+    pool = {n: t for n, t in users.items() if team == "All teams" or t == team or team in extra.get(n, [])}
     with c2:
         who = st.selectbox("Person", ["Everyone"] + sorted(pool), key=f"{kp}_who")
     with c3:
@@ -14799,7 +14986,8 @@ def show_staff_summary(kp="rs"):
         return
     try:
         with st.spinner("Adding up the work…"):
-            data = _staff_cached(_ds(lo), _ds(hi), tuple(sorted(pool.items())))
+            data = _staff_cached(_ds(lo), _ds(hi), tuple(sorted(pool.items())),
+                                 tuple(sorted((n, tuple(v)) for n, v in extra.items() if n in pool)))
     except Exception as e:
         st.error(f"Could not load the work: {e}")
         return
@@ -14816,7 +15004,7 @@ def show_staff_summary(kp="rs"):
         st.caption("No activity in this period: " + ", ".join(absent))
     for P in seen:
         with st.container(border=True):
-            head = f"**{P['name']}** · {P['team']}" + (f" · 📍 {P['area']}" if P["area"] else "") + \
+            head = f"**{P['name']}** · {' + '.join(P.get('teams') or [P['team']])}" + (f" · 📍 {P['area']}" if P["area"] else "") + \
                 f" · {P['days']} day(s) clocked in" + \
                 (f" · {P['days_active']} day(s) with work" if P["days_active"] != P["days"] else "")
             if lo == hi and P["per_day"]:
@@ -14824,6 +15012,9 @@ def show_staff_summary(kp="rs"):
                 head += f" · 🟢 In {s['cin'].strftime('%I:%M %p') if s['cin'] else '—'} → " \
                         f"🔴 Out {s['cout'].strftime('%I:%M %p') if s['cout'] else ('still in' if s['cin'] else '—')}"
             st.markdown(head)
+            if len(P.get("teams") or []) > 1:
+                st.caption("Task time by team: " + " · ".join(
+                    f"{TEAM_ICON.get(tm, '')} {tm} {_rep_t(P['team_secs'].get(tm, 0))}" for tm in P["teams"]))
             st.dataframe(_staff_card_df(P), hide_index=True, width='stretch')
     if not seen:
         st.info("No work recorded for this period.")
@@ -16347,6 +16538,7 @@ def show_admin_page():
                                 st.error(f"❌ {f} — run fix_roles.sql in Supabase (see Claude's note), then try again")
                             if not done and not failed:
                                 st.info("Nothing changed — edit a cell first, then Save.")
+                show_extra_teams_admin(users_resp.data or [])
                 if users_resp.data:
                     for u in users_resp.data:
                         c1,c2,c3,c4,c5 = st.columns([2,2,2,1,1])
@@ -16497,6 +16689,8 @@ def main():
     if not st.session_state.logged_in:
         show_login()
     else:
+        if st.session_state.role != "admin":
+            init_work_mode()
         show_sidebar()
         if st.session_state.role == "admin":
             show_admin_page()
