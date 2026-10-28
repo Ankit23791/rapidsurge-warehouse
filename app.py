@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v20-Oct team switch"
+APP_VERSION = "v21-Oct order time & arrangement times"
 
 def show_sidebar():
     with st.sidebar:
@@ -5657,7 +5657,73 @@ BACKEND_COLS = {
     "packsize": "pack_size", "pack": "pack_size",
     "qty": "qty", "quantity": "qty",
     "rx": "rx", "unitprice": "unit_price", "linetotal": "line_total",
+    "orderdate": "order_date", "customerorderdate": "order_date", "chatdate": "order_date",
+    "ordertime": "order_time", "customerordertime": "order_time", "chattime": "order_time", "orderedat": "order_time",
 }
+
+# ── CUSTOMER ORDER TIME (from the chat team's sheet, brought in with VLOOKUP) ──
+ORDER_TIME_SQL = "alter table public.customer_order_lines add column if not exists order_time text;"
+_TIME_FMTS = ("%I:%M:%S %p", "%I:%M %p", "%I:%M%p", "%I:%M:%S%p", "%H:%M:%S", "%H:%M", "%H.%M")
+_DATE_FMTS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y", "%d-%b-%Y", "%d %b %Y", "%Y/%m/%d")
+
+
+def _any_time(v):
+    """'10:50', '8:40:06 AM', '22:15:00', Excel fraction 0.4513, '1899-12-30 10:50:00' -> time or None"""
+    s = _clean_str(v)
+    if not s:
+        return None
+    try:
+        f = float(s)
+        if 0 <= f < 1:                                     # Excel time stored as a fraction of a day
+            secs = int(round(f * 86400)) % 86400
+            return datetime(2000, 1, 1, secs // 3600, secs % 3600 // 60, secs % 60).time()
+    except Exception:
+        pass
+    if " " in s and re.match(r"^\d{4}-\d{2}-\d{2} ", s):    # '1899-12-30 10:50:00' / '2026-10-28 10:50:00'
+        s = s.split(" ", 1)[1]
+    s = s.upper().replace(".", ":") if re.match(r"^\d{1,2}\.\d{2}$", s) else s.upper()
+    for fmt in _TIME_FMTS:
+        try:
+            return datetime.strptime(s.strip(), fmt).time()
+        except Exception:
+            pass
+    return None
+
+
+def _any_date(v, near=None):
+    """date text in any common format; '10/11/2026' (day or month first?) -> the reading closest to `near`"""
+    s = _clean_str(v)
+    if not s:
+        return None
+    s = s.split(" ")[0] if re.match(r"^\d{4}-\d{2}-\d{2}[ T]", s) else s
+    found = []
+    for fmt in _DATE_FMTS:
+        try:
+            d = datetime.strptime(s, fmt).date()
+            if d not in found:
+                found.append(d)
+        except Exception:
+            pass
+    if not found:
+        return None
+    if near and len(found) > 1:
+        return min(found, key=lambda d: abs((d - near).days))
+    return found[0]
+
+
+def order_time_iso(date_v, time_v, fallback_date=None):
+    """customer's order date + time -> '2026-10-28T10:50:00+05:30' (None when the time is missing)"""
+    t = _any_time(time_v)
+    if t is None:
+        return None
+    if _clean_str(time_v) and re.match(r"^\d{4}-\d{2}-\d{2} ", _clean_str(time_v)) and \
+            not _clean_str(time_v).startswith(("1899", "1900")) and not _clean_str(date_v):
+        date_v = _clean_str(time_v).split(" ")[0]          # the time cell already holds the full date + time
+    d = _any_date(date_v, near=fallback_date) or fallback_date
+    if d is None:
+        return None
+    return IST.localize(datetime.combine(d, t)).isoformat()
+
 
 def now_iso():
     return now_ist().isoformat()
@@ -5736,10 +5802,14 @@ def parse_backend_file(uploaded):
         if key in lines:                       # same item twice in one order -> add qty
             lines[key]["qty"] += qty
             continue
+        sched = _clean_str(r.get("scheduled_date"))[:10]
+        ot = order_time_iso(r.get("order_date"), r.get("order_time"),
+                            _any_date(sched) or today_ist()) if "order_time" in df.columns else None
         lines[key] = {
             "line_key": key,
             "order_no": order_no,
-            "scheduled_date": _clean_str(r.get("scheduled_date"))[:10],
+            "order_time": ot,
+            "scheduled_date": sched,
             "customer_name": _clean_str(r.get("customer_name")),
             "customer_phone": _clean_str(r.get("customer_phone")),
             "item_name": item,
@@ -5749,6 +5819,14 @@ def parse_backend_file(uploaded):
             "unit_price": _to_float(r.get("unit_price"), 0),
             "line_total": _to_float(r.get("line_total"), 0),
         }
+    first = {}                                   # one order = one customer order time: the earliest of its rows
+    for l in lines.values():
+        if l["order_time"] and (l["order_no"] not in first or l["order_time"] < first[l["order_no"]]):
+            first[l["order_no"]] = l["order_time"]
+    for l in lines.values():
+        l["order_time"] = first.get(l["order_no"])
+        if not l["order_time"]:
+            l.pop("order_time")
     return list(lines.values()), None
 
 def _chunks(seq, n):
@@ -5777,14 +5855,29 @@ def import_order_lines(lines, area):
     existing = {}
     for part in _chunks(keys, 80):
         resp = supabase.table("customer_order_lines")\
-            .select("id,line_key,area,status,removed,qty").in_("line_key", part).execute()
+            .select("*").in_("line_key", part).execute()
         for r in resp.data or []:
             existing[r["line_key"]] = r
+    # medicines the purchase team already added by hand to these orders -> don't add them twice
+    hand = set()
+    try:
+        for part in _chunks(sorted({l["order_no"] for l in lines}), 80):
+            for r in supabase.table("customer_order_lines").select("order_no,item_name,pack_size,line_key")\
+                    .in_("order_no", part).like("line_key", "manual|%").execute().data or []:
+                hand.add((str(r.get("order_no")), str(r.get("item_name") or "").strip().lower(),
+                          str(r.get("pack_size") or "").strip().lower()))
+    except Exception:
+        hand = set()
+    time_fills = []
 
     new_rows, seen_ids, wrong_area = [], [], []
     restored = qty_changed = 0
     for l in lines:
         ex = existing.get(l["line_key"])
+        if not ex and (str(l["order_no"]), l["item_name"].strip().lower(), (l.get("pack_size") or "").strip().lower()) in hand:
+            continue                                    # already added by hand
+        if ex and l.get("order_time") and not ex.get("order_time"):
+            time_fills.append((ex["id"], l["order_time"]))
         if not ex:
             row = dict(l)
             row.update({"area": area, "status": "Pending", "qty_arranged": 0, "qty_received": 0,
@@ -5808,8 +5901,22 @@ def import_order_lines(lines, area):
 
     for part in _chunks(seen_ids, 100):
         supabase.table("customer_order_lines").update({"last_seen_at": now}).in_("id", part).execute()
+    no_time_col = False
     for part in _chunks(new_rows, 200):
-        supabase.table("customer_order_lines").insert(part).execute()
+        try:
+            supabase.table("customer_order_lines").insert(part).execute()
+        except Exception as e:
+            if "order_time" not in str(e):
+                raise
+            no_time_col = True                         # column not added in Supabase yet -> save without the time
+            supabase.table("customer_order_lines").insert([{k: v for k, v in r.items() if k != "order_time"}
+                                                           for r in part]).execute()
+    for lid, ot in time_fills:
+        try:
+            supabase.table("customer_order_lines").update({"order_time": ot}).eq("id", lid).execute()
+        except Exception:
+            no_time_col = True
+            break
 
     # Lines of the same area + scheduled dates that are no longer in the file -> Removed
     removed = 0
@@ -5819,14 +5926,17 @@ def import_order_lines(lines, area):
             .eq("area", area).eq("status", "Pending").eq("removed", False)\
             .in_("scheduled_date", dates).execute()
         file_keys = set(keys)
-        gone = [r["id"] for r in (resp.data or []) if r["line_key"] not in file_keys]
+        gone = [r["id"] for r in (resp.data or []) if r["line_key"] not in file_keys
+                and not str(r["line_key"]).startswith("manual|")]          # hand-added lines are never removed
         for part in _chunks(gone, 100):
             supabase.table("customer_order_lines").update(
                 {"removed": True, "status": "Removed"}).in_("id", part).execute()
         removed = len(gone)
 
     return {"new": len(new_rows), "existing": len(seen_ids), "restored": restored,
-            "qty_changed": qty_changed, "removed": removed, "wrong_area": wrong_area}
+            "qty_changed": qty_changed, "removed": removed, "wrong_area": wrong_area,
+            "times": len({l["order_no"] for l in lines if l.get("order_time")}), "no_time_col": no_time_col,
+            "time_filled": len(time_fills)}
 
 def get_open_lines(area=None):
     """all open customer lines — paged, because Supabase returns max 1000 rows per request
@@ -5869,12 +5979,21 @@ def refresh_line_status(line_id):
 # ── PURCHASE: IMPORT ──────────────────────────────────────────────────────────
 CUSTOMER_ORDER_SAMPLE = pd.DataFrame([
     {"Scheduled Date": "2026-10-01", "Order #": "ORD10231", "Customer Name": "Rahul Sharma", "Customer Phone": "9876543210",
-     "Item Name": "Dolo 650 Tablet", "Pack Size": "15 Tablet", "Qty": 2, "Rx": "No", "Unit Price": 30.5, "Line Total": 61},
+     "Item Name": "Dolo 650 Tablet", "Pack Size": "15 Tablet", "Qty": 2, "Rx": "No", "Unit Price": 30.5, "Line Total": 61,
+     "Order Date": "2026-10-01", "Order Time": "10:50 AM"},
     {"Scheduled Date": "2026-10-01", "Order #": "ORD10231", "Customer Name": "Rahul Sharma", "Customer Phone": "9876543210",
-     "Item Name": "Telma 40 Tablet", "Pack Size": "30 Tablet", "Qty": 1, "Rx": "Yes", "Unit Price": 245, "Line Total": 245},
+     "Item Name": "Telma 40 Tablet", "Pack Size": "30 Tablet", "Qty": 1, "Rx": "Yes", "Unit Price": 245, "Line Total": 245,
+     "Order Date": "2026-10-01", "Order Time": "10:50 AM"},
     {"Scheduled Date": "2026-10-02", "Order #": "ORD10232", "Customer Name": "Priya Verma", "Customer Phone": "9811122233",
-     "Item Name": "Volini Gel", "Pack Size": "30 gm", "Qty": 1, "Rx": "No", "Unit Price": 150, "Line Total": 150},
+     "Item Name": "Volini Gel", "Pack Size": "30 gm", "Qty": 1, "Rx": "No", "Unit Price": 150, "Line Total": 150,
+     "Order Date": "2026-10-01", "Order Time": "11:40 PM"},
 ])
+ORDER_TIME_HELP = [
+    "Order Date + Order Time = when the CUSTOMER placed the order (from the chat team's sheet).",
+    "Bring BOTH the date and the time with VLOOKUP — an order at 11:40 PM is often imported the next morning.",
+    "Match on the customer phone number. Any time format works: 10:50 / 10:50 AM / 22:50:00.",
+    "No match in the chat sheet? Leave the cells empty and add the time later in ⏰ Missing order time.",
+]
 
 def customer_order_template():
     notes = pd.DataFrame({"How to fill": [
@@ -5886,13 +6005,13 @@ def customer_order_template():
         "Header names can also be: Order No / Order ID, Medicine Name / Item, Pack, Quantity, Customer, Phone / Mobile, Date.",
         "Upload one area/store per file. Re-uploading the same file is safe — only new items are added.",
         "The 3 example rows are samples — delete them before uploading.",
-    ]})
+    ] + ORDER_TIME_HELP})
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         CUSTOMER_ORDER_SAMPLE.to_excel(w, index=False, sheet_name="Customer Orders")
         notes.to_excel(w, index=False, sheet_name="How to fill")
         ws = w.sheets["Customer Orders"]
-        for col, width in zip("ABCDEFGHIJ", [15, 12, 18, 15, 24, 12, 6, 6, 11, 11]):
+        for col, width in zip("ABCDEFGHIJKL", [15, 12, 18, 15, 24, 12, 6, 6, 11, 11, 13, 12]):
             ws.column_dimensions[col].width = width
         w.sheets["How to fill"].column_dimensions["A"].width = 110
     return buf.getvalue()
@@ -5905,15 +6024,263 @@ def show_customer_order_format(expanded=False):
         st.download_button("⬇️ Download sample format (Excel)", customer_order_template(), "customer-orders-format.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="imp_fmt")
 
+IMPORT_VIEWS = ["📥 Import file", "➕ Add order by hand", "⏰ Missing order time"]
+
+
+def show_order_time_guide(expanded=False):
+    with st.expander("🕐 Before importing: add the customer's ORDER DATE + ORDER TIME (VLOOKUP from the chat sheet)",
+                     expanded=expanded):
+        st.markdown(
+            "1. Download the order Excel from the **software**.\n"
+            "2. Download the **chat team's sheet** (Purchase report).\n"
+            "3. In the software Excel add **two columns: `Order Date` and `Order Time`** and fill them with "
+            "**VLOOKUP from the chat sheet** — match on the **customer phone number**.\n"
+            "4. ⚠️ Bring **BOTH the date and the time**. An order taken at 11:40 PM is often imported the next morning — "
+            "without the date the app can't tell which day it was ordered.\n"
+            "5. Any time format works: `10:50` · `10:50 AM` · `22:50:00`. No match in the chat sheet? Leave it empty and "
+            "fill it in **⏰ Missing order time**.\n"
+            "6. Chat team missed an order or some medicines? Add them in **➕ Add order by hand**.")
+        st.caption("Why: the app measures how fast we order, pick up, upload and call — from the moment the customer ordered.")
+
+
+def _recent_lines(days=7, area=None):
+    since = IST.localize(datetime.combine(today_ist() - timedelta(days=days), datetime.min.time())).isoformat()
+    def build(q):
+        q = q.eq("removed", False).gte("imported_at", since)
+        return q.eq("area", area) if area else q
+    return fetch_all("customer_order_lines", build)
+
+
+def _orders_missing_time(days=3):
+    """{order_no: [lines]} of recent orders with no customer order time; None = the column is not in Supabase yet"""
+    lines = _recent_lines(days)
+    if lines and "order_time" not in lines[0]:
+        return None
+    by = {}
+    for l in lines:
+        if l.get("status") in ("Removed", "Closed"):
+            continue
+        by.setdefault(str(l.get("order_no")), []).append(l)
+    return {o: ls for o, ls in by.items() if not any(x.get("order_time") for x in ls)}
+
+
+def count_missing_order_time():
+    try:
+        m = _orders_missing_time()
+        return len(m) if m else 0
+    except Exception:
+        return 0
+
+
+def _insert_lines(rows):
+    """-> True if saved with the order time, False if the order_time column is missing (saved without it)"""
+    try:
+        supabase.table("customer_order_lines").insert(rows).execute()
+        return True
+    except Exception as e:
+        if "order_time" not in str(e):
+            raise
+        supabase.table("customer_order_lines").insert([{k: v for k, v in r.items() if k != "order_time"} for r in rows]).execute()
+        return False
+
+
+def form_add_order_by_hand():
+    st.caption("The chat team missed an order, or wrote only part of it? Add it here. Lines you add are marked "
+               "✍️ **added by hand** and are **never removed** by the next file import.")
+    msg = st.session_state.pop("man_msg", None)
+    if msg:
+        st.success(msg)
+    ver = st.session_state.get("man_ver", 0)
+    c1, c2 = st.columns(2)
+    with c1:
+        area = st.selectbox("Area / store *", [SELECT_AREA] + load_areas(), key="man_area")
+    with c2:
+        mode = st.radio("What are you adding?", ["Medicines missing from an order", "A whole new order"],
+                        horizontal=True, key="man_mode")
+    if area == SELECT_AREA:
+        st.info("Select the area first.")
+        return
+    base, new = None, mode.startswith("A whole")
+    if not new:
+        try:
+            lines = _recent_lines(7, area)
+        except Exception as e:
+            st.error(f"Could not load orders: {e}")
+            return
+        orders = {}
+        for l in lines:
+            orders.setdefault(str(l.get("order_no")), []).append(l)
+        if not orders:
+            st.info(f"No orders of the last 7 days in {area} — choose **A whole new order**.")
+            return
+        opts = {f"#{o} — {ls[0].get('customer_name', '')} — {ls[0].get('customer_phone', '')} ({len(ls)} medicine(s))": o
+                for o, ls in sorted(orders.items(), key=lambda kv: str(kv[1][0].get("imported_at")), reverse=True)}
+        pick = st.selectbox("Order *", list(opts), key=f"man_order_{ver}")
+        order_lines = orders[opts[pick]]
+        base = order_lines[0]
+        st.caption("Already in this order: " + ", ".join(f"{l.get('item_name')} ×{_qty_txt(l.get('qty'))}" for l in order_lines))
+        order_no = str(base.get("order_no"))
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            order_no = st.text_input("Order # (empty = automatic)", key=f"man_no_{ver}").strip()
+            cust = st.text_input("Customer name *", key=f"man_cust_{ver}").strip()
+        with c2:
+            phone = st.text_input("Phone *", key=f"man_phone_{ver}").strip()
+            sched = st.date_input("Delivery (scheduled) date", value=today_ist(), key=f"man_sched_{ver}")
+        with c3:
+            od = st.date_input("Customer order date *", value=today_ist(), max_value=today_ist(), key=f"man_od_{ver}")
+            ot = st.time_input("Customer order time *", value=None, step=60, key=f"man_ot_{ver}")
+    n = int(st.number_input("How many medicines?", 1, 15, 1, key=f"man_n_{ver}"))
+    meds = []
+    for i in range(n):
+        c1, c2, c3 = st.columns([3, 2, 1])
+        with c1:
+            nm = st.text_input(f"Medicine {i + 1} *", key=f"man_med_{ver}_{i}")
+        with c2:
+            pk = st.text_input("Pack", key=f"man_pack_{ver}_{i}", placeholder="e.g. 15 Tablet")
+        with c3:
+            q = st.number_input("Qty", 1, 999, 1, key=f"man_qty_{ver}_{i}")
+        meds.append((nm.strip(), pk.strip(), q))
+    if not st.button("💾 Add " + ("order" if new else "medicines"), type="primary", key=f"man_save_{ver}", width='stretch'):
+        _show_hand_added(area)
+        return
+    meds = [m for m in meds if m[0]]
+    if not meds:
+        st.error("Write at least one medicine name.")
+        return
+    if new:
+        if not cust and not phone:
+            st.error("Write the customer name and phone.")
+            return
+        if ot is None:
+            st.error("Enter the customer's order time (from the chat).")
+            return
+        if order_no:
+            ex = supabase.table("customer_order_lines").select("area").eq("order_no", order_no).eq("removed", False)\
+                .limit(1).execute().data or []
+            if ex:
+                st.error(f"Order #{order_no} already exists ({ex[0].get('area')}) — use **Medicines missing from an order**.")
+                return
+        else:
+            pre = f"HAND-{today_ist().strftime('%Y%m%d')}-"
+            have = supabase.table("customer_order_lines").select("order_no").like("order_no", pre + "%").execute().data or []
+            order_no = f"{pre}{len({r['order_no'] for r in have}) + 1:03d}"
+        info = {"customer_name": cust, "customer_phone": phone, "scheduled_date": _ds(sched),
+                "order_time": IST.localize(datetime.combine(od, ot)).isoformat()}
+    else:
+        info = {"customer_name": base.get("customer_name"), "customer_phone": base.get("customer_phone"),
+                "scheduled_date": base.get("scheduled_date"), "order_time": base.get("order_time"),
+                **({"delivery_time": base.get("delivery_time")} if base.get("delivery_time") else {})}
+        info = {k: v for k, v in info.items() if v is not None}
+    import uuid
+    now = now_iso()
+    rows = [{**info, "line_key": f"manual|{order_no}|{nm.lower()}|{pk.lower()}|{uuid.uuid4().hex[:6]}",
+             "order_no": order_no, "item_name": nm, "pack_size": pk, "qty": float(q), "area": area,
+             "status": "Pending", "qty_arranged": 0, "qty_received": 0, "imported_at": now,
+             "imported_by": st.session_state.name, "last_seen_at": now, "removed": False} for nm, pk, q in meds]
+    try:
+        with_time = _insert_lines(rows)
+    except Exception as e:
+        st.error(f"Could not save: {e}")
+        return
+    log_simple_task("Order Added by Hand", {"area": area, "order_no": order_no, "lines": str(len(rows)),
+                                             "new_order": "Yes" if new else "No"})
+    st.session_state["man_ver"] = ver + 1
+    st.session_state["man_msg"] = (f"✅ #{order_no}: {len(rows)} medicine(s) added — they are now in 📦 Arrangement Order"
+                                   + ("" if with_time or not new else " · ⚠️ order time not saved: run the SQL line in ⏰ Missing order time"))
+    st.rerun()
+
+
+def _show_hand_added(area):
+    try:
+        mine = [l for l in _recent_lines(7, area) if str(l.get("line_key", "")).startswith("manual|")]
+    except Exception:
+        return
+    if not mine:
+        return
+    st.markdown(f"**✍️ Added by hand — last 7 days ({len(mine)})**")
+    st.dataframe(pd.DataFrame([{"Order #": l.get("order_no"), "Customer": l.get("customer_name", ""),
+                                "Medicine": l.get("item_name"), "Qty": _qty_txt(l.get("qty")),
+                                "Added by": l.get("imported_by", ""),
+                                "When": (to_ist(l.get("imported_at")) or now_ist()).strftime("%d %b %I:%M %p")}
+                               for l in sorted(mine, key=lambda l: str(l.get("imported_at")), reverse=True)]),
+                 hide_index=True, width='stretch')
+
+
+def form_missing_order_time():
+    st.caption("Orders of the last 3 days with no customer order time — the VLOOKUP found no match in the chat sheet. "
+               "Look the time up in the chat and save it here (it applies to the whole order).")
+    msg = st.session_state.pop("mot_msg", None)
+    if msg:
+        st.success(msg)
+    try:
+        miss = _orders_missing_time()
+    except Exception as e:
+        st.error(f"Could not load orders: {e}")
+        return
+    if miss is None:
+        st.error("One-time setup: run this line in Supabase → SQL Editor, then reload the app.")
+        st.code(ORDER_TIME_SQL, language="sql")
+        return
+    if not miss:
+        st.success("🎉 Every order of the last 3 days has its order time.")
+        return
+    st.dataframe(pd.DataFrame([{"Order #": o, "Area": ls[0].get("area", ""), "Customer": ls[0].get("customer_name", ""),
+                                "Phone": ls[0].get("customer_phone", ""), "Medicines": len(ls),
+                                "Imported": (to_ist(ls[0].get("imported_at")) or now_ist()).strftime("%d %b %I:%M %p")}
+                               for o, ls in miss.items()]), hide_index=True, width='stretch')
+    ver = st.session_state.get("mot_ver", 0)
+    opts = {f"#{o} — {ls[0].get('customer_name', '')} — {ls[0].get('customer_phone', '')}": o for o, ls in miss.items()}
+    c1, c2, c3 = st.columns([3, 2, 2])
+    with c1:
+        pick = st.selectbox("Order *", list(opts), key=f"mot_pick_{ver}")
+    first = miss[opts[pick]][0]
+    with c2:
+        od = st.date_input("Order date *", value=_any_date(first.get("scheduled_date")) or today_ist(),
+                           max_value=today_ist(), key=f"mot_d_{ver}")
+    with c3:
+        ot = st.time_input("Order time *", value=None, step=60, key=f"mot_t_{ver}")
+    if st.button("💾 Save order time", type="primary", key=f"mot_save_{ver}"):
+        if ot is None:
+            st.error("Enter the time.")
+            return
+        o = opts[pick]
+        iso = IST.localize(datetime.combine(od, ot)).isoformat()
+        try:
+            supabase.table("customer_order_lines").update({"order_time": iso}).eq("order_no", o).eq("removed", False).execute()
+        except Exception as e:
+            st.error(f"Could not save: {e}")
+            return
+        log_simple_task("Order Time Added", {"order_no": o, "order_time": iso})
+        st.session_state["mot_ver"] = ver + 1
+        st.session_state["mot_msg"] = f"✅ #{o}: order time {ot.strftime('%I:%M %p')} on {od.strftime('%d %b')} saved"
+        st.rerun()
+
+
 def form_import_orders():
-    st.subheader("📥 Import Customer Orders")
+    st.subheader("📥 Customer Orders")
+    n_miss = count_missing_order_time()
+    view = st.radio("View", IMPORT_VIEWS, horizontal=True, key="imp_view", label_visibility="collapsed",
+                    format_func=lambda v: v + (f" ({n_miss})" if v.startswith("⏰") and n_miss else ""))
+    if view == IMPORT_VIEWS[1]:
+        form_add_order_by_hand()
+        return
+    if view == IMPORT_VIEWS[2]:
+        form_missing_order_time()
+        return
+    _form_import_file()
+
+
+def _form_import_file():
     st.caption("Upload the order-schedule file from backend — one area at a time. "
                "Re-uploading the same or a newer file is safe: only new items are added.")
     area = st.selectbox("Which area / store is this file for? *", [SELECT_AREA] + load_areas(), key="imp_area")
     up = st.file_uploader("Backend file (.xlsx or .csv)", type=["xlsx", "xls", "csv"],
                           key=f"imp_file_{st.session_state.get('imp_ver', 0)}")
     if not up:
-        show_customer_order_format(expanded=True)
+        show_order_time_guide(expanded=True)
+        show_customer_order_format(expanded=False)
         return
     try:
         lines, err = parse_backend_file(up)
@@ -5929,9 +6296,18 @@ def form_import_orders():
         st.warning("No item lines found in this file.")
         return
     n_orders = len(set(l["order_no"] for l in lines))
-    st.info(f"📄 File has **{len(lines)} item lines** in **{n_orders} orders**")
-    prev = pd.DataFrame(lines)[["scheduled_date", "order_no", "customer_name", "item_name", "pack_size", "qty"]]
-    prev.columns = ["Date", "Order #", "Customer", "Item", "Pack", "Qty"]
+    n_time = len({l["order_no"] for l in lines if l.get("order_time")})
+    st.info(f"📄 File has **{len(lines)} item lines** in **{n_orders} orders** · 🕐 order time found for "
+            f"**{n_time} of {n_orders}** orders")
+    if n_time < n_orders:
+        st.warning("🕐 " + ("This file has no **Order Date / Order Time** columns." if not n_time else
+                           f"{n_orders - n_time} order(s) have no order time.")
+                   + " Add them with VLOOKUP from the chat sheet (see below), or fill them later in ⏰ Missing order time.")
+        show_order_time_guide(expanded=not n_time)
+    pf = pd.DataFrame(lines)
+    pf["ot"] = [(to_ist(l.get("order_time")).strftime("%d %b %I:%M %p") if l.get("order_time") else "—") for l in lines]
+    prev = pf[["scheduled_date", "order_no", "ot", "customer_name", "item_name", "pack_size", "qty"]]
+    prev.columns = ["Date", "Order #", "Ordered at", "Customer", "Item", "Pack", "Qty"]
     st.dataframe(prev, hide_index=True, width='stretch', height=250)
 
     if st.button("📥 Import", type="primary", key="imp_go", width='stretch'):
@@ -5945,7 +6321,13 @@ def form_import_orders():
             return
         st.success(f"✅ **{area}**: {res['new']} new items added · {res['existing']} already imported"
                    + (f" · {res['qty_changed']} qty updated" if res['qty_changed'] else "")
-                   + (f" · {res['restored']} restored" if res['restored'] else ""))
+                   + (f" · {res['restored']} restored" if res['restored'] else "")
+                   + (f" · 🕐 order time for {res['times']} orders" if res.get("times") else "")
+                   + (f" ({res['time_filled']} added to items imported earlier)" if res.get("time_filled") else ""))
+        if res.get("no_time_col"):
+            st.error("🕐 Order times were NOT saved — one-time setup needed: run this line in Supabase → SQL Editor, "
+                     "then import the file again.")
+            st.code(ORDER_TIME_SQL, language="sql")
         if res["removed"]:
             st.warning(f"🗑️ {res['removed']} pending item(s) are no longer in the backend file — marked **Removed** (cancelled/changed orders).")
         if res["wrong_area"]:
@@ -15407,13 +15789,277 @@ def show_area_summary(kp="ra"):
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
 
 
+# ── 🚚 ARRANGEMENT SUMMARY — how long each step of a customer's arrangement order takes ─────────────────
+ARR_STEPS = [   # key, label, owner, default target (minutes; None = no target)
+    ("s1", "1️⃣ Customer order → order to distributor", "Purchase", 30),
+    ("s2", "2️⃣ Order placed → picked up (self pick / porter)", "Distributor + pilot / porter", 120),
+    ("s3", "3️⃣ Picked up → reached warehouse", "Pilot / porter", 60),
+    ("s23", "2️⃣+3️⃣ Distributor delivers: order placed → reached warehouse", "Distributor", 180),
+    ("s4", "4️⃣ Reached warehouse → bill uploaded", "Stock", 60),
+    ("s5", "5️⃣ Order ready → customer call marked", "Call", 30),
+    ("s6", "⏳ Pilot waiting at the distributor", "Distributor", 20),
+    ("tot", "🏁 Total: customer order → call marked", "Everyone", None),
+]
+ARR_SPLITS = {"Distributor": "dist", "Area": "area", "Pickup type": "ptype", "Pilot": "pilot"}
+
+
+def arr_targets():
+    t = {k: d for k, _, _, d in ARR_STEPS}
+    try:
+        t.update({k: int(v) for k, v in json.loads(get_app_setting("arr_targets", "{}") or "{}").items() if k in t})
+    except Exception:
+        pass
+    return t
+
+
+def _arr_dt(v):
+    return _naive(to_ist(v)) if v else None
+
+
+def _mins_between(a, b):
+    return (b - a).total_seconds() / 60 if a and b and b >= a else None
+
+
+def arr_measure(lo_s, hi_s, now_n=None):
+    """every step time of the arrangements placed lo_s..hi_s -> (records, promise records)
+    record: {step, mins, dist, area, ptype, pilot, ref, date}"""
+    now_n = now_n or _now_n()
+    hi3 = _ds(datetime.strptime(hi_s, "%Y-%m-%d") + timedelta(days=3))
+    arrs = fetch_all("arrangements", lambda q: q.gte("order_placed_date", lo_s).lte("order_placed_date", hi_s))
+    if not arrs:
+        return [], []
+    by_no = {str(a.get("arrangement_no")): a for a in arrs}
+    als = []
+    for part in _chunks(list(by_no), 80):
+        als += fetch_all("arrangement_lines", lambda q, p=part: q.in_("arrangement_no", p))
+    orders = sorted({str(a.get("order_no")) for a in als if a.get("order_no")})
+    lines = []
+    for part in _chunks(orders, 80):
+        lines += fetch_all("customer_order_lines", lambda q, p=part: q.in_("order_no", p))
+    line_by_id = {l["id"]: l for l in lines}
+    pick = {}
+    for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Pickup").gte("date", lo_s).lte("date", hi3)):
+        n = str((t.get("details") or {}).get("arrangement_no") or "")
+        if n and t.get("status") != "In Progress":
+            pick.setdefault(n, []).append(t)
+    porter = {}
+    try:
+        for b in fetch_all("porter_bookings", lambda q: q.gte("date", lo_s).lte("date", hi3)):
+            t = _any_time(b.get("handover_time"))
+            if not t:
+                continue
+            at = datetime.combine(datetime.strptime(str(b.get("date"))[:10], "%Y-%m-%d").date(), t)
+            for n in re.split(r"[,\s]+", str(b.get("arrangement_nos") or "")):
+                n = n.strip().lstrip("#")
+                if n and (n not in porter or at < porter[n]):
+                    porter[n] = at
+    except Exception:
+        pass
+    jour = {}
+    for j in build_bill_journeys(lo_s, hi3, hi3):
+        n = str(j["d"].get("arrangement_no") or "").strip().lstrip("#")
+        if n and (n not in jour or (j["arrived"] and jour[n]["arrived"] and j["arrived"] < jour[n]["arrived"])):
+            jour[n] = j
+    recs, attr = [], {}
+    for n, a in by_no.items():
+        ptype = a.get("pickup_type") or "Self Pick"
+        pilot = a.get("pickup_by") if ptype == "Self Pick" else ("Porter" if ptype == "Porter" else "Distributor")
+        at = {"dist": a.get("distributor") or "—", "area": a.get("area") or "—", "ptype": ptype,
+              "pilot": pilot or "—", "ref": f"#{n}", "date": str(a.get("order_placed_date"))[:10]}
+        attr[n] = at
+        placed = _arr_dt(a.get("created_at"))
+        if ptype == "Self Pick":
+            picked = _arr_dt(a.get("picked_up_at"))
+            if not picked and pick.get(n):
+                picked = _rep_span(sorted(pick[n], key=lambda t: t.get("id") or 0)[-1])[1]
+        elif ptype == "Porter":
+            picked = porter.get(n)
+        else:
+            picked = None
+        j = jour.get(n)
+        reached = j["arrived"] if j else None
+        uploaded = j["uploaded"] if j else None
+        if ptype == "Distributor Delivers":
+            steps = [("s23", _mins_between(placed, reached))]
+        else:
+            steps = [("s2", _mins_between(placed, picked)), ("s3", _mins_between(picked, reached))]
+        steps.append(("s4", _mins_between(reached, uploaded)))
+        for t in pick.get(n, []):
+            s_, e_ = _rep_span(t)
+            steps.append(("s6", _mins_between(s_, e_)))
+        recs += [dict(at, step=k, mins=m) for k, m in steps if m is not None]
+    for al in als:
+        l = line_by_id.get(al.get("line_id"))
+        m = _mins_between(_arr_dt((l or {}).get("order_time")), _arr_dt(al.get("ordered_at")))
+        if m is not None:
+            recs.append(dict(attr.get(str(al.get("arrangement_no")), {}), step="s1", mins=m))
+    # per customer order: ready -> call, total, called before the promised time
+    arr_of = {}
+    for al in als:
+        arr_of.setdefault(str(al.get("order_no")), set()).add(str(al.get("arrangement_no")))
+    by_order = {}
+    for l in lines:
+        if not l.get("removed") and l.get("status") not in ("Removed", "Closed"):
+            by_order.setdefault(str(l.get("order_no")), []).append(l)
+    promise = []
+    for o, ls in by_order.items():
+        ats = [attr[x] for x in arr_of.get(o, ()) if x in attr]
+        if not ats:
+            continue
+        one = lambda k: ats[0][k] if len({x[k] for x in ats}) == 1 else "Several"
+        g = {"dist": one("dist"), "area": ls[0].get("area") or "—", "ptype": one("ptype"), "pilot": one("pilot"),
+             "ref": f"Order {o}", "date": min(x["date"] for x in ats)}
+        ready = None
+        if all(line_ready(l) for l in ls):
+            rs = [_naive(line_ready_at(l)) for l in ls]
+            ready = max(r for r in rs if r) if any(rs) else None
+        calls = [_arr_dt(l.get("delivery_at")) for l in ls if l.get("delivery_status")]
+        call = min(c for c in calls if c) if any(calls) else None
+        ot = min((_arr_dt(l.get("order_time")) for l in ls if l.get("order_time")), default=None)
+        for k, m in (("s5", _mins_between(ready, call)), ("tot", _mins_between(ot, call))):
+            if m is not None:
+                recs.append(dict(g, step=k, mins=m))
+        if call:
+            sd = _any_date(ls[0].get("scheduled_date"))
+            tm = _any_time(ls[0].get("delivery_time")) if ls[0].get("delivery_time") else None
+            if sd:
+                due = datetime.combine(sd, tm) if tm else datetime.combine(sd, datetime.max.time())
+                promise.append(dict(g, on_time=call <= due))
+    return recs, promise
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def arr_report(lo_s, hi_s):
+    return arr_measure(lo_s, hi_s)
+
+
+def _arr_stats(vals, target):
+    if not vals:
+        return None
+    v = sorted(vals)
+    n = len(v)
+    med = v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+    return {"n": n, "avg": sum(v) / n, "med": med,
+            "within": round(100 * sum(1 for x in v if x <= target) / n) if target else None}
+
+
+def _fm(m):
+    return fmt_age(int(round(m))) if m is not None else "—"
+
+
+def arr_summary_df(recs, targets):
+    rows = []
+    for k, label, owner, _ in ARR_STEPS:
+        s = _arr_stats([r["mins"] for r in recs if r["step"] == k], targets.get(k))
+        tgt = targets.get(k)
+        rows.append({"Step": label, "Owner": owner, "Count": s["n"] if s else 0,
+                     "Average": ("🔴 " if s and tgt and s["avg"] > tgt else "") + (_fm(s["avg"]) if s else "—"),
+                     "Typical (median)": _fm(s["med"]) if s else "—",
+                     "Within target": f"{s['within']}%" if s and s["within"] is not None else "—",
+                     "Target": _fm(tgt) if tgt else "—"})
+    return pd.DataFrame(rows).astype(str)
+
+
+def arr_split_df(recs, by, targets):
+    groups = sorted({r.get(by, "—") for r in recs})
+    rows = []
+    for g in groups:
+        mine = [r for r in recs if r.get(by, "—") == g]
+        row = {by_label(by): g, "Arrangements": len({r["ref"] for r in mine if r["ref"].startswith("#")})}
+        for k, label, _, _ in ARR_STEPS:
+            s = _arr_stats([r["mins"] for r in mine if r["step"] == k], targets.get(k))
+            tgt = targets.get(k)
+            row[label.split(" ", 1)[0] + " " + label.split(" ", 1)[1][:28]] = \
+                (("🔴 " if tgt and s["avg"] > tgt else "") + f"{_fm(s['avg'])} ({s['n']})") if s else "—"
+        rows.append(row)
+    rows.sort(key=lambda r: -r["Arrangements"])
+    return pd.DataFrame(rows).astype(str)
+
+
+def by_label(by):
+    return {v: k for k, v in ARR_SPLITS.items()}.get(by, by)
+
+
+def show_arrangement_summary(kp="rar"):
+    st.markdown("#### 🚚 Arrangement summary — how long each step takes")
+    lo, hi, _ = report_period(kp)
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    with c2:
+        split = st.selectbox("Split by", list(ARR_SPLITS), key=f"{kp}_split")
+    with c3:
+        st.write("")
+        if st.button("🔄 Refresh", key=f"{kp}_ref"):
+            arr_report.clear()
+            st.rerun()
+    try:
+        with st.spinner("Adding up the arrangement times…"):
+            recs, promise = arr_report(_ds(lo), _ds(hi))
+    except Exception as e:
+        st.error(f"Could not build the arrangement summary: {e}")
+        return
+    if area != "All Areas":
+        recs = [r for r in recs if r.get("area") == area]
+        promise = [p for p in promise if p.get("area") == area]
+    st.caption(f"Arrangement orders placed {lo.strftime('%d %b')} – {hi.strftime('%d %b %Y')}"
+               + (f" · {area}" if area != "All Areas" else "") + ". Each step is measured from the end of the one before.")
+    if not recs:
+        st.info("No arrangement orders with times in this period.")
+        return
+    targets = arr_targets()
+    if promise:
+        ok = sum(1 for p in promise if p["on_time"])
+        st.metric(f"📞 Customers called before the promised delivery time ({ok} of {len(promise)} orders)",
+                  f"{round(100 * ok / len(promise))}%")
+    summ = arr_summary_df(recs, targets)
+    st.dataframe(summ, hide_index=True, width='stretch')
+    no_time = not any(r["step"] in ("s1", "tot") for r in recs)
+    st.caption("🔴 = average slower than the target. Typical (median) = the middle value — one overnight bill can't "
+               "push it up. Step 5 starts when every medicine of the order is ready (received / picked / not available)."
+               + (" ⚠️ Steps 1 and Total need the customer's order time — import it with the order Excel "
+                  "(📥 Customer Orders → 🕐 guide)." if no_time else ""))
+    by = ARR_SPLITS[split]
+    st.markdown(f"**By {split.lower()}** — average (count)")
+    sp = arr_split_df(recs, by, targets)
+    st.dataframe(sp, hide_index=True, width='stretch')
+    with st.expander("🐢 Slowest 10 for each step"):
+        rows = []
+        for k, label, _, _ in ARR_STEPS:
+            for r in sorted([r for r in recs if r["step"] == k], key=lambda r: -r["mins"])[:10]:
+                rows.append({"Step": label, "Took": _fm(r["mins"]), "Arrangement / order": r["ref"],
+                             "Distributor": r.get("dist"), "Area": r.get("area"), "Pilot": r.get("pilot"),
+                             "Date": r.get("date")})
+        st.dataframe(pd.DataFrame(rows).astype(str), hide_index=True, width='stretch')
+    if st.session_state.get("role") == "admin":
+        with st.expander("🎯 Targets (minutes)"):
+            new = {}
+            cols = st.columns(4)
+            for i, (k, label, _, d) in enumerate([s for s in ARR_STEPS if s[3] is not None]):
+                with cols[i % 4]:
+                    new[k] = int(st.number_input(label, 1, 2000, int(targets.get(k) or d), key=f"{kp}_t_{k}"))
+            if st.button("💾 Save targets", key=f"{kp}_tsave"):
+                set_app_setting("arr_targets", json.dumps(new))
+                st.success("✅ Targets saved")
+                st.rerun()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        summ.to_excel(w, index=False, sheet_name="Steps")
+        sp.to_excel(w, index=False, sheet_name=f"By {split}"[:30])
+    st.download_button("⬇️ Download Excel", buf.getvalue(), f"arrangement-times-{_ds(lo)}-to-{_ds(hi)}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
+
+
 def show_reports(kp="rep"):
     st.subheader("📋 Staff & Area Summary")
-    tab = st.radio("Report", ["👤 Staff", "📍 Area"], horizontal=True, key=f"{kp}_tab", label_visibility="collapsed")
+    tab = st.radio("Report", ["👤 Staff", "📍 Area", "🚚 Arrangement"], horizontal=True, key=f"{kp}_tab",
+                   label_visibility="collapsed")
     if tab == "👤 Staff":
         show_staff_summary(f"{kp}_s")
-    else:
+    elif tab == "📍 Area":
         show_area_summary(f"{kp}_a")
+    else:
+        show_arrangement_summary(f"{kp}_r")
 
 
 
