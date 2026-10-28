@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v21-Oct order time & arrangement times"
+APP_VERSION = "v22-Oct delivery summary"
 
 def show_sidebar():
     with st.sidebar:
@@ -16050,16 +16050,227 @@ def show_arrangement_summary(kp="rar"):
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
 
 
+# ── 🛵 DELIVERY SUMMARY — every delivery pilot side by side ──────────────────────────────────────────────
+DEL_TARGETS = {"ontime": 90, "wait": 20, "to_wh": 60, "overnight": 0, "extra_km": 15}
+DEL_TARGET_LABEL = {"ontime": "On-time pickups at least (%)", "wait": "Waiting at distributor at most (min)",
+                    "to_wh": "Pickup → warehouse at most (min)", "overnight": "Bills kept overnight at most",
+                    "extra_km": "Extra KM over expected at most (%)"}
+
+
+def del_targets():
+    t = dict(DEL_TARGETS)
+    try:
+        t.update({k: float(v) for k, v in json.loads(get_app_setting("del_targets", "{}") or "{}").items() if k in t})
+    except Exception:
+        pass
+    return t
+
+
+def delivery_pilots():
+    users, xmap = load_users() or {}, extra_teams_map()
+    return sorted({u["name"] for k, u in users.items()
+                   if u.get("team") == "Delivery" or "Delivery" in xmap.get(k, [])})
+
+
+def _num(v):
+    try:
+        return float(v) if str(v).strip() not in ("", "None", "nan") else None
+    except Exception:
+        return None
+
+
+def delivery_measure(lo_s, hi_s, now_n=None):
+    """-> [pilot dict] for lo_s..hi_s (numbers, flags and every pickup)"""
+    now_n = now_n or _now_n()
+    lo, hi = datetime.strptime(lo_s, "%Y-%m-%d").date(), datetime.strptime(hi_s, "%Y-%m-%d").date()
+    T = del_targets()
+    tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Pickup", "Delivery Trip"]).gte("date", lo_s).lte("date", hi_s))
+    tasks = [t for t in tasks if t.get("status") != "In Progress"]
+    names = set(delivery_pilots()) | {t.get("person") for t in tasks if t.get("task_type") == "Pickup" and t.get("person")}
+    if not names:
+        return []
+    staff = _staff_cached(lo_s, hi_s, tuple(sorted((x, "Delivery") for x in names)))      # shared with the Staff tab
+    try:
+        to_wh = {}
+        for r in arr_report(lo_s, hi_s)[0]:                                               # shared with the Arrangement tab
+            if r["step"] == "s3":
+                to_wh.setdefault(r.get("pilot"), []).append(r["mins"])
+    except Exception:
+        to_wh = {}
+    try:
+        hos = fetch_all("pilot_handovers", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        hos = []
+    try:
+        logs = fetch_all("km_log", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        logs = []
+    routes, sett = load_routes() or {}, km_settings()
+    by_pd = {}
+    for t in tasks:
+        by_pd.setdefault((t.get("person"), str(t.get("date"))[:10]), []).append(t)
+    out = []
+    for n in sorted(names):
+        S = staff.get(n) or {}
+        pk = sorted([t for t in tasks if t.get("person") == n and t.get("task_type") == "Pickup"],
+                    key=lambda t: (str(t.get("date")), time_sort_key(t.get("start_time"))))
+        rows, waits, delays, yes, no, short, skus = [], [], [], 0, 0, 0, 0
+        for t in pk:
+            d = t.get("details") or {}
+            s_, e_ = _rep_span(t)
+            w = _mins_between(s_, e_)
+            if w is not None:
+                waits.append(w)
+            ot, dl = d.get("on_time"), _num(d.get("delay_mins"))
+            if ot == "Yes":
+                yes += 1
+            elif ot == "No":
+                no += 1
+                if dl is not None:
+                    delays.append(dl)
+            o_, r_ = _num(d.get("no_sku_ordered")), _num(d.get("no_sku_received"))
+            skus += int(r_ or 0)
+            is_short = o_ is not None and r_ is not None and o_ > 0 and r_ < o_
+            short += 1 if is_short else 0
+            rows.append({"Date": _rep_day0(str(t.get("date"))[:10]).strftime("%d %b"), "ARR #": d.get("arrangement_no", ""),
+                         "Distributor": d.get("distributor", ""), "Target": d.get("target_pickup", "") or "—",
+                         "Reached": d.get("time_reached") or (s_.strftime("%I:%M %p") if s_ else ""),
+                         "Handed over": d.get("time_handover") or (e_.strftime("%I:%M %p") if e_ else ""),
+                         "Waited": _fm(w),
+                         "Result": "✅ on time" if ot == "Yes" else (f"🔴 late {_fm(dl)}" if ot == "No" else "— no target"),
+                         "SKUs ordered → received": (f"{int(o_ or 0)} → {int(r_ or 0)}" + (" ⚠️ short" if is_short else ""))
+                         if o_ is not None or r_ is not None else ""})
+        mine_h = [h for h in hos if n in (h.get("from_person"), h.get("to_person"))]
+        overnight = len({str(h.get("arrangement_no")) for h in mine_h if h.get("kind") == "overnight" and h.get("to_person") == n})
+        given = sum(1 for h in mine_h if h.get("kind") != "overnight" and h.get("from_person") == n and h.get("to_person") != n)
+        taken = sum(1 for h in mine_h if h.get("kind") != "overnight" and h.get("to_person") == n and h.get("from_person") != n)
+        km, km_cmp, exp_cmp = 0.0, 0.0, 0.0
+        for l in logs:
+            if l.get("person") != n:
+                continue
+            meter = _num(l.get("km"))
+            if meter is None and _num(l.get("end_km")) is not None and _num(l.get("start_km")) is not None:
+                meter = _num(l["end_km"]) - _num(l["start_km"])
+            if meter is None:
+                continue
+            km += meter
+            seq = day_places(by_pd.get((n, str(l.get("date"))[:10]), []))
+            exp, missing = expected_km(seq, routes, (sett.get(n) or {}).get("home_km"))
+            if seq and not missing and exp > 0:
+                km_cmp += meter
+                exp_cmp += exp
+        days = S.get("days") or len({str(t.get("date")) for t in pk})
+        P = {"name": n, "days": days, "present": S.get("present", 0), "rest": S.get("rest", 0),
+             "pickups": len(pk), "per_day": round(len(pk) / days, 1) if days else None,
+             "trips": sum(1 for t in tasks if t.get("person") == n and t.get("task_type") == "Delivery Trip"),
+             "skus": skus, "ontime": round(100 * yes / (yes + no)) if yes + no else None,
+             "late_by": _mean(delays), "wait": _mean(waits), "to_wh": _mean(to_wh.get(n, [])),
+             "short": short, "overnight": overnight, "given": given, "taken": taken,
+             "km": round(km, 1) if km else None, "km_per": round(km / len(pk), 1) if km and pk else None,
+             "extra_km": round(100 * (km_cmp - exp_cmp) / exp_cmp) if exp_cmp else None, "rows": rows}
+        P["flags"] = [k for k, bad in (("ontime", P["ontime"] is not None and P["ontime"] < T["ontime"]),
+                                       ("wait", P["wait"] is not None and P["wait"] > T["wait"]),
+                                       ("to_wh", P["to_wh"] is not None and P["to_wh"] > T["to_wh"]),
+                                       ("overnight", P["overnight"] > T["overnight"]),
+                                       ("extra_km", P["extra_km"] is not None and P["extra_km"] > T["extra_km"])) if bad]
+        if P["pickups"] or P["days"] or P["trips"] or P["km"]:
+            out.append(P)
+    out.sort(key=lambda P: (-len(P["flags"]), P["name"].lower()))
+    return out
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def delivery_report(lo_s, hi_s):
+    return delivery_measure(lo_s, hi_s)
+
+
+def delivery_table(data):
+    red = lambda P, k, txt: ("🔴 " if k in P["flags"] else "") + txt
+    rows = []
+    for P in data:
+        rows.append({
+            "Pilot": P["name"], "🚩": len(P["flags"]) or "", "Days": P["days"], "Hours": _rep_t(P["present"]),
+            "Rest": _rep_t(P["rest"]), "Pickups": P["pickups"], "Per day": P["per_day"] if P["per_day"] is not None else "—",
+            "Trips": P["trips"], "SKUs": P["skus"],
+            "On time": red(P, "ontime", f"{P['ontime']}%" if P["ontime"] is not None else "—"),
+            "Late by (avg)": _fm(P["late_by"]), "Waiting at distributor": red(P, "wait", _fm(P["wait"])),
+            "Pickup → warehouse": red(P, "to_wh", _fm(P["to_wh"])), "Short pickups": P["short"],
+            "Bills overnight": red(P, "overnight", str(P["overnight"])),
+            "Handovers given / taken": f"{P['given']} / {P['taken']}",
+            "KM": P["km"] if P["km"] is not None else "—", "KM / pickup": P["km_per"] if P["km_per"] is not None else "—",
+            "KM vs expected": red(P, "extra_km", (f"{P['extra_km']:+d}%" if P["extra_km"] is not None else "—"))})
+    return pd.DataFrame(rows).astype(str)
+
+
+def show_delivery_summary(kp="rdl"):
+    st.markdown("#### 🛵 Delivery summary — every pilot side by side")
+    lo, hi, _ = report_period(kp)
+    c1, c2 = st.columns([4, 1])
+    with c2:
+        if st.button("🔄 Refresh", key=f"{kp}_ref"):
+            delivery_report.clear()
+            st.rerun()
+    try:
+        with st.spinner("Adding up the pickups…"):
+            data = delivery_report(_ds(lo), _ds(hi))
+    except Exception as e:
+        st.error(f"Could not build the delivery summary: {e}")
+        return
+    if not data:
+        st.info("No delivery pilots or pickups in this period.")
+        return
+    T = del_targets()
+    st.dataframe(delivery_table(data), hide_index=True, width='stretch')
+    st.caption(f"🔴 = outside the target: on time below {T['ontime']:g}% · waiting over {T['wait']:g} min · pickup → "
+               f"warehouse over {T['to_wh']:g} min · bills kept overnight · KM more than {T['extra_km']:g}% above expected. "
+               "Pilots with the most 🔴 are on top. Waiting = 'reached distributor' → 'medicines handed over'. "
+               "KM vs expected uses only days where every route has a distance (🛵 Delivery KM → Routes).")
+    for P in data:
+        if not P["rows"]:
+            continue
+        with st.expander(f"{'🔴 ' * len(P['flags'])}{P['name']} — {P['pickups']} pickup(s)", expanded=False):
+            st.dataframe(pd.DataFrame(P["rows"]).astype(str), hide_index=True, width='stretch')
+    if st.session_state.get("role") == "admin":
+        with st.expander("🎯 Targets"):
+            new = {}
+            cols = st.columns(len(DEL_TARGETS))
+            for col, k in zip(cols, DEL_TARGETS):
+                with col:
+                    new[k] = st.number_input(DEL_TARGET_LABEL[k], 0, 1000, int(T[k]), key=f"{kp}_t_{k}")
+            if st.button("💾 Save targets", key=f"{kp}_tsave"):
+                set_app_setting("del_targets", json.dumps(new))
+                delivery_report.clear()
+                st.success("✅ Targets saved")
+                st.rerun()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        delivery_table(data).to_excel(w, index=False, sheet_name="Summary")
+        used = {"Summary"}
+        for P in data:
+            if not P["rows"]:
+                continue
+            nm = re.sub(r"[\[\]\*\?/\\:]", "", P["name"])[:28] or "Pilot"
+            while nm in used:
+                nm = nm[:25] + "_"
+            used.add(nm)
+            pd.DataFrame(P["rows"]).to_excel(w, index=False, sheet_name=nm)
+    st.download_button("⬇️ Download Excel (summary + one sheet per pilot)", buf.getvalue(),
+                       f"delivery-summary-{_ds(lo)}-to-{_ds(hi)}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
+
+
 def show_reports(kp="rep"):
     st.subheader("📋 Staff & Area Summary")
-    tab = st.radio("Report", ["👤 Staff", "📍 Area", "🚚 Arrangement"], horizontal=True, key=f"{kp}_tab",
+    tab = st.radio("Report", ["👤 Staff", "📍 Area", "🚚 Arrangement", "🛵 Delivery"], horizontal=True, key=f"{kp}_tab",
                    label_visibility="collapsed")
     if tab == "👤 Staff":
         show_staff_summary(f"{kp}_s")
     elif tab == "📍 Area":
         show_area_summary(f"{kp}_a")
-    else:
+    elif tab == "🚚 Arrangement":
         show_arrangement_summary(f"{kp}_r")
+    else:
+        show_delivery_summary(f"{kp}_d")
 
 
 
