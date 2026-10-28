@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v22-Oct delivery summary"
+APP_VERSION = "v23-Oct overlap & cost"
 
 def show_sidebar():
     with st.sidebar:
@@ -16051,10 +16051,11 @@ def show_arrangement_summary(kp="rar"):
 
 
 # ── 🛵 DELIVERY SUMMARY — every delivery pilot side by side ──────────────────────────────────────────────
-DEL_TARGETS = {"ontime": 90, "wait": 20, "to_wh": 60, "overnight": 0, "extra_km": 15}
+DEL_TARGETS = {"ontime": 90, "wait": 20, "to_wh": 60, "overnight": 0, "extra_km": 15, "own_pilot": 8}
 DEL_TARGET_LABEL = {"ontime": "On-time pickups at least (%)", "wait": "Waiting at distributor at most (min)",
                     "to_wh": "Pickup → warehouse at most (min)", "overnight": "Bills kept overnight at most",
-                    "extra_km": "Extra KM over expected at most (%)"}
+                    "extra_km": "Extra KM over expected at most (%)",
+                    "own_pilot": "Pickups a day for an own pilot"}
 
 
 def del_targets():
@@ -16209,6 +16210,7 @@ def show_delivery_summary(kp="rdl"):
     with c2:
         if st.button("🔄 Refresh", key=f"{kp}_ref"):
             delivery_report.clear()
+            overlap_report.clear()
             st.rerun()
     try:
         with st.spinner("Adding up the pickups…"):
@@ -16230,6 +16232,9 @@ def show_delivery_summary(kp="rdl"):
             continue
         with st.expander(f"{'🔴 ' * len(P['flags'])}{P['name']} — {P['pickups']} pickup(s)", expanded=False):
             st.dataframe(pd.DataFrame(P["rows"]).astype(str), hide_index=True, width='stretch')
+    st.divider()
+    show_overlap_cost(kp, lo, hi)
+    st.divider()
     if st.session_state.get("role") == "admin":
         with st.expander("🎯 Targets"):
             new = {}
@@ -16240,6 +16245,7 @@ def show_delivery_summary(kp="rdl"):
             if st.button("💾 Save targets", key=f"{kp}_tsave"):
                 set_app_setting("del_targets", json.dumps(new))
                 delivery_report.clear()
+                overlap_report.clear()
                 st.success("✅ Targets saved")
                 st.rerun()
     buf = io.BytesIO()
@@ -16257,6 +16263,169 @@ def show_delivery_summary(kp="rdl"):
     st.download_button("⬇️ Download Excel (summary + one sheet per pilot)", buf.getvalue(),
                        f"delivery-summary-{_ds(lo)}-to-{_ds(hi)}.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{kp}_xl")
+
+
+# ── 🔁 OVERLAP & COST (inside the 🛵 Delivery tab) ─────────────────────────────────────────────────────
+OVERLAP_MINS = 60            # two pilots at the same distributor within this many minutes = one visit too many
+PILOT_WORK_DAYS = 26         # monthly salary ÷ this = cost of one working day
+
+
+def pilot_salaries():
+    try:
+        v = json.loads(get_app_setting("pilot_salary", "{}") or "{}")
+        return {k: float(x) for k, x in v.items() if x not in (None, "")}
+    except Exception:
+        return {}
+
+
+def overlap_measure(lo_s, hi_s, pilots_data, own_pilot_min=8):
+    """-> {"wh": per-warehouse pickups, "dist": distributor overlap, "cost": cost per pickup, "porter": porter cost}"""
+    arrs = fetch_all("arrangements", lambda q: q.gte("order_placed_date", lo_s).lte("order_placed_date", hi_s))
+    work_days = len({str(a.get("order_placed_date"))[:10] for a in arrs}) or 1
+    wh = {}
+    for a in arrs:
+        w = wh.setdefault(a.get("area") or "—", {"Self Pick": 0, "Porter": 0, "Distributor Delivers": 0})
+        pt = a.get("pickup_type") or "Self Pick"
+        w[pt] = w.get(pt, 0) + 1
+    wh_rows = []
+    for area, w in sorted(wh.items(), key=lambda kv: -(kv[1]["Self Pick"] + kv[1]["Porter"])):
+        per_day = round((w["Self Pick"] + w["Porter"]) / work_days, 1)
+        wh_rows.append({"Warehouse / area": area, "Self pick": w["Self Pick"], "Porter": w["Porter"],
+                        "Distributor delivers": w["Distributor Delivers"], "Pickups per working day": per_day,
+                        "Suggestion": "✅ enough for its own pilot" if per_day >= own_pilot_min
+                        else "🛵 Porter or share a nearby pilot"})
+    # distributor visited by 2+ pilots within the same hour
+    pk = [t for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Pickup").gte("date", lo_s).lte("date", hi_s))
+          if t.get("status") != "In Progress" and (t.get("details") or {}).get("distributor")]
+    by = {}
+    for t in pk:
+        s_, e_ = _rep_span(t)
+        if s_:
+            by.setdefault((_norm_col(t["details"]["distributor"]), str(t.get("date"))[:10]), []).append((s_, e_, t))
+    dist = {}
+    for (dk, day), visits in by.items():
+        visits.sort(key=lambda v: v[0])
+        name = visits[0][2]["details"]["distributor"]
+        D = dist.setdefault(dk, {"Distributor": name, "Visits": 0, "Days": set(), "Extra visits": 0, "Pilots": set(),
+                                 "Waiting lost (min)": 0.0, "Example": ""})
+        D["Visits"] += len(visits)
+        D["Days"].add(day)
+        i = 0
+        while i < len(visits):                          # a group = visits starting within OVERLAP_MINS of the first one
+            grp = [visits[i]]
+            j = i + 1
+            while j < len(visits) and (visits[j][0] - visits[i][0]).total_seconds() <= OVERLAP_MINS * 60:
+                grp.append(visits[j])
+                j += 1
+            people = {g[2].get("person") for g in grp}
+            if len(people) > 1:
+                extra = grp[1:]
+                D["Extra visits"] += len(extra)
+                D["Pilots"] |= people
+                D["Waiting lost (min)"] += sum(_mins_between(g[0], g[1]) or 0 for g in extra)
+                if not D["Example"]:
+                    D["Example"] = f"{_rep_day0(day).strftime('%d %b')}: " + ", ".join(
+                        f"{g[2].get('person')} {g[0].strftime('%I:%M %p')}" for g in grp)
+            i = j
+    dist_rows = [dict(D, Days=len(D["Days"]), Pilots=", ".join(sorted(p for p in D["Pilots"] if p)),
+                      **{"Waiting lost (min)": round(D["Waiting lost (min)"])}) for D in dist.values()]
+    dist_rows.sort(key=lambda r: (-r["Extra visits"], -r["Visits"]))
+    # cost per pickup: salary share for the days present + fuel (KM × ₹/km from Delivery KM settings)
+    sal, sett = pilot_salaries(), km_settings()
+    default_rate = float((sett.get("*") or {}).get("rate_per_km") or 0)
+    cost_rows = []
+    for P in pilots_data:
+        rate = (sett.get(P["name"]) or {}).get("rate_per_km")
+        rate = float(rate) if rate is not None else default_rate
+        days = P["days"] or 0
+        s_share = sal.get(P["name"], 0) / PILOT_WORK_DAYS * days
+        fuel = (P["km"] or 0) * rate
+        total = s_share + fuel
+        cost_rows.append({"Pilot": P["name"], "Days present": days, "Pickups": P["pickups"],
+                          "Salary share ₹": round(s_share), "Fuel / KM ₹": round(fuel), "Total ₹": round(total),
+                          "Cost per pickup ₹": round(total / P["pickups"]) if P["pickups"] and total else None,
+                          "_no_salary": P["name"] not in sal})
+    # porter: what we actually paid (💰 Porter Payment)
+    try:
+        bks = fetch_all("porter_bookings", lambda q: q.gte("date", lo_s).lte("date", hi_s))
+    except Exception:
+        bks = []
+    paid = [b for b in bks if _num(b.get("porter_cost"))]
+    n_arr = sum(len([x for x in re.split(r"[,\s]+", str(b.get("arrangement_nos") or "")) if x.strip()]) or 1 for b in paid)
+    spent = sum(_num(b.get("porter_cost")) for b in paid)
+    porter = {"trips": len(paid), "arrangements": n_arr if paid else 0, "spent": round(spent),
+              "per_trip": round(spent / len(paid)) if paid else None,
+              "per_arr": round(spent / n_arr) if paid else None, "unpaid": len(bks) - len(paid)}
+    return {"wh": wh_rows, "work_days": work_days, "dist": dist_rows, "cost": cost_rows, "porter": porter}
+
+
+@st.cache_data(ttl=600, max_entries=24, show_spinner=False)
+def overlap_report(lo_s, hi_s, own_pilot_min):
+    return overlap_measure(lo_s, hi_s, delivery_report(lo_s, hi_s), own_pilot_min)
+
+
+def show_overlap_cost(kp, lo, hi):
+    st.markdown("### 🔁 Overlap & cost — when does a warehouse need its own pilot?")
+    T = del_targets()
+    try:
+        with st.spinner("Checking overlaps and costs…"):
+            R = overlap_report(_ds(lo), _ds(hi), float(T.get("own_pilot", 8)))
+    except Exception as e:
+        st.error(f"Could not build overlap & cost: {e}")
+        return
+    st.markdown(f"**📦 Pickups per warehouse** — {R['work_days']} working day(s)")
+    if R["wh"]:
+        st.dataframe(pd.DataFrame(R["wh"]).astype(str), hide_index=True, width='stretch')
+        st.caption(f"Pickups per working day = (self pick + porter) ÷ days with arrangement orders. "
+                   f"{T.get('own_pilot', 8):g}+ a day = enough work for a dedicated pilot.")
+    else:
+        st.caption("No arrangement orders in this period.")
+    st.markdown(f"**🔁 Distributors visited by 2+ pilots within {OVERLAP_MINS} min**")
+    over = [r for r in R["dist"] if r["Extra visits"]]
+    if over:
+        tot = sum(r["Extra visits"] for r in over)
+        lost = sum(r["Waiting lost (min)"] for r in over)
+        st.warning(f"🔁 {tot} extra visit(s) in this period — one pilot could have collected for both · "
+                   f"about {fmt_age(lost)} of waiting at distributors could be saved.")
+        st.dataframe(pd.DataFrame(over).astype(str), hide_index=True, width='stretch')
+        st.caption("Fix: the pilot who goes first collects for the other warehouse too and hands over the bills "
+                   "(🤝 Hand over to another pilot), or move that distributor to fixed pickup rounds.")
+    else:
+        st.success(f"✅ No distributor was visited by two pilots within {OVERLAP_MINS} min.")
+    with st.expander(f"All distributors — visits ({len(R['dist'])})"):
+        st.dataframe(pd.DataFrame(R["dist"]).astype(str), hide_index=True, width='stretch')
+    st.markdown("**💰 Cost per pickup — pilot vs Porter**")
+    cost = [r for r in R["cost"] if r["Pickups"] or r["Days present"]]
+    if cost:
+        st.dataframe(pd.DataFrame([{k: ("—" if v is None else v) for k, v in r.items() if not k.startswith("_")}
+                                   for r in cost]).astype(str), hide_index=True, width='stretch')
+        miss = [r["Pilot"] for r in cost if r["_no_salary"]]
+        if miss:
+            st.caption("⚠️ No salary entered for: " + ", ".join(miss) + " — admin: enter it below.")
+    P = R["porter"]
+    if P["trips"]:
+        st.info(f"🛵 **Porter:** ₹{P['spent']:,} paid for {P['trips']} trip(s) carrying {P['arrangements']} arrangement(s) "
+                f"→ **₹{P['per_trip']:,} per trip · ₹{P['per_arr']:,} per arrangement**"
+                + (f" · {P['unpaid']} booking(s) not paid yet" if P["unpaid"] else ""))
+    else:
+        st.caption("🛵 Porter: no paid porter trips in this period (💰 Porter Payment).")
+    st.caption(f"Pilot cost = monthly salary ÷ {PILOT_WORK_DAYS} × days present + KM × ₹/km (🛵 Delivery KM settings). "
+               "Pilots also do delivery trips, so cost per pickup is a little high for them.")
+    if st.session_state.get("role") == "admin":
+        with st.expander("💰 Pilot monthly salaries (for cost per pickup)"):
+            sal = pilot_salaries()
+            names = [r["Pilot"] for r in R["cost"]]
+            new = {}
+            cols = st.columns(min(4, max(1, len(names))))
+            for i, n in enumerate(names):
+                with cols[i % len(cols)]:
+                    new[n] = st.number_input(f"{n} ₹/month", 0, 500000, int(sal.get(n, 0)), step=500, key=f"{kp}_sal_{n}")
+            if st.button("💾 Save salaries", key=f"{kp}_sal_save"):
+                keep = {k: v for k, v in sal.items() if k not in new}
+                set_app_setting("pilot_salary", json.dumps({**keep, **{k: v for k, v in new.items() if v}}))
+                overlap_report.clear()
+                st.success("✅ Salaries saved")
+                st.rerun()
 
 
 def show_reports(kp="rep"):
