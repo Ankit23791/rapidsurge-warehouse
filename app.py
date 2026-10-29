@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v23-Oct overlap & cost"
+APP_VERSION = "v23.1-Oct porter pickup step"
 
 def show_sidebar():
     with st.sidebar:
@@ -3640,19 +3640,53 @@ def show_pickup_images():
                        f"Delivery by: {d.get('delivery_by','')} · Porter: {d.get('porter_no') or '—'} · "
                        f"Remarks: {d.get('remarks') or '—'}")
 
-def porter_direct_pickup():
-    """porter picks up straight from the distributor (nobody of ours there): purchase confirms the count by phone"""
-    lo = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
+def porter_waiting():
+    """porter bookings still 'Booked' (pickup not confirmed yet), last 3 days"""
+    lo = (today_ist() - timedelta(days=3)).strftime("%Y-%m-%d")
+    return fetch_all("porter_bookings", lambda q: q.eq("status", "Booked").gte("date", lo))
+
+
+def porter_waiting_count():
     try:
-        bks = fetch_all("porter_bookings", lambda q: q.eq("status", "Booked").gte("date", lo))
+        return len(porter_waiting())
     except Exception:
-        return
+        return 0
+
+
+def form_confirm_porter_pickup():
+    st.subheader("📞 Confirm porter pickup")
+    st.caption("Step after 🚛 Book Porter: when the porter has collected the medicines from the distributor, call the "
+               "distributor / porter and confirm here how many bills and polythene he took. This saves the pickup time "
+               "and the stock team checks the count when he reaches the warehouse.")
+    if not porter_direct_pickup(boxed=False):
+        msg = st.session_state.pop("pdp_msg", None)
+        if msg:
+            st.success(msg)
+        st.success("🎉 No porter booking is waiting for pickup confirmation.")
+
+
+def porter_direct_pickup(boxed=True):
+    """porter picks up straight from the distributor (nobody of ours there): purchase confirms the count by phone.
+    Returns the number of bookings waiting."""
+    try:
+        bks = porter_waiting()
+    except Exception:
+        return 0
     if not bks:
-        return
+        return 0
     msg = st.session_state.pop("pdp_msg", None)
     if msg:
         st.success(msg)
-    with st.expander(f"📞 Porter picked up straight from the distributor? Confirm the count ({len(bks)} booked)", expanded=False):
+    if not boxed:
+        now = now_ist()
+        st.dataframe(pd.DataFrame([{"Porter": b.get("porter_no", ""), "Arrangements": b.get("arrangement_nos", ""),
+                                    "Pickup point": b.get("pickup_point", ""), "Going to": b.get("delivery_point", ""),
+                                    "Booked": f"{b.get('date', '')} {b.get('time', '')}",
+                                    "Waiting": fmt_age(age_mins(b.get("created_at"), now)) if b.get("created_at") else ""}
+                                   for b in bks]).astype(str), hide_index=True, width='stretch')
+    box = st.expander(f"📞 Porter picked up from the distributor? Confirm the count ({len(bks)} waiting)", expanded=True) \
+        if boxed else st.container(border=True)
+    with box:
         st.caption("When the porter collects from the distributor (no pilot there), call the distributor / porter and "
                    "enter how many bills and polythene he took. The stock team checks this count when he arrives.")
         ver = st.session_state.get("pdp_v", 0)
@@ -3689,6 +3723,7 @@ def porter_direct_pickup():
         st.session_state["pdp_v"] = ver + 1
         st.session_state["pdp_msg"] = f"✅ {b.get('porter_no')}: {nb} bill(s) · {npoly} polythene on the way — stock team will check the count."
         st.rerun()
+    return len(bks)
 
 
 def form_book_porter():
@@ -3777,7 +3812,8 @@ def form_book_porter():
                             "porter_no": porter_no,
                         }).eq("id", arr_id).execute()
 
-                    st.success(f"✅ Porter {porter_no} booked successfully!")
+                    st.success(f"✅ Porter {porter_no} booked successfully! Next step: when the porter has collected "
+                               f"the medicines, confirm it in **📞 Confirm porter pickup**.")
                     st.info(f"Arrangements linked: {', '.join(arr_nos)}")
                     st.balloons()
                 except Exception as e:
@@ -4563,6 +4599,11 @@ def show_user_page():
                 type="primary" if st.session_state.call_active_form=="porter" else "secondary"):
                 st.session_state.call_active_form = "porter"
                 st.rerun()
+            n_pw_c = porter_waiting_count()
+            if st.button("📞 Confirm porter pickup" + (f" ({n_pw_c})" if n_pw_c else ""), width='stretch', key="c_porter_pick",
+                type="primary" if n_pw_c or st.session_state.call_active_form == "porter_pick" else "secondary"):
+                st.session_state.call_active_form = "porter_pick"
+                st.rerun()
             if st.button("✏️ Other", width='stretch', key="c_other",
                 type="primary" if st.session_state.call_active_form=="other" else "secondary"):
                 st.session_state.call_active_form = "other"
@@ -4598,6 +4639,7 @@ def show_user_page():
                 "custdel":   form_customer_delivery,
                 "medsearch": form_medicine_search,
                 "porter":    form_book_porter,
+                "porter_pick": form_confirm_porter_pickup,
                 "other":     form_other_task,
             }
             if st.session_state.call_active_form in form_map:
@@ -4861,6 +4903,11 @@ def show_user_page():
                 type="primary" if st.session_state.purchase_active_form=="porter" else "secondary"):
                 st.session_state.purchase_active_form = "porter"
                 st.rerun()
+            n_pw = porter_waiting_count()
+            if st.button("📞 Confirm porter pickup" + (f" ({n_pw})" if n_pw else ""), width='stretch', key="p_porter_pick",
+                type="primary" if n_pw or st.session_state.purchase_active_form == "porter_pick" else "secondary"):
+                st.session_state.purchase_active_form = "porter_pick"
+                st.rerun()
             if st.button("💰 Porter Payment", width='stretch', key="p_payment",
                 type="primary" if st.session_state.purchase_active_form=="payment" else "secondary"):
                 st.session_state.purchase_active_form = "payment"
@@ -4924,6 +4971,7 @@ def show_user_page():
                 "pharma":      form_pharmarack,
                 "bounce":      form_bounce_medicine,
                 "porter":      form_book_porter,
+                "porter_pick": form_confirm_porter_pickup,
                 "payment":     form_porter_payment,
                 "pickup":      show_pickup_images,
                 "register":    form_register_entry,
@@ -4999,6 +5047,10 @@ def show_user_page():
             with c1:
                 if st.button("🚛 Book Porter", key="mp_porter", use_container_width=True):
                     st.session_state.purchase_active_form = "porter"
+                    st.rerun()
+                if st.button("📞 Confirm porter pickup" + (f" ({n_pw})" if n_pw else ""), key="mp_porter_pick",
+                             use_container_width=True, type="primary" if n_pw else "secondary"):
+                    st.session_state.purchase_active_form = "porter_pick"
                     st.rerun()
             with c2:
                 if st.button("💰 Porter Payment", key="mp_payment", use_container_width=True):
