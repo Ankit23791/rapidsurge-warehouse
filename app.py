@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v23.2-Oct porter auto-fill"
+APP_VERSION = "v24-Oct call proof"
 
 def show_sidebar():
     with st.sidebar:
@@ -4597,6 +4597,7 @@ def show_user_page():
     elif team == "Call":
         if "call_active_form" not in st.session_state:
             st.session_state.call_active_form = None
+        n_rc = ready_to_call_count()
 
         with st.sidebar:
             st.divider()
@@ -4605,8 +4606,8 @@ def show_user_page():
                 type="primary" if st.session_state.call_active_form=="calllog" else "secondary"):
                 st.session_state.call_active_form = "calllog"
                 st.rerun()
-            if st.button("📞 Customer Delivery", width='stretch', key="c_custdel",
-                type="primary" if st.session_state.call_active_form=="custdel" else "secondary"):
+            if st.button("📞 Customer Delivery" + (f" ({n_rc} 🟢)" if n_rc else ""), width='stretch', key="c_custdel",
+                type="primary" if n_rc or st.session_state.call_active_form=="custdel" else "secondary"):
                 st.session_state.call_active_form = "custdel"
                 st.rerun()
             if st.button("🔍 Medicine Search", width='stretch', key="c_medsearch",
@@ -4677,7 +4678,8 @@ def show_user_page():
                 if st.button("🔍 Medicine Search", key="mc_medsearch", type="primary", use_container_width=True):
                     st.session_state.call_active_form = "medsearch"
                     st.rerun()
-            if st.button("📞 Customer Delivery Status", key="mc_custdel", type="primary", use_container_width=True):
+            if st.button("📞 Customer Delivery Status" + (f" ({n_rc} 🟢)" if n_rc else ""), key="mc_custdel", type="primary",
+                         use_container_width=True):
                 st.session_state.call_active_form = "custdel"
                 st.rerun()
             st.markdown("#### 🚛 Logistics")
@@ -7829,6 +7831,78 @@ NOT_DELIVERED_REASONS = [
 ]
 DELIVERY_CHOICES = ["—", "✅ Delivered", "❌ Not Delivered"]
 
+NOT_REACHABLE = "G) Customer not reachable (no answer) — try again later"
+PROOF_HELP = {"one": "call log screenshot (showing the call duration) or the WhatsApp chat with the customer",
+              "two": "call log screenshot showing 2 calls + WhatsApp message sent"}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _ready_to_call_count():
+    by = {}
+    for l in _recent_lines(7):
+        by.setdefault(str(l.get("order_no")), []).append(l)
+    return sum(1 for ls in by.values() if any(not l.get("delivery_status") for l in ls) and all(line_ready(l) for l in ls))
+
+
+def ready_to_call_count():
+    try:
+        return _ready_to_call_count()
+    except Exception:
+        return 0
+
+
+def not_reachable_tries(days=7):
+    """{order_no: [tries]} — 'not reachable' calls saved with proof (the order stays open)"""
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    out = {}
+    try:
+        for t in fetch_all("daily_tasks", lambda q: q.eq("task_type", "Customer Not Reachable").gte("date", lo)):
+            out.setdefault(str((t.get("details") or {}).get("order")), []).append(t)
+    except Exception:
+        pass
+    return out
+
+
+def _upload_proofs(files):
+    names = [upload_image(f, "call_proof") for f in files]
+    return names if all(names) else None
+
+
+def show_delivery_proof_check(kp="pc", days=7):
+    """managers: every not-delivered / not-reachable save with its screenshots"""
+    with st.expander(f"🔍 Proof check — not delivered & not reachable (last {days} days)", expanded=False):
+        lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+        try:
+            ts = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Customer Delivery Update", "Customer Not Reachable"])
+                           .gte("date", lo))
+        except Exception as e:
+            st.error(f"Could not load: {e}")
+            return
+        rows = []
+        for t in ts:
+            d = t.get("details") or {}
+            nr = t.get("task_type") == "Customer Not Reachable"
+            if not nr and int(_to_float(d.get("not_delivered"), 0)) == 0:
+                continue
+            rows.append({"id": t.get("id"), "When": f"{_rep_day0(str(t.get('date'))[:10]).strftime('%d %b')} {t.get('time', '')}",
+                         "By": t.get("person", ""), "Order": d.get("order", ""), "Customer": d.get("customer", ""),
+                         "Result": "📵 Not reachable" if nr else "❌ Not delivered: " + ", ".join(d.get("reasons") or []),
+                         "Screenshots": len(d.get("proof") or []) or "⚠️ none", "_proof": d.get("proof") or []})
+        if not rows:
+            st.success("Nothing marked not delivered / not reachable in this period.")
+            return
+        rows.sort(key=lambda r: -(r["id"] or 0))
+        st.dataframe(pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_") and k != "id"} for r in rows]).astype(str),
+                     hide_index=True, width='stretch')
+        opts = {f"{r['When']} · {r['By']} · #{r['Order']} · {r['Result']}": r for r in rows if r["_proof"]}
+        if opts:
+            r = opts[st.selectbox("See the screenshots of", list(opts), key=f"{kp}_pick")]
+            cols = st.columns(min(3, len(r["_proof"])))
+            for i, name in enumerate(r["_proof"]):
+                with cols[i % len(cols)]:
+                    show_image(name, f"Screenshot {i + 1}", key=f"{kp}_img_{r['id']}_{i}")
+
+
 def customer_order_summary(lines):
     """Summary block in the format asked for by Ankit"""
     ls = [l for l in lines if not l.get("removed")]
@@ -7907,10 +7981,12 @@ def form_customer_delivery():
     def ready(x):
         return all(line_ready(l) for l in x)
     olist = sorted(orders.items(), key=lambda kv: (not ready(kv[1]), str(min(l.get("imported_at", "") for l in kv[1]))))
+    tries = not_reachable_tries()
     st.markdown(f"**{len(olist)} orders** · 🟢 ready = in-store medicines picked from the shelf + the rest received")
 
     # quick whole-order action
-    labels = {f"{'🟢' if ready(x) else '⏳'} #{o} — {x[0].get('customer_name','')} — {x[0].get('customer_phone','')} — {len(x)} medicine(s)": o
+    labels = {f"{'🟢' if ready(x) else '⏳'} #{o} — {x[0].get('customer_name','')} — {x[0].get('customer_phone','')} — {len(x)} medicine(s)"
+              + (f" · 📵 tried {len(tries[str(o)])}×" if tries.get(str(o)) else ""): o
               for o, x in olist}
     pick = st.selectbox("Order", list(labels.keys()), key="cd_pick")
     o = labels[pick]
@@ -7929,15 +8005,47 @@ def form_customer_delivery():
         st.warning(f"⏳ This order is not ready — {len(not_ready)} medicine(s) not received / not picked yet: "
                    + ", ".join(str(l.get("item_name", "")) for l in not_ready[:5]) + ("…" if len(not_ready) > 5 else ""))
         sure = st.checkbox("The customer really got everything — mark delivered anyway", key=f"cd_sure_{o}")
+    t_o = tries.get(str(o)) or []
+    if t_o:
+        last = sorted(t_o, key=lambda t: t.get("id") or 0)[-1]
+        st.caption(f"📵 Not reachable before: {len(t_o)} time(s) — last {_rep_day0(str(last.get('date'))[:10]).strftime('%d %b')} "
+                   f"{last.get('time', '')} by {last.get('person', '')}")
+    msg = st.session_state.pop("cd_msg", None)
+    if msg:
+        st.success(msg)
     b1, b2, b3 = st.columns([1, 2, 1])
     with b1:
         if st.button("✅ Whole order delivered", key=f"cd_all_ok_{o}", type="primary", width='stretch', disabled=not sure):
-            save_delivery([(l["id"], "Delivered", None) for l in x], o)
+            save_delivery([(l["id"], "Delivered", None) for l in x], o, customer=x[0].get("customer_name"))
     with b2:
-        reason = st.selectbox("Reason", NOT_DELIVERED_REASONS, key=f"cd_reason_{o}", label_visibility="collapsed")
+        reason = st.selectbox("Reason", NOT_DELIVERED_REASONS + [NOT_REACHABLE], key=f"cd_reason_{o}",
+                              label_visibility="collapsed")
+    nr = reason == NOT_REACHABLE
+    pv = st.session_state.get("cd_pv", 0)
+    proof = st.file_uploader(f"📸 Proof for ❌ / 📵 — {PROOF_HELP['two' if nr else 'one']} *",
+                             type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"cd_proof_{o}_{pv}",
+                             help="Needed only when the order is NOT delivered or the customer is not reachable.")
     with b3:
-        if st.button("❌ Whole order not delivered", key=f"cd_all_no_{o}", width='stretch'):
-            save_delivery([(l["id"], "Not Delivered", reason) for l in x], o)
+        if st.button("📵 Not reachable — try later" if nr else "❌ Whole order not delivered", key=f"cd_all_no_{o}",
+                     width='stretch'):
+            need = 2 if nr else 1
+            if len(proof or []) < need:
+                st.error(f"📸 Add the proof first: {PROOF_HELP['two' if nr else 'one']}"
+                         + (" (2 screenshots)." if nr else "."))
+                return
+            names = _upload_proofs(proof)
+            if not names:
+                return                                  # upload_image already showed the error
+            if nr:
+                log_simple_task("Customer Not Reachable", {"order": str(o), "customer": x[0].get("customer_name", ""),
+                                                           "phone": x[0].get("customer_phone", ""), "lines": str(len(x)),
+                                                           "proof": names})
+                st.session_state["cd_pv"] = pv + 1
+                st.session_state["cd_msg"] = f"📵 #{o}: saved as not reachable ({len(t_o) + 1} try) — the order stays open, call again later."
+                _ready_to_call_count.clear()
+                st.rerun()
+            st.session_state["cd_pv"] = pv + 1
+            save_delivery([(l["id"], "Not Delivered", reason) for l in x], o, proof=names, customer=x[0].get("customer_name"))
 
     # per-medicine marking (all waiting orders)
     with st.expander("✏️ Mark individual medicines (all waiting orders)"):
@@ -7955,6 +8063,8 @@ def form_customer_delivery():
         not_ready_ids = {l["id"] for _, xx in olist for l in xx if not line_ready(l)}
         sure_lines = st.checkbox("Allow ✅ Delivered for medicines that are not received / picked yet",
                                  key="cd_sure_lines")
+        lproof = st.file_uploader(f"📸 Proof for the ❌ not-delivered medicines — {PROOF_HELP['one']}",
+                                  type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"cd_lproof_{ver}")
         if st.button("💾 Save medicine-wise", key="cd_save_lines", type="primary"):
             old = {r["id"]: (r["Delivery"], r["Reason"]) for r in rows}
             changes, missing = [], 0
@@ -7972,14 +8082,20 @@ def form_customer_delivery():
             elif early and not sure_lines:
                 st.error(f"⏳ {len(early)} medicine(s) marked Delivered are not received / picked yet. "
                          "Check again, or tick the box above to allow it.")
+            elif any(c[1] == "Not Delivered" for c in changes) and not lproof:
+                st.error(f"📸 Add the proof for the not-delivered medicines: {PROOF_HELP['one']}.")
             elif changes:
+                names = _upload_proofs(lproof) if lproof else []
+                if names is None:
+                    return
                 st.session_state["cd_ver"] = ver + 1
-                save_delivery(changes, "medicine-wise")
+                ords = sorted({str(r["Order #"]) for _, r in ed.iterrows() if int(r["id"]) in {c[0] for c in changes}})
+                save_delivery(changes, ", ".join(ords) or "medicine-wise", proof=names)
             else:
                 st.info("Nothing changed.")
 
-def save_delivery(changes, label):
-    """changes: [(line_id, 'Delivered'/'Not Delivered', reason)]"""
+def save_delivery(changes, label, proof=None, customer=None):
+    """changes: [(line_id, 'Delivered'/'Not Delivered', reason)] — proof: screenshot names (not delivered)"""
     now_s = now_iso()
     try:
         for lid, stt, reason in changes:
@@ -7988,7 +8104,10 @@ def save_delivery(changes, label):
                 "delivery_by": st.session_state.name, "delivery_at": now_s}).eq("id", lid).execute()
         ok = sum(1 for c in changes if c[1] == "Delivered")
         log_simple_task("Customer Delivery Update", {"lines": str(len(changes)), "delivered": str(ok),
-                                                      "not_delivered": str(len(changes) - ok), "order": str(label)})
+                                                      "not_delivered": str(len(changes) - ok), "order": str(label),
+                                                      "customer": customer or "", "proof": proof or [],
+                                                      "reasons": sorted({c[2] for c in changes if c[2]})})
+        _ready_to_call_count.clear()
         st.rerun()
     except Exception as e:
         st.error(f"Could not save: {e}")
@@ -9657,7 +9776,9 @@ def show_manager_team_view():
     if _nav == '📌 Assign Tasks': show_assign_tasks_admin("mgr_asg")
     if _nav == '📅 Shift Planner': show_shift_planner("mgr_shift")
     if _nav == '🧾 Bills Register': show_bills_register("mgr_bills")
-    if _nav == '📦 Customer Orders': show_customer_order_tracker("mgr_trk", show_phone=True)
+    if _nav == '📦 Customer Orders':
+        show_customer_order_tracker("mgr_trk", show_phone=True)
+        show_delivery_proof_check("mgr_pc")
     if _nav == '📍 Order Journey': show_order_journey("mgr_oj")
     if _nav == '🛒 Normal Orders': show_order_sheet_report("mgr_osr")
     if _nav == '🚚 Distributors': show_distributors_admin("mgr_dist")
@@ -16571,6 +16692,7 @@ def show_admin_page():
     if _nav == '📦 Customer Orders':
         show_close_old_lines("adm_col")
         show_customer_order_tracker("adm", show_phone=True)
+        show_delivery_proof_check("adm_pc")
 
     if _nav == '📍 Order Journey':
         show_order_journey("adm_oj")
