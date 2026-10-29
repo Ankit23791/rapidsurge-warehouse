@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v24-Oct call proof"
+APP_VERSION = "v25-Oct journey all orders"
 
 def show_sidebar():
     with st.sidebar:
@@ -7553,36 +7553,119 @@ def find_journey_orders(text):
             seen[o] = r
     return sorted(seen.values(), key=lambda r: str(r.get("imported_at") or ""), reverse=True)
 
-@st.cache_data(ttl=60, show_spinner=False)
-def order_journey(order_no):
-    """Every step of one customer order, as a time-ordered list of events.
-    branch = None for order-level steps, else the ARR no (one branch per distributor bill)"""
-    from datetime import timedelta
-    lines = supabase.table("customer_order_lines").select("*").eq("order_no", str(order_no))\
-        .eq("removed", False).execute().data or []
-    if not lines:
+JOURNEY_CALL_TASKS = ["Customer Not Reachable", "Customer Delivery Update"]
+
+
+def _j_at_any(date_s, time_s):
+    """like _j_at, also reads '14:05' / '14:05:00' (porter handover time)"""
+    w = _j_at(date_s, time_s)
+    if w or not time_s:
+        return w
+    try:
+        t = _any_time(time_s)
+        return datetime.combine(datetime.strptime(str(date_s)[:10], "%Y-%m-%d").date(), t) if t else None
+    except Exception:
         return None
+
+
+def _ano(x):
+    return str(x or "").strip().lstrip("#")
+
+
+def _load_journey_ctx(lines):
+    """everything the journeys of these customer-order lines need, loaded in a few batch queries"""
     ids = [l["id"] for l in lines]
     als = []
     for part in _chunks(ids, 100):
         als += supabase.table("arrangement_lines").select("*").in_("line_id", part).execute().data or []
-    arr_nos = sorted({str(a.get("arrangement_no") or "").strip().lstrip("#") for a in als} - {""})
+    arr_nos = sorted({_ano(a.get("arrangement_no")) for a in als} - {""})
     arrs = {}
+    for part in _chunks(arr_nos, 100):
+        for a in supabase.table("arrangements").select("*").in_("arrangement_no", part).execute().data or []:
+            arrs[_ano(a.get("arrangement_no"))] = a
+    now_n = now_ist().replace(tzinfo=None)
+    starts = [_j_ts(l.get("imported_at")) for l in lines if l.get("imported_at")] + \
+             [_j_ts(a.get("ordered_at")) for a in als if a.get("ordered_at")]
+    starts = [s for s in starts if s]
+    base, top = (min(starts), max(starts)) if starts else (now_n, now_n)
+    d_lo = (base - timedelta(days=1)).strftime("%Y-%m-%d")
+    d_hi = min(top + timedelta(days=10), now_n + timedelta(days=1)).strftime("%Y-%m-%d")
+    aset = set(arr_nos)
+    tasks_by_arr, calls_by_order = {}, {}
+    try:
+        tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", JOURNEY_TASKS + JOURNEY_CALL_TASKS)
+                          .gte("date", d_lo).lte("date", d_hi))
+    except Exception:
+        tasks = []
+    for t in tasks:
+        d = t.get("details") or {}
+        if t.get("task_type") in JOURNEY_CALL_TASKS:
+            for o in re.split(r",\s*", str(d.get("order") or "")):
+                if o:
+                    calls_by_order.setdefault(o.strip(), []).append(t)
+        else:
+            for a in _arr_nos_of(d) & aset:
+                tasks_by_arr.setdefault(a, []).append(t)
+    hos_by_arr, porter_by_arr, ba = {}, {}, {}
     if arr_nos:
-        for a in supabase.table("arrangements").select("*").in_("arrangement_no", arr_nos).execute().data or []:
-            arrs[str(a.get("arrangement_no"))] = a
+        try:
+            for part in _chunks(arr_nos, 100):
+                for h in supabase.table("pilot_handovers").select("*").in_("arrangement_no", part).execute().data or []:
+                    hos_by_arr.setdefault(_ano(h.get("arrangement_no")), []).append(h)
+        except Exception:
+            pass                                       # table not created yet
+        try:
+            for b in sorted(fetch_all("porter_bookings", lambda q: q.gte("date", d_lo).lte("date", d_hi)),
+                            key=lambda b: b.get("id") or 0):
+                for a in _arr_nos_of({"arrangement_nos": b.get("arrangement_nos")}) & aset:
+                    porter_by_arr.setdefault(a, []).append(b)
+        except Exception:
+            pass
+        arr_ids = sorted({(t.get("details") or {}).get("arrival_id") for ts in tasks_by_arr.values() for t in ts
+                          if t.get("task_type") == "Register Entry"} - {None, ""})
+        try:
+            for part in _chunks(arr_ids, 100):
+                for b in supabase.table("bill_arrivals").select("*").in_("id", part).execute().data or []:
+                    ba[b["id"]] = b
+        except Exception:
+            pass
+    return {"als": als, "arrs": arrs, "tasks_by_arr": tasks_by_arr, "calls_by_order": calls_by_order,
+            "hos_by_arr": hos_by_arr, "porter_by_arr": porter_by_arr, "ba": ba}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def order_journey(order_no):
+    """Every step of one customer order, as a time-ordered list of events.
+    branch = None for order-level steps, else the ARR no (one branch per distributor bill)"""
+    lines = supabase.table("customer_order_lines").select("*").eq("order_no", str(order_no))\
+        .eq("removed", False).execute().data or []
+    if not lines:
+        return None
+    return build_journey(lines, _load_journey_ctx(lines))
+
+
+def build_journey(lines, ctx):
+    idset = {l["id"] for l in lines}
+    order_no = str(lines[0].get("order_no"))
+    als = [a for a in ctx["als"] if a.get("line_id") in idset]
+    arr_nos = sorted({_ano(a.get("arrangement_no")) for a in als} - {""})
+    arrs = ctx["arrs"]
 
     ev, photos = [], []
-    def add(when, step, who="", branch=None, info="", photo=None):
-        ev.append({"when": when, "step": step, "who": who or "", "branch": branch, "info": info})
-        if photo:
-            photos.append((f"{step}" + (f" · #{branch}" if branch else ""), photo))
+    def add(when, step, who="", branch=None, info="", photo=None, k=""):
+        ev.append({"when": when, "step": step, "who": who or "", "branch": branch, "info": info, "k": k})
+        for p in (photo if isinstance(photo, list) else [photo] if photo else []):
+            photos.append((f"{step}" + (f" · #{branch}" if branch else ""), p))
 
-    # 1) order came in
-    t0 = min([_j_ts(l.get("imported_at")) for l in lines if l.get("imported_at")] or [None]) if lines else None
+    # 1) customer ordered (chat sheet time) / order came in (import)
+    ots = [_j_ts(l.get("order_time")) for l in lines if l.get("order_time")]
+    ots = [t for t in ots if t]
+    if ots:
+        add(min(ots), "🛒 Customer ordered (chat)", "", info="order time from the chat sheet", k="order")
+    t0 = min([_j_ts(l.get("imported_at")) for l in lines if l.get("imported_at")] or [None])
     imp_by = ", ".join(sorted({l.get("imported_by") or "" for l in lines} - {""}))
-    add(t0, "🧾 Order came in", imp_by,
-        info=f"{len(lines)} medicine(s) · deliver by {lines[0].get('delivery_time') or '—'}")
+    add(t0, "🧾 Order came in (imported)", imp_by,
+        info=f"{len(lines)} medicine(s) · deliver by {lines[0].get('delivery_time') or '—'}", k="import")
 
     # 2) store check / decision (In store / to arrange / not available)
     dec = [l for l in lines if l.get("decided_at")]
@@ -7594,43 +7677,34 @@ def order_journey(order_no):
         add(max(_j_ts(l["decided_at"]) for l in dec), "🔎 Store check — what to arrange",
             ", ".join(sorted({l.get("decided_by") or "" for l in dec} - {""})),
             info=f"{in_store} in store · {len(lines) - in_store - cnt.get('Not Available', 0)} to arrange"
-                 + (f" · {cnt['Not Available']} not available" if cnt.get("Not Available") else ""))
+                 + (f" · {cnt['Not Available']} not available" if cnt.get("Not Available") else ""), k="store")
 
     # 3) one branch per arrangement (distributor bill)
-    lo = None
-    for a in als:
-        w = _j_ts(a.get("ordered_at"))
-        if w and (lo is None or w < lo):
-            lo = w
-    tasks = []
-    if arr_nos:
-        d_lo = ((lo or t0 or datetime.now()) - timedelta(days=1)).strftime("%Y-%m-%d")
-        d_hi = ((lo or t0 or datetime.now()) + timedelta(days=10)).strftime("%Y-%m-%d")
-        try:
-            tasks = [t for t in fetch_all("daily_tasks", lambda q: q.in_("task_type", JOURNEY_TASKS)
-                                          .gte("date", d_lo).lte("date", d_hi))
-                     if _arr_nos_of(t.get("details") or {}) & set(arr_nos)]
-        except Exception:
-            tasks = []
-        try:
-            hos = supabase.table("pilot_handovers").select("*").in_("arrangement_no", arr_nos).execute().data or []
-        except Exception:
-            hos = []                                  # table not created yet
-    else:
-        hos = []
-
     branches = []
     for a_no in arr_nos:
         arr = arrs.get(a_no, {})
-        mine = [a for a in als if str(a.get("arrangement_no") or "").strip().lstrip("#") == a_no]
+        mine = [a for a in als if _ano(a.get("arrangement_no")) == a_no]
         dist = arr.get("distributor") or (mine[0].get("distributor") if mine else "")
         branches.append((a_no, dist))
         o_at = min([_j_ts(a.get("ordered_at")) for a in mine if a.get("ordered_at")] or [None])
         add(o_at, f"📦 Ordered from {dist}", ", ".join(sorted({a.get("ordered_by") or "" for a in mine} - {""}))
             or arr.get("order_by", ""), a_no,
             info=f"{len(mine)} medicine(s) of this order" + (f" · {arr.get('urgency')}" if arr.get("urgency") not in (None, "", "Normal") else ""),
-            photo=arr.get("order_image"))
-        my_t = [t for t in tasks if a_no in _arr_nos_of(t.get("details") or {})]
+            photo=arr.get("order_image"), k="ordered")
+        my_t = ctx["tasks_by_arr"].get(a_no, [])
+        porter_picked = False
+        for b in ctx["porter_by_arr"].get(a_no, [])[:1]:
+            w = _j_at_any(b.get("date"), b.get("time"))
+            if w:
+                add(w, f"🚛 Porter booked ({b.get('porter_no') or '—'})", b.get("booked_by", ""), a_no,
+                    info=f"{b.get('pickup_point') or ''} → {b.get('delivery_point') or ''}", k="porter_book")
+            h_at = _j_at_any(b.get("date"), b.get("handover_time")) if b.get("status") not in (None, "", "Booked") else None
+            if h_at:
+                porter_picked = True
+                add(h_at, "📞 Porter picked up", b.get("handover_by", ""), a_no,
+                    info=" · ".join(x for x in [f"{b.get('no_bills')} bill(s)" if b.get("no_bills") else "",
+                                                f"{b.get('no_polythene')} polythene" if b.get("no_polythene") else ""] if x),
+                    photo=b.get("handover_image") or None, k="picked")
         pk = [t for t in my_t if t.get("task_type") == "Pickup" and t.get("status") != "In Progress"]
         if pk:
             t = pk[0]
@@ -7640,37 +7714,32 @@ def order_journey(order_no):
                 info=" · ".join(x for x in [f"{d.get('no_sku_received')} SKU" if d.get("no_sku_received") else "",
                                             f"delivery: {d.get('delivery_by')}" if d.get("delivery_by") else "",
                                             f"porter {d.get('porter_no')}" if d.get("porter_no") else ""] if x),
-                photo=d.get("medicine_image"))
-        elif arr.get("picked_up_at") or arr.get("pickup_by"):
+                photo=d.get("medicine_image"), k="picked")
+        elif (arr.get("picked_up_at") or arr.get("pickup_by")) and not porter_picked:
             add(_j_ts(arr.get("picked_up_at")), "🛵 Picked up at distributor", arr.get("pickup_by", ""), a_no,
-                info=arr.get("pickup_type") or "")
-        for h in sorted([h for h in hos if str(h.get("arrangement_no")) == a_no], key=lambda x: str(x.get("at") or "")):
+                info=arr.get("pickup_type") or "", k="picked")
+        for h in sorted(ctx["hos_by_arr"].get(a_no, []), key=lambda x: str(x.get("at") or "")):
             if h.get("kind") == "overnight":
                 add(_j_ts(h.get("at")), f"🌙 Kept overnight by {h.get('to_person','')}", h.get("to_person", ""), a_no,
-                    info=h.get("note") or "", photo=h.get("photo"))
+                    info=h.get("note") or "", photo=h.get("photo"), k="handover")
                 continue
             add(_j_ts(h.get("at")), f"🤝 Handed {h.get('from_person','')} → {h.get('to_person','')}",
-                h.get("from_person", ""), a_no, info=f"for {h.get('area') or '—'}", photo=h.get("photo"))
+                h.get("from_person", ""), a_no, info=f"for {h.get('area') or '—'}", photo=h.get("photo"), k="handover")
         for t in [t for t in my_t if t.get("task_type") in ("Porter Receipt", "Distributor Delivery Receipt")][:1]:
             add(_task_dt(t, "time"), "📦 Reached warehouse (receipt)", t.get("person", ""), a_no,
-                info=(t.get("details") or {}).get("area", ""))
+                info=(t.get("details") or {}).get("area", ""), k="arrived")
         regs = sorted([t for t in my_t if t.get("task_type") == "Register Entry"], key=lambda x: _task_dt(x, "time") or datetime.max)
         for r in regs[:1]:
             d = r.get("details") or {}
             if d.get("arrival_id") or d.get("arrived_at"):
-                ba = {}
-                if d.get("arrival_id"):
-                    try:
-                        ba = (supabase.table("bill_arrivals").select("*").eq("id", d["arrival_id"]).execute().data or [{}])[0]
-                    except Exception:
-                        ba = {}
-                add(_j_ts(d.get("arrived_at") or ba.get("arrived_at")), f"📥 Arrived at {d.get('area') or ba.get('area') or 'warehouse'}",
-                    ba.get("logged_by", ""), a_no,
-                    info=f"brought by {ba.get('brought_by_name') or ba.get('brought_by') or '—'}" if ba else "",
-                    photo=ba.get("photo"))
+                b_ = ctx["ba"].get(d.get("arrival_id"), {})
+                add(_j_ts(d.get("arrived_at") or b_.get("arrived_at")), f"📥 Arrived at {d.get('area') or b_.get('area') or 'warehouse'}",
+                    b_.get("logged_by", ""), a_no,
+                    info=f"brought by {b_.get('brought_by_name') or b_.get('brought_by') or '—'}" if b_ else "",
+                    photo=b_.get("photo"), k="arrived")
             add(_task_dt(r, "time"), "📝 Register entry", r.get("person", ""), a_no,
                 info=f"Bill {d.get('bill_no') or '—'} · {int(_to_float(d.get('no_items'), 0))} items",
-                photo=d.get("invoice_image"))
+                photo=d.get("invoice_image"), k="register")
         cc = sorted([t for t in my_t if t.get("task_type") == "Bill Cross Check" and t.get("status") != "In Progress"],
                     key=lambda x: _task_dt(x) or datetime.max)
         rec = [a for a in mine if a.get("status") in ("Received", "Short")]
@@ -7679,15 +7748,15 @@ def order_journey(order_no):
             t = cc[0]
             add(_task_dt(t), "✔️ Cross checked — medicines received", t.get("person", ""), a_no,
                 info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""),
-                photo=(t.get("details") or {}).get("bill_check_image"))
+                photo=(t.get("details") or {}).get("bill_check_image"), k="checked")
         elif rec:
             add(max([_j_ts(a.get("received_at")) for a in rec if a.get("received_at")] or [None]),
                 "✔️ Medicines received", ", ".join(sorted({a.get("received_by") or "" for a in rec} - {""})), a_no,
-                info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""))
+                info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""), k="checked")
         up = sorted([t for t in my_t if t.get("task_type") == "Bill Upload (Software)" and t.get("status") != "In Progress"],
                     key=lambda x: _task_dt(x) or datetime.max)
         for t in up[:1]:
-            add(_task_dt(t), "📤 Bill uploaded in software", t.get("person", ""), a_no)
+            add(_task_dt(t), "📤 Bill uploaded in software", t.get("person", ""), a_no, k="uploaded")
         pl = sorted([t for t in my_t if t.get("task_type") == "Stock Placement" and t.get("status") != "In Progress"],
                     key=lambda x: _task_dt(x) or datetime.max)
         for t in pl[:1]:
@@ -7695,11 +7764,11 @@ def order_journey(order_no):
             wh = d.get("placed_by_type") == "Warehouse team"
             add(_task_dt(t), "📍 Placed on racks" + (" (warehouse team)" if wh else ""),
                 (d.get("warehouse_person") or "Warehouse team") if wh else t.get("person", ""), a_no,
-                info=f"logged by {t.get('person', '')}" if wh else "", photo=d.get("printout_image"))
+                info=f"logged by {t.get('person', '')}" if wh else "", photo=d.get("printout_image"), k="placed")
         if not (cc or rec):
-            nxt = ("waiting for pickup" if not (pk or arr.get("pickup_by")) else
+            nxt = ("waiting for pickup" if not (pk or arr.get("pickup_by") or porter_picked) else
                    "on the way to warehouse" if not regs else "waiting for cross check")
-            add(None, f"⏳ Now: {nxt}", "", a_no, info=arr.get("status", ""))
+            add(None, f"⏳ Now: {nxt}", "", a_no, info=arr.get("status", ""), k="now")
 
     # 4) all medicines ready, then the call
     picked = [l for l in lines if l.get("status") == "In Store" and l.get("store_checked_at")]
@@ -7707,25 +7776,33 @@ def order_journey(order_no):
         nf = [l for l in picked if l.get("store_check") != "Picked"]
         add(max(_j_ts(l["store_checked_at"]) for l in picked), "🏪 Picked from the shelf",
             ", ".join(sorted({l.get("store_checked_by") or "" for l in picked} - {""})),
-            info=f"{len(picked) - len(nf)} picked" + (f" · ⚠️ {len(nf)} not found" if nf else ""))
+            info=f"{len(picked) - len(nf)} picked" + (f" · ⚠️ {len(nf)} not found" if nf else ""), k="shelf")
     to_pick = [l for l in lines if l.get("status") == "In Store" and l.get("store_check") != "Picked"]
     if to_pick:
         add(None, f"⏳ Now: {len(to_pick)} in-store medicine(s) to pick from the shelf", "",
-            info=", ".join(l.get("item_name", "") for l in to_pick[:5]))
+            info=", ".join(l.get("item_name", "") for l in to_pick[:5]), k="now")
     if all(line_ready(l) for l in lines):
         done_t = [_naive(line_ready_at(l)) for l in lines if line_ready_at(l)]
         add(max(done_t) if done_t else None, "✅ All medicines ready", "",
-            info="everything picked from the shelf / received")
+            info="everything picked from the shelf / received", k="ready")
+    calls = ctx["calls_by_order"].get(order_no, [])
+    nr = sorted([t for t in calls if t.get("task_type") == "Customer Not Reachable"], key=lambda t: t.get("id") or 0)
+    for i, t in enumerate(nr, 1):
+        pr = (t.get("details") or {}).get("proof") or []
+        add(_j_at(t.get("date"), t.get("time")), f"📵 Called — not reachable (try {i})", t.get("person", ""),
+            info=f"{len(pr)} screenshot(s)", photo=pr, k="nr")
     called = [l for l in lines if l.get("delivery_status")]
     if called:
         n_ok = sum(1 for l in called if l.get("delivery_status") == "Delivered")
         res = ("✅ Delivered" if n_ok == len(lines) else "❌ Not delivered" if n_ok == 0 else f"🟡 Partly delivered ({n_ok}/{len(lines)})")
         reasons = sorted({l.get("delivery_reason") or "" for l in called if l.get("delivery_status") != "Delivered"} - {""})
+        proof = [p for t in calls if t.get("task_type") == "Customer Delivery Update"
+                 for p in ((t.get("details") or {}).get("proof") or [])]
         add(max([_j_ts(l.get("delivery_at")) for l in called if l.get("delivery_at")] or [None]), f"📞 Call done → {res}",
             ", ".join(sorted({l.get("delivery_by") or "" for l in called} - {""})),
-            info="; ".join(reasons))
+            info="; ".join(reasons) + (f" · 📸 {len(proof)} screenshot(s)" if proof else ""), photo=proof, k="call")
     else:
-        add(None, "⏳ Now: waiting for the call to customer", "")
+        add(None, "⏳ Now: waiting for the call to customer" + (f" · 📵 tried {len(nr)}×" if nr else ""), "", k="now")
 
     # sort by time (undated 'now' rows go last), then gap from the previous step on the same path
     timed = sorted([e for e in ev if e["when"]], key=lambda e: e["when"])
@@ -7742,12 +7819,222 @@ def order_journey(order_no):
         last_any = e["when"]
     first = lines[0]
     return {"lines": lines, "events": timed + [e for e in ev if not e["when"]], "photos": photos,
-            "branches": branches, "head": {"customer": first.get("customer_name", ""), "phone": first.get("customer_phone", ""),
-                                           "area": first.get("area", ""), "sched": first.get("scheduled_date", ""),
-                                           "deliver_by": first.get("delivery_time") or ""}}
+            "branches": branches, "nr": len(nr), "arranged": bool(arr_nos),
+            "head": {"customer": first.get("customer_name", ""), "phone": first.get("customer_phone", ""),
+                     "area": first.get("area", ""), "sched": first.get("scheduled_date", ""),
+                     "deliver_by": first.get("delivery_time") or ""}}
+
+
+# columns of the 📅 All orders table: (column, step keys, name of the wait that ends here)
+J_COLS = [("Ordered to distributor", ("ordered",), "Ordering"),
+          ("Picked up", ("picked",), "Pickup"),
+          ("Arrived at warehouse", ("arrived", "register"), "Travel to warehouse"),
+          ("Cross checked", ("checked",), "Cross check"),
+          ("All ready", ("ready",), "Shelf pick / ready"),
+          ("Call done", ("call",), "Call")]
+J_LATE = 180
+
+
+def journey_summary(j, now_n=None):
+    """one row of numbers for the 📅 All orders table"""
+    now_n = now_n or now_ist().replace(tzinfo=None)
+    evs = [e for e in j["events"] if e["when"]]
+    t_in = min([e["when"] for e in evs if e["k"] in ("order", "import")] or [None])
+    out = {"came_in": t_in, "steps": {}, "gaps": {}}
+    prev = t_in
+    for col, ks, _ in J_COLS:
+        ts = [e["when"] for e in evs if e["k"] in ks]
+        if col == "Arrived at warehouse":                # the real arrival beats the register entry
+            real = [e["when"] for e in evs if e["k"] == "arrived"]
+            ts = real or ts
+        w = max(ts) if ts else None                     # the customer waits for the LAST bill
+        out["steps"][col] = w
+        if w and prev:
+            out["gaps"][col] = max(0.0, (w - prev).total_seconds() / 60)
+        if w:
+            prev = w
+    call = out["steps"]["Call done"]
+    out["closed"] = bool(call)
+    out["total"] = ((call or now_n) - t_in).total_seconds() / 60 if t_in else None
+    out["late"] = out["total"] is not None and out["total"] >= J_LATE
+    res = next((e["step"].split("→", 1)[1].strip() for e in evs if e["k"] == "call"), "")
+    nows = [e["step"].replace("⏳ Now: ", "") for e in j["events"] if not e["when"] and e["k"] == "now"]
+    out["now"] = res or ("⏳ " + nows[0] if nows else "⏳")
+    out["result"] = res
+    out["nr"] = j.get("nr", 0)
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def journeys_for_period(lo_s, hi_s, area):
+    """{order_no: (journey, summary)} for every customer order whose ORDER date (chat time, else import) is in [lo, hi]"""
+    lo, hi = datetime.strptime(lo_s, "%Y-%m-%d"), datetime.strptime(hi_s, "%Y-%m-%d")
+    since = IST.localize(lo - timedelta(days=1)).isoformat()
+    until = IST.localize(hi + timedelta(days=2)).isoformat()
+    def build(q):
+        q = q.eq("removed", False).gte("imported_at", since).lt("imported_at", until)
+        return q.eq("area", area) if area != "All Areas" else q
+    lines = fetch_all("customer_order_lines", build)
+    by = {}
+    for l in lines:
+        by.setdefault(str(l.get("order_no")), []).append(l)
+    keep = {}
+    for o, ls in by.items():
+        ts = [_j_ts(l.get("order_time")) for l in ls if l.get("order_time")] or \
+             [_j_ts(l.get("imported_at")) for l in ls if l.get("imported_at")]
+        ts = [t for t in ts if t]
+        if ts and lo.date() <= min(ts).date() <= hi.date():
+            keep[o] = ls
+    if not keep:
+        return {}
+    ctx = _load_journey_ctx([l for ls in keep.values() for l in ls])
+    now_n = now_ist().replace(tzinfo=None)
+    out = {}
+    for o, ls in keep.items():
+        j = build_journey(ls, ctx)
+        out[o] = (j, journey_summary(j, now_n))
+    return out
+
+
+J_SHOW = ["All", "⏳ Still open", "🔴 Late (over 3 hours)", "❌ Not delivered", "📵 Not reachable"]
+
+
+def _jcell(w, gap, ref):
+    if not w:
+        return ""
+    return _fmt_when(w, ref) + (f" ({fmt_age(int(gap))})" if gap is not None else "")
+
+
+def _show_all_journeys(kp, show_phone):
+    lo, hi, _b = report_period(f"{kp}_all")
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_all_area")
+    with c2:
+        show = st.selectbox("Show", J_SHOW, key=f"{kp}_all_show")
+    with c3:
+        st.write("")
+        only_arr = st.checkbox("Only orders sent to a distributor (arrangement)", value=True, key=f"{kp}_all_arr")
+    st.caption("Date = the customer's order date (chat-sheet time; the import time when it is missing).")
+    try:
+        with st.spinner("Building the journeys…"):
+            data = journeys_for_period(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"), area)
+    except Exception as e:
+        st.error(f"Could not load: {e}")
+        return
+    items = [(o, j, s) for o, (j, s) in data.items() if j["arranged"] or not only_arr]
+    if not items:
+        st.info("No customer orders in this period / area.")
+        return
+
+    # ── period summary (before the Show filter)
+    closed = [s for _, _, s in items if s["closed"] and s["total"] is not None]
+    avg_t = sum(s["total"] for s in closed) / len(closed) if closed else None
+    in3 = sum(1 for s in closed if s["total"] < J_LATE)
+    open_late = sum(1 for _, _, s in items if not s["closed"] and s["late"])
+    step_avg = {}
+    for col, _, nm in J_COLS:
+        g = [s["gaps"][col] for _, _, s in items if col in s["gaps"]]
+        if g:
+            step_avg[nm] = sum(g) / len(g)
+    res = lambda r: sum(1 for _, _, s in items if s["result"].startswith(r))
+    m = st.columns(5)
+    m[0].metric("Orders", len(items))
+    m[1].metric("Avg came in → call", fmt_age(int(avg_t)) if avg_t is not None else "—")
+    m[2].metric("Within 3 hours", f"{round(100 * in3 / len(closed))}%" if closed else "—",
+                help="of the orders where the call is done")
+    m[3].metric("✅ / ❌ / 🟡", f"{res('✅')} / {res('❌')} / {res('🟡')}")
+    m[4].metric("⏳ Open (🔴 late)", f"{len(items) - len(closed)} ({open_late})")
+    if step_avg:
+        worst = max(step_avg, key=step_avg.get)
+        st.markdown(f"🔴 **Most time is lost in: {worst}** — avg {fmt_age(int(step_avg[worst]))} · "
+                    + " · ".join(f"{k} {fmt_age(int(v))}" for k, v in step_avg.items()))
+    nr_n = sum(1 for _, _, s in items if s["nr"])
+    if nr_n:
+        st.caption(f"📵 {nr_n} order(s) had a 'not reachable' call.")
+
+    # ── area-wise / day-wise summary
+    by_kind = st.radio("Summary by", ["📍 Area", "📅 Day"], horizontal=True, key=f"{kp}_all_by")
+    grp = {}
+    for o, j, s in items:
+        key = j["head"]["area"] or "—" if by_kind == "📍 Area" else (s["came_in"].strftime("%Y-%m-%d") if s["came_in"] else "—")
+        grp.setdefault(key, []).append(s)
+    srows = []
+    for key in sorted(grp):
+        ss = grp[key]
+        cl = [s for s in ss if s["closed"] and s["total"] is not None]
+        r = {("Area" if by_kind == "📍 Area" else "Day"):
+             key if by_kind == "📍 Area" or key == "—" else datetime.strptime(key, "%Y-%m-%d").strftime("%a %d %b"),
+             "Orders": len(ss), "Call done": len(cl),
+             "Avg total": fmt_age(int(sum(s["total"] for s in cl) / len(cl))) if cl else "—",
+             "Within 3h": f"{round(100 * sum(1 for s in cl if s['total'] < J_LATE) / len(cl))}%" if cl else "—",
+             "🔴 Late": sum(1 for s in ss if s["late"])}
+        for col, _, nm in J_COLS:
+            g = [s["gaps"][col] for s in ss if col in s["gaps"]]
+            r[nm] = fmt_age(int(sum(g) / len(g))) if g else ""
+        srows.append(r)
+    st.dataframe(pd.DataFrame(srows).astype(str), hide_index=True, width='stretch')
+    st.caption("Step columns = average wait before that step finished (e.g. Pickup = ordered → picked up).")
+
+    # ── one row per order
+    if show == "⏳ Still open":
+        items = [x for x in items if not x[2]["closed"]]
+    elif show.startswith("🔴"):
+        items = [x for x in items if x[2]["late"]]
+    elif show.startswith("❌"):
+        items = [x for x in items if x[2]["result"].startswith(("❌", "🟡"))]
+    elif show.startswith("📵"):
+        items = [x for x in items if x[2]["nr"]]
+    items.sort(key=lambda x: -(x[2]["total"] or 0))
+    st.markdown(f"**{len(items)} order(s)** — slowest first")
+    if not items:
+        return
+    rows, xrows = [], []
+    for o, j, s in items:
+        h, ref = j["head"], s["came_in"]
+        slow = max(s["gaps"], key=s["gaps"].get) if s["gaps"] else None
+        slow_nm = next((nm for col, _, nm in J_COLS if col == slow), "")
+        r = {"Order": f"#{o}", "Area": h["area"], "Customer": h["customer"]}
+        if show_phone:
+            r["Phone"] = h["phone"]
+        r["Came in"] = _fmt_when(ref, None) if ref else ""
+        x = dict(r, **{"Came in": ref.strftime("%Y-%m-%d %H:%M") if ref else ""})
+        for col, _, _ in J_COLS:
+            r[col] = _jcell(s["steps"][col], s["gaps"].get(col), ref)
+            x[col] = s["steps"][col].strftime("%Y-%m-%d %H:%M") if s["steps"][col] else ""
+            x[col + " (mins)"] = int(s["gaps"][col]) if col in s["gaps"] else ""
+        tot = (("🔴 " if s["late"] else "🟢 ") + fmt_age(int(s["total"])) + ("" if s["closed"] else " ⏳")) if s["total"] is not None else ""
+        r.update({"Total": tot, "Slowest step": f"{slow_nm} {fmt_age(int(s['gaps'][slow]))}" if slow else "",
+                  "Now": s["now"] + (f" · 📵 {s['nr']}×" if s["nr"] else "")})
+        x.update({"Total (mins)": int(s["total"]) if s["total"] is not None else "", "Late": "Yes" if s["late"] else "",
+                  "Slowest step": slow_nm, "Status": s["now"], "Not reachable tries": s["nr"]})
+        rows.append(r)
+        xrows.append(x)
+    st.dataframe(pd.DataFrame(rows).astype(str), hide_index=True, width='stretch')
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(xrows).to_excel(w, index=False, sheet_name="Orders")
+        pd.DataFrame(srows).to_excel(w, index=False, sheet_name="Summary")
+    st.download_button("📥 Download Excel", buf.getvalue(), key=f"{kp}_all_dl",
+                       file_name=f"order-journeys-{lo:%d%b}-{hi:%d%b}-{area.replace(' ', '_')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.divider()
+    labels = {f"#{o} — {j['head']['customer']} — {j['head']['area']} — {s['now']}": o for o, j, s in items[:300]}
+    pick = st.selectbox("🔍 Open the full journey of", ["—"] + list(labels), key=f"{kp}_all_pick")
+    if pick != "—":
+        o = labels[pick]
+        _show_journey_detail(data[o][0], o, f"{kp}_all", show_phone)
+
 
 def show_order_journey(kp="oj", show_phone=True):
     st.subheader("📍 Order Journey")
+    mode = st.radio("View", ["📅 All orders (date & area)", "🔍 One order"], horizontal=True, key=f"{kp}_mode",
+                    label_visibility="collapsed")
+    if mode.startswith("📅"):
+        st.caption("Every customer order in the period with the time of each step — came in → ordered to distributor → "
+                   "picked up → arrived → cross checked → all ready → call done — and where the time is lost.")
+        _show_all_journeys(kp, show_phone)
+        return
     st.caption("Search one customer order and see every step — order came in → store check → ordered from distributor → "
                "pickup → handovers → arrived → entry → cross check → call — with who did it and how long each gap took.")
     q = st.text_input("🔍 Order #, mobile number or customer name", key=f"{kp}_q",
@@ -7769,8 +8056,12 @@ def show_order_journey(kp="oj", show_phone=True):
     if not j:
         st.info("This order has no medicines.")
         return
+    _show_journey_detail(j, labels[pick], kp, show_phone)
+
+
+def _show_journey_detail(j, order_no, kp, show_phone):
     h = j["head"]
-    st.markdown(f"**#{labels[pick]} · {h['customer']}**" + (f" · {h['phone']}" if show_phone and h["phone"] else "")
+    st.markdown(f"**#{order_no} · {h['customer']}**" + (f" · {h['phone']}" if show_phone and h["phone"] else "")
                 + f" · 📍 {h['area']} · 📅 {_sched_label(h['sched'])}" + (f" · deliver by {h['deliver_by']}" if h["deliver_by"] else ""))
     if len(j["branches"]) > 1:
         st.caption("This order came from " + str(len(j["branches"])) + " distributor bills: "
@@ -7797,12 +8088,11 @@ def show_order_journey(kp="oj", show_phone=True):
                      "Gap": (flag + fmt_age(int(g))) if g is not None else "", "Details": e["info"]})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
-    call = next((e for e in evs if e["step"].startswith("📞") and e["when"]), None)
-    now_n = now_ist().replace(tzinfo=None)
+    call = next((e for e in evs if e["step"].startswith("📞 Call") and e["when"]), None)
     if t_first:
         end = call["when"] if call else now_n
         mins = int((end - t_first).total_seconds() // 60)
-        mark = "🔴 over 3 hours" if mins >= 180 else "🟢 within 3 hours"
+        mark = "🔴 over 3 hours" if mins >= J_LATE else "🟢 within 3 hours"
         st.markdown(f"**{'Total: came in → call done' if call else '⏳ Running: came in → now'} = {fmt_age(mins)} · {mark}**")
         if worst and worst >= 30:
             w = next(e for e in evs if e.get("gap") == worst)
@@ -7810,14 +8100,15 @@ def show_order_journey(kp="oj", show_phone=True):
                        + f" — {fmt_age(int(worst))} after the step before"
                        + (f", by {w['who']}" if w["who"] else ""))
     st.caption("Gap = time since the step before on the same path. 🔴 slowest gap · 🟡 over 1 hour. "
-               "Handover and arrival-photo steps show only for orders after those features started.")
+               "The clock starts at the customer's order time from the chat sheet (import time when it is missing).")
     if j["photos"]:
-        if st.toggle(f"📸 Show photos ({len(j['photos'])})", key=f"{kp}_ph_{labels[pick]}"):
+        if st.toggle(f"📸 Show photos & call screenshots ({len(j['photos'])})", key=f"{kp}_ph_{order_no}"):
             cols = st.columns(min(3, len(j["photos"])))
             for i, (lbl, nm) in enumerate(j["photos"]):
                 with cols[i % len(cols)]:
                     st.caption(lbl)
-                    show_image(nm, key=f"{kp}_img_{labels[pick]}_{i}")
+                    show_image(nm, key=f"{kp}_img_{order_no}_{i}")
+
 
 
 # ── CUSTOMER DELIVERY STATUS (Call team) ──────────────────────────────────────
