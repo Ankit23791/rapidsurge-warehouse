@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v23.1-Oct porter pickup step"
+APP_VERSION = "v23.2-Oct porter auto-fill"
 
 def show_sidebar():
     with st.sidebar:
@@ -2729,9 +2729,13 @@ def show_arrival_button():
                 cnt[a.get("distributor") or "?"] = cnt.get(a.get("distributor") or "?", 0) + 1
             st.info(f"{porter_label(porter_bk)} — for {area}: "
                     + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}" for a in pa) or "no ARR listed"))
-            if cnt and st.button(f"⬇️ Fill these {len(pa)} bills", key=f"arr_in_pfill_{ver}"):
+            if cnt and st.session_state.get(f"arr_in_pauto_{ver}") != porter_bk.get("id"):
+                st.session_state[f"arr_in_pauto_{ver}"] = porter_bk.get("id")     # fill once per chosen booking
                 st.session_state["arr_in_prefill"] = list(cnt.items())
                 st.rerun()
+            if cnt:
+                st.caption("✅ Distributor and type (Arrangement) filled from the booking — change a line only if "
+                           "the bills he brought are different.")
             exp_b = int(_to_float(porter_bk.get("no_bills"), 0) or len(pa) or 1)
             exp_p = int(_to_float(porter_bk.get("no_polythene"), 0))
             c1, c2 = st.columns(2)
@@ -3743,7 +3747,25 @@ def form_book_porter():
         st.error(f"Error loading arrangements: {e}")
         arrangements = []
 
-    with st.form("book_porter_form", clear_on_submit=True):
+    msg = st.session_state.pop("pb_msg", None)
+    if msg:
+        st.success(msg[0])
+        st.info(msg[1])
+    pv = st.session_state.get("pb_ver", 0)
+    by_label = {f"#{a.get('arrangement_no')} — {a.get('distributor')} — {a.get('area','')}": a for a in arrangements}
+    if arrangements:
+        selected_arrs = st.multiselect("Link Arrangements * (choose these first — pickup point fills by itself)",
+                                       list(by_label), key=f"pb_arrs_{pv}")
+    else:
+        st.warning("No pending arrangements found!")
+        selected_arrs = []
+    chosen = [by_label[x] for x in selected_arrs]
+    auto_pick = " + ".join(dict.fromkeys(str(a.get("distributor") or "").strip() for a in chosen if a.get("distributor")))
+    whs = load_warehouses()
+    areas_ch = {_norm_col(a.get("area") or "") for a in chosen}
+    wh_idx = next((i for i, w in enumerate(whs) if _norm_col(w) in areas_ch), 0) if len(areas_ch) == 1 else 0
+    sel_key = abs(hash(tuple(sorted(selected_arrs)))) % 10**8
+    with st.form(f"book_porter_form_{pv}", clear_on_submit=False):
         c1,c2 = st.columns(2)
         with c1:
             # Auto-generate System Porter ID
@@ -3762,20 +3784,16 @@ def form_book_porter():
                 placeholder="e.g. 9876543210",
                 help="Actual porter contact number")
             vehicle_no   = st.text_input("Vehicle Number", placeholder="e.g. UP16 AB 1234")
-            pickup_point = st.text_input("Pickup Point *", placeholder="Distributor name/address")
+            pickup_point = st.text_input("Pickup Point *", value=auto_pick, placeholder="Distributor name/address",
+                                         key=f"pb_pick_{pv}_{sel_key}",
+                                         help="Filled from the chosen arrangements — add the address if the porter needs it")
         with c2:
-            delivery_point = st.selectbox("Delivery Point *", load_warehouses(), key="pb_delivery")
+            delivery_point = st.selectbox("Delivery Point *", whs, index=wh_idx, key=f"pb_delivery_{pv}_{sel_key}")
             booked_via     = st.selectbox("Booked Via", ["Phone Call","Porter App","WhatsApp","Other"], key="pb_via")
 
-        # Select multiple arrangements
-        if arrangements:
-            arr_options = [f"#{a.get('arrangement_no')} — {a.get('distributor')} — {a.get('area','')}" for a in arrangements]
-            selected_arrs = st.multiselect("Link Arrangements *", arr_options, key="pb_arrs")
-        else:
-            st.warning("No pending arrangements found!")
-            selected_arrs = []
-
-        remarks = st.text_input("Remarks")
+        if chosen:
+            st.caption("🔗 Arrangements: " + ", ".join(f"#{a.get('arrangement_no')}" for a in chosen))
+        remarks = st.text_input("Remarks", key=f"pb_rem_{pv}")
 
         if st.form_submit_button("Book Porter ✅", type="primary", width='stretch'):
             if not porter_phone or not pickup_point or not delivery_point:
@@ -3812,10 +3830,12 @@ def form_book_porter():
                             "porter_no": porter_no,
                         }).eq("id", arr_id).execute()
 
-                    st.success(f"✅ Porter {porter_no} booked successfully! Next step: when the porter has collected "
-                               f"the medicines, confirm it in **📞 Confirm porter pickup**.")
-                    st.info(f"Arrangements linked: {', '.join(arr_nos)}")
-                    st.balloons()
+                    st.session_state["pb_msg"] = (
+                        f"✅ Porter {porter_no} booked successfully! Next step: when the porter has collected "
+                        f"the medicines, confirm it in **📞 Confirm porter pickup**.",
+                        f"Arrangements linked: {', '.join(arr_nos)}")
+                    st.session_state["pb_ver"] = pv + 1
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
 
