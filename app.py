@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v27-Oct call table"
+APP_VERSION = "v28-Oct live tracker"
 
 def show_sidebar():
     with st.sidebar:
@@ -4814,6 +4814,10 @@ def show_user_page():
                 type="primary" if n_rc or st.session_state.call_active_form=="custdel" else "secondary"):
                 st.session_state.call_active_form = "custdel"
                 st.rerun()
+            if st.button("🧭 Live Order Tracker", width='stretch', key="c_live",
+                type="primary" if st.session_state.call_active_form=="live" else "secondary"):
+                st.session_state.call_active_form = "live"
+                st.rerun()
             if st.button("🔍 Medicine Search", width='stretch', key="c_medsearch",
                 type="primary" if st.session_state.call_active_form=="medsearch" else "secondary"):
                 st.session_state.call_active_form = "medsearch"
@@ -4862,6 +4866,7 @@ def show_user_page():
             form_map = {
                 "calllog":   form_call_log,
                 "custdel":   form_customer_delivery,
+                "live":      lambda: show_live_tracker("c_lt", True, "📞 Call"),
                 "medsearch": form_medicine_search,
                 "porter":    form_book_porter,
                 "porter_pick": form_confirm_porter_pickup,
@@ -5105,6 +5110,10 @@ def show_user_page():
                 st.session_state.purchase_active_form = "import"
                 st.rerun()
             # 🧾 Pending Items is now part of 📦 Arrangement Order
+            if st.button("🧭 Live Order Tracker", width='stretch', key="p_live",
+                type="primary" if st.session_state.purchase_active_form=="live" else "secondary"):
+                st.session_state.purchase_active_form = "live"
+                st.rerun()
             if st.button("📊 Order Tracker", width='stretch', key="p_tracker",
                 type="primary" if st.session_state.purchase_active_form=="tracker" else "secondary"):
                 st.session_state.purchase_active_form = "tracker"
@@ -5198,6 +5207,7 @@ def show_user_page():
                 "bounce":      form_bounce_medicine,
                 "porter":      form_book_porter,
                 "porter_pick": form_confirm_porter_pickup,
+                "live":        lambda: show_live_tracker("p_lt", True, "🛒 Purchase"),
                 "payment":     form_porter_payment,
                 "pickup":      show_pickup_images,
                 "register":    form_register_entry,
@@ -8348,10 +8358,329 @@ def _show_arr_journey(kp, show_phone):
                 show_image(nm, key=f"{kp}_arr_img_{a_no}_{i}")
 
 
+# ── 🧭 LIVE ORDER TRACKER: every open customer order — which step it is at and whose job it is now ──────────
+LT_COLS = ["Ordered", "To distributor", "Picked up", "At warehouse", "Checked", "Ready", "Called"]
+LT_GROUPS = {"🛒 Purchase": "purchase", "📦 Stock": "stock", "📞 Call": "call"}
+LT_RED = {"decide": 30, "pickup": 90, "porter": 90, "dist": 240, "transit": 60, "enter": 30, "check": 60,
+          "shelf": 30, "call": 30, "missing": 0}
+
+
+def _lt_branch_times(evs, a_no):
+    out = {}
+    for e in evs:
+        if e["branch"] == a_no and e["when"]:
+            out.setdefault(e["k"], []).append(e)
+    return out
+
+
+def live_row(o, ls, j, ctx, credits, now_n):
+    """one tracker row: done steps, the step it is stuck at, whose job, how long"""
+    evs = j["events"]
+    timed = [e for e in evs if e["when"]]
+    by_k = {}
+    for e in timed:
+        if e["branch"] is None:
+            by_k.setdefault(e["k"], []).append(e["when"])
+    t_in = min(by_k.get("order", []) + by_k.get("import", []) or [None])
+    branches = [a for a, _ in j["branches"]]
+    br = {a: _lt_branch_times(evs, a) for a in branches}
+    def all_done(keys):
+        if not branches:
+            return None
+        ts = []
+        for a in branches:
+            t = [e["when"] for k in keys for e in br[a].get(k, [])]
+            if not t:
+                return False
+            ts.append(max(t))
+        return max(ts)
+    cells = {"Ordered": t_in, "To distributor": all_done(["ordered"]), "Picked up": all_done(["picked"]),
+             "At warehouse": all_done(["arrived", "register"]), "Checked": all_done(["checked"]),
+             "Ready": max(by_k["ready"]) if by_k.get("ready") else False,
+             "Called": max(by_k["call"]) if by_k.get("call") else False}
+    if not branches:
+        for c in ("To distributor", "Picked up", "At warehouse", "Checked"):
+            cells[c] = None                               # nothing ordered from a distributor
+    # where is it stuck?
+    stuck = []                                            # (column, text, whose, kind, since)
+    pend = [l for l in ls if l.get("status") in (None, "", "Pending")]
+    if pend:
+        stuck.append(("To distributor", f"Not ordered yet — {len(pend)} medicine(s) to decide / order", "🛒 Purchase",
+                      "decide", t_in))
+    for a in branches:
+        arr = ctx["arrs"].get(a, {})
+        b = br[a]
+        last = max([e["when"] for es in b.values() for e in es] or [t_in or now_n])
+        dist = arr.get("distributor", "")
+        if b.get("checked"):
+            continue
+        if b.get("missing") and not b.get("register"):
+            stuck.append(("Picked up", f"❌ #{a} {dist} not received from porter", "🛒 Purchase", "missing", last))
+        elif not b.get("picked"):
+            pt = arr.get("pickup_type") or ""
+            if pt == "Distributor Delivers":
+                stuck.append(("Picked up", f"#{a} {dist} — distributor to deliver", "🛒 Purchase", "dist", last))
+            elif b.get("porter_book"):
+                stuck.append(("Picked up", f"#{a} {dist} — porter booked, not collected", "🛒 Purchase", "porter", last))
+            elif pt == "Porter":
+                stuck.append(("Picked up", f"#{a} {dist} — book the porter", "🛒 Purchase", "pickup", last))
+            else:
+                stuck.append(("Picked up", f"#{a} {dist} — waiting for pickup", "🛒 Purchase", "pickup", last))
+        elif not (b.get("arrived") or b.get("register")):
+            picked_t = max(e["when"] for e in b["picked"])
+            if _take_arrival(credits, dist, arr.get("area"), picked_t - timedelta(minutes=30)):
+                stuck.append(("At warehouse", f"#{a} {dist} — arrived, not entered", "📦 Stock", "enter", last))
+            else:
+                stuck.append(("At warehouse", f"#{a} {dist} — on the way to warehouse", "🛒 Purchase", "transit", last))
+        else:
+            stuck.append(("Checked", f"#{a} {dist} — entered, not cross-checked", "📦 Stock", "check", last))
+    shelf = [l for l in ls if l.get("status") == "In Store" and l.get("store_check") != "Picked"]
+    if shelf:
+        dec = [_j_ts(l.get("decided_at")) for l in shelf if l.get("decided_at")]
+        stuck.append(("Ready", f"{len(shelf)} in-store medicine(s) to pick from the shelf", "📦 Stock", "shelf",
+                      max(dec) if dec else t_in))
+    if not stuck:
+        nr = sorted(by_k.get("nr", []))
+        since = nr[-1] if nr else (cells["Ready"] or t_in)
+        stuck.append(("Called", f"📵 Not reachable {len(nr)}× — call again" if nr else "Ready — call the customer",
+                      "📞 Call", "call", since))
+    order = {c: i for i, c in enumerate(LT_COLS)}
+    stuck.sort(key=lambda s: order[s[0]])
+    col, text, whose, kind, since = stuck[0]
+    wait = int((now_n - since).total_seconds() // 60) if since else 0
+    due = next((due_info(l) for l in ls if due_info(l)), None)
+    red = (due is not None and due[1] <= 60) or wait >= LT_RED.get(kind, 60)
+    return {"order": o, "head": j["head"], "cells": cells, "col": col, "text": text, "more": len(stuck) - 1,
+            "whose": whose, "kind": kind, "wait": wait, "due": due, "red": red, "j": j,
+            "groups": {LT_GROUPS[s[2]] for s in stuck}}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def live_tracker_data(area):
+    since = IST.localize(datetime.combine(today_ist() - timedelta(days=7), datetime.min.time())).isoformat()
+    def build(q):
+        q = q.eq("removed", False).gte("imported_at", since)
+        return q.eq("area", area) if area != "All Areas" else q
+    lines = fetch_all("customer_order_lines", build)
+    by = {}
+    for l in lines:
+        by.setdefault(str(l.get("order_no")), []).append(l)
+    by = {o: ls for o, ls in by.items() if any(not l.get("delivery_status") for l in ls)}
+    if not by:
+        return []
+    ctx = _load_journey_ctx([l for ls in by.values() for l in ls])
+    credits = [dict(a, _left=int(a.get("bills") or 0) - a.get("_entered", 0), _at=_naive(to_ist(a.get("arrived_at"))))
+               for a in load_open_arrivals(2)]
+    now_n = now_ist().replace(tzinfo=None)
+    return [live_row(o, ls, build_journey(ls, ctx), ctx, credits, now_n) for o, ls in by.items()]
+
+
+def show_live_tracker(kp="lt", show_phone=True, default_group="All"):
+    st.subheader("🧭 Live Order Tracker")
+    st.caption("Every open customer order — the step it is at now, whose job it is and how long it is waiting. "
+               "🔴 = due within 1 hour, or the step is waiting too long.")
+    groups = ["All"] + list(LT_GROUPS)
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    with c2:
+        grp = st.selectbox("Whose job now", groups, index=groups.index(default_group) if default_group in groups else 0,
+                           key=f"{kp}_grp")
+    with c3:
+        st.write("")
+        only_red = st.checkbox("Only 🔴", key=f"{kp}_red")
+    try:
+        with st.spinner("Loading…"):
+            data = live_tracker_data(area)
+    except Exception as e:
+        st.error(f"Could not load: {e}")
+        return
+    if not data:
+        st.success("✅ No open customer orders.")
+        return
+    m = st.columns(5)
+    m[0].metric("Open orders", len(data))
+    m[1].metric("🔴 Urgent", sum(1 for r in data if r["red"]))
+    for i, (g, k) in enumerate(LT_GROUPS.items()):
+        m[2 + i].metric(f"{g} job", sum(1 for r in data if k in r["groups"]))
+    rows = [r for r in data if (grp == "All" or LT_GROUPS[grp] in r["groups"]) and (r["red"] or not only_red)]
+    rows.sort(key=lambda r: (not r["red"], r["due"][1] if r["due"] else 10 ** 9, -r["wait"]))
+    if not rows:
+        st.success("✅ Nothing here right now.")
+        return
+    today_d = now_ist().date()
+    def cell(v, col, r):
+        if col == r["col"]:
+            return f"⏳ {fmt_age(r['wait'])}"
+        if v is None:
+            return "—"
+        if not v:
+            return ""
+        return "✅ " + (v.strftime("%I:%M %p") if v.date() == today_d else v.strftime("%d %b %H:%M"))
+    out = []
+    for r in rows:
+        h = r["head"]
+        row = {"": "🔴" if r["red"] else "", "⏰ Deliver by": (f"{r['due'][0]} {r['due'][2]}" if r["due"] else ""),
+               "Order": r["order"], "Customer": h["customer"],
+               "Stuck at": r["text"] + (f" (+{r['more']} more)" if r["more"] else ""), "Whose job": r["whose"]}
+        for c in LT_COLS:
+            row[c] = cell(r["cells"].get(c), c, r)
+        if show_phone:
+            row["Phone"] = h["phone"]
+        row["Area"] = h["area"]
+        out.append(row)
+    st.markdown(f"**{len(rows)} order(s)** — 🔴 first, then by delivery time")
+    st.dataframe(pd.DataFrame(out).astype(str), hide_index=True, width='stretch',
+                 column_config={"Stuck at": st.column_config.TextColumn("Stuck at", width="large")})
+    st.caption("✅ done (time) · ⏳ the step it is waiting at (how long) · — not needed (no distributor order)")
+    labels = {f"#{r['order']} — {r['head']['customer']} — {r['text']}": r for r in rows[:300]}
+    pick = st.selectbox("🔍 Open the full journey of", ["—"] + list(labels), key=f"{kp}_pick")
+    if pick != "—":
+        r = labels[pick]
+        _show_journey_detail(r["j"], r["order"], f"{kp}_d", show_phone)
+
+
+# ── 📋 FULL TABLE: one row per medicine, every step (admin / managers, Excel) ─────────────────────────────
+FT_SCREEN = ["Order", "Name", "Medicine Name", "Availability", "Distributor Name", "Arrangement No", "Status",
+             "Total Time", "Slowest Step", "Stuck At Now"]
+
+
+def _ft(t, ref=None):
+    return t.strftime("%d %b %I:%M %p") if t else ""
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def full_journey_table(lo_s, hi_s, area):
+    data = journeys_for_period(lo_s, hi_s, area)
+    if not data:
+        return []
+    lines = [l for j, _ in data.values() for l in j["lines"]]
+    ctx = _load_journey_ctx(lines)
+    by_line = {}
+    for a in ctx["als"]:
+        by_line.setdefault(a.get("line_id"), []).append(a)
+    now_n = now_ist().replace(tzinfo=None)
+    rows = []
+    for o, (j, s) in data.items():
+        evs = [e for e in j["events"] if e["when"]]
+        lvl = {}
+        for e in evs:
+            if e["branch"] is None:
+                lvl.setdefault(e["k"], []).append(e)
+        ready_t = max([e["when"] for e in lvl.get("ready", [])] or [None])
+        call_t = max([e["when"] for e in lvl.get("call", [])] or [None])
+        nr = len(lvl.get("nr", []))
+        proof = any(t.get("task_type") == "Customer Delivery Update" and (t.get("details") or {}).get("proof")
+                    for t in ctx["calls_by_order"].get(o, []))
+        slow = max(s["gaps"], key=s["gaps"].get) if s["gaps"] else None
+        slow_nm = next((f"{nm} {fmt_age(int(s['gaps'][slow]))}" for col, _, nm in J_COLS if col == slow), "")
+        for l in j["lines"]:
+            al = sorted(by_line.get(l["id"], []), key=lambda a: str(a.get("ordered_at") or ""))
+            al = al[-1] if al else {}
+            a_no = _ano(al.get("arrangement_no"))
+            arr = ctx["arrs"].get(a_no, {})
+            b = _lt_branch_times(j["events"], a_no) if a_no else {}
+            first = lambda k: (b.get(k) or [None])[0]
+            my_t = ctx["tasks_by_arr"].get(a_no, []) if a_no else []
+            pk = next((t for t in my_t if t.get("task_type") == "Pickup" and t.get("status") != "In Progress"), None)
+            pd_ = (pk or {}).get("details") or {}
+            reached = _j_at(pk.get("date"), pd_.get("time_reached")) if pk else None
+            handed = (_j_at(pk.get("date"), pd_.get("time_handover")) or _task_dt(pk)) if pk else None
+            reg = next((t for t in sorted(my_t, key=lambda t: _task_dt(t, "time") or datetime.max)
+                        if t.get("task_type") == "Register Entry"), None)
+            ba = ctx["ba"].get(((reg or {}).get("details") or {}).get("arrival_id"), {})
+            pb = (ctx["porter_by_arr"].get(a_no) or [{}])[0] if a_no else {}
+            ot = _j_ts(l.get("order_time")) or _j_ts(l.get("imported_at"))
+            ev_ = lambda k: first(k)
+            arrived = ev_("arrived")
+            row = {
+                "Schedule Date": _sched_label(l.get("scheduled_date")), "Schedule Time": l.get("delivery_time") or "",
+                "Order Date": ot.strftime("%d %b") if ot else "", "Order Time": ot.strftime("%I:%M %p") if ot else "",
+                "Order": o, "Cust Mob No": l.get("customer_phone", ""), "Name": l.get("customer_name", ""),
+                "Area": l.get("area", ""), "Medicine Name": l.get("item_name", ""), "Pack Size": l.get("pack_size", ""),
+                "Qty": _qty_txt(l.get("qty")), "Availability": LINE_ICON.get(l.get("status"), l.get("status") or ""),
+                "Store Check Time": _ft(_j_ts(l.get("decided_at"))), "Store Check By": l.get("decided_by") or "",
+                "Order to Distributor By": al.get("ordered_by") or (arr.get("order_by") if a_no else "") or "",
+                "Arrangement No": a_no, "Inv No": arr.get("invoice_no") or ((reg or {}).get("details") or {}).get("bill_no") or "",
+                "Distributor Placed Time": _ft(_j_ts(al.get("ordered_at"))), "Distributor Name": arr.get("distributor") or al.get("distributor") or "",
+                "Target Pickup": _ft(_naive(to_ist(arr.get("target_pickup_at")))) if arr.get("target_pickup_at") else "",
+                "Porter No": pb.get("porter_no", ""), "Porter Booked Time": _ft(_j_at_any(pb.get("date"), pb.get("time"))) if pb else "",
+                "Pick Up By": (pk or {}).get("person") or (f"Porter {pb.get('porter_no')}" if pb.get("handover_time") else "") or arr.get("pickup_by") or "",
+                "Dist Reach Time": _ft(reached),
+                "Dist Waiting Time": fmt_age(int((handed - reached).total_seconds() // 60)) if reached and handed and handed >= reached else "",
+                "Dist HandOver Time": _ft(handed or (b.get("picked") or [{}])[0].get("when")),
+                "Warehouse Reach Time": _ft(arrived["when"]) if arrived else "",
+                "Delivery By": ba.get("brought_by_name") or ba.get("brought_by") or "",
+                "Register Entry Time": _ft(ev_("register")["when"]) if ev_("register") else "",
+                "Register Entry By": ev_("register")["who"] if ev_("register") else "",
+                "Bill Cross Check Time": _ft(ev_("checked")["when"]) if ev_("checked") else "",
+                "Bill Cross Check By": ev_("checked")["who"] if ev_("checked") else "",
+                "Short": "⚠️ Short" if al.get("status") == "Short" else "",
+                "Bill Upload Time": _ft(ev_("uploaded")["when"]) if ev_("uploaded") else "",
+                "Bill Upload By": ev_("uploaded")["who"] if ev_("uploaded") else "",
+                "Placement Time": _ft(ev_("placed")["when"]) if ev_("placed") else "",
+                "Placement By": ev_("placed")["who"] if ev_("placed") else "",
+                "Shelf Pick Time": _ft(_j_ts(l.get("store_checked_at"))) if l.get("status") == "In Store" else "",
+                "Shelf Pick By": (l.get("store_checked_by") or "") if l.get("status") == "In Store" else "",
+                "All Ready Time": _ft(ready_t), "Call Done Time": _ft(_j_ts(l.get("delivery_at"))) or _ft(call_t),
+                "Call By": l.get("delivery_by") or "",
+                "Call Wait": fmt_age(int((call_t - ready_t).total_seconds() // 60)) if call_t and ready_t and call_t >= ready_t
+                else (f"⏳ {fmt_age(int((now_n - ready_t).total_seconds() // 60))}" if ready_t and not call_t else ""),
+                "Status": {"Delivered": "✅ Delivered", "Not Delivered": "❌ Not delivered"}.get(l.get("delivery_status"), "⏳ Open"),
+                "Reason": l.get("delivery_reason") or "", "Not Reachable Tries": nr or "", "Proof": "📸 Yes" if proof else "",
+                "Total Time": ((("🔴 " if s["late"] else "🟢 ") + fmt_age(int(s["total"])) + ("" if s["closed"] else " ⏳"))
+                               if s["total"] is not None else ""),
+                "3h Target": ("❌ Late" if s["late"] else "✅ On time") if s["total"] is not None else "",
+                "Slowest Step": slow_nm, "Stuck At Now": "" if s["closed"] else s["now"],
+                "_late": s["late"], "_open": not s["closed"]}
+            rows.append(row)
+    rows.sort(key=lambda r: (r["Order Date"], r["Order Time"], r["Order"]))
+    return rows
+
+
+def _show_full_table(kp):
+    lo, hi, _b = report_period(f"{kp}_ft")
+    if (hi - lo).days > 30:
+        lo = hi - timedelta(days=30)
+        st.warning(f"Up to 31 days at a time — showing {lo.strftime('%d %b')} → {hi.strftime('%d %b')}.")
+    c1, c2 = st.columns(2)
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_ft_area")
+    with c2:
+        show = st.selectbox("Show", ["All", "🔴 Late (over 3 hours)", "⏳ Still open"], key=f"{kp}_ft_show")
+    try:
+        with st.spinner("Building the table…"):
+            rows = full_journey_table(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"), area)
+    except Exception as e:
+        st.error(f"Could not load: {e}")
+        return
+    if show.startswith("🔴"):
+        rows = [r for r in rows if r["_late"]]
+    elif show.startswith("⏳"):
+        rows = [r for r in rows if r["_open"]]
+    if not rows:
+        st.info("No customer orders in this period / area.")
+        return
+    st.markdown(f"**{len(rows)} medicine(s) · {len({r['Order'] for r in rows})} order(s)** — key columns below; "
+                "📥 the Excel has every step (time + who).")
+    st.dataframe(pd.DataFrame([{k: r[k] for k in FT_SCREEN} for r in rows]).astype(str), hide_index=True, width='stretch')
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]).to_excel(
+            w, index=False, sheet_name="Full journey")
+    st.download_button("📥 Download full table (Excel)", buf.getvalue(), key=f"{kp}_ft_dl", type="primary",
+                       file_name=f"full-journey-{lo:%d%b}-{hi:%d%b}-{area.replace(' ', '_')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 def show_order_journey(kp="oj", show_phone=True):
     st.subheader("📍 Order Journey")
-    mode = st.radio("View", ["📅 All orders (date & area)", "🔍 One order", "🔎 ARR number"], horizontal=True,
-                    key=f"{kp}_mode", label_visibility="collapsed")
+    mode = st.radio("View", ["📅 All orders (date & area)", "📋 Full table (every step)", "🔍 One order", "🔎 ARR number"],
+                    horizontal=True, key=f"{kp}_mode", label_visibility="collapsed")
+    if mode.startswith("📋"):
+        st.caption("One row per medicine with every step — time and who — like the manual sheet. Open the Excel for all columns.")
+        _show_full_table(kp)
+        return
     if mode.startswith("🔎"):
         st.caption("Type an arrangement (distributor bill) number — see where it is now, the porter, and which customers wait for it.")
         _show_arr_journey(kp, show_phone)
@@ -10457,7 +10786,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
+    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '🧭 Live Tracker', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
     if _nav == '📅 Daily Summary': show_daily_summary("mgr_ds")
     if _nav == '🔎 Reviews': show_reviews("mgr_rv")
     if _nav == '👥 All Staff Work': show_all_staff_work("mgr_asw")
@@ -10470,6 +10799,7 @@ def show_manager_team_view():
         show_customer_order_tracker("mgr_trk", show_phone=True)
         show_delivery_proof_check("mgr_pc")
     if _nav == '📍 Order Journey': show_order_journey("mgr_oj")
+    if _nav == '🧭 Live Tracker': show_live_tracker("mgr_lt")
     if _nav == '🛒 Normal Orders': show_order_sheet_report("mgr_osr")
     if _nav == '🚚 Distributors': show_distributors_admin("mgr_dist")
     if _nav == '🛵 Delivery KM': show_delivery_km("mgr_dkm")
@@ -17338,7 +17668,7 @@ def show_admin_page():
     pending_reviews_banner()
     st.divider()
 
-    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
+    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '🧭 Live Tracker', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
 
     if _nav == '📅 Daily Summary':
         show_daily_summary("adm_ds")
@@ -17386,6 +17716,8 @@ def show_admin_page():
 
     if _nav == '📍 Order Journey':
         show_order_journey("adm_oj")
+    if _nav == '🧭 Live Tracker':
+        show_live_tracker("adm_lt")
 
     if _nav == '🧾 Bills Register':
         show_bills_register("adm_bills")
