@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v25.2-Oct porter filters"
+APP_VERSION = "v26-Oct porter bill check"
 
 def show_sidebar():
     with st.sidebar:
@@ -2552,6 +2552,80 @@ def not_arrived_distributor_deliveries(hours=4):
         out.append(dict(a, _age=int((now_n - t).total_seconds() // 60)))
     return sorted(out, key=lambda a: -a["_age"])
 
+PORTER_MISSING_WHY = ["Porter didn't give it", "Distributor didn't hand it over to the porter"]
+
+
+def _registered_arr_nos(days=5):
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        regs = fetch_all("daily_tasks", lambda q: q.eq("task_type", "Register Entry").gte("date", lo))
+    except Exception:
+        return set()
+    return {a for r in regs for a in _arr_nos_of(r.get("details") or {})}
+
+
+def porter_missing_bills(days=3):
+    """bills a porter was booked for but did not hand over at the warehouse — open until the bill is entered or sorted"""
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        ts = fetch_all("daily_tasks", lambda q: q.in_("task_type", ["Porter Bill Missing", "Porter Bill Missing Sorted"])
+                       .gte("date", lo))
+    except Exception:
+        return []
+    sorted_ = {_ano((t.get("details") or {}).get("arrangement_no")) for t in ts if t.get("task_type") == "Porter Bill Missing Sorted"}
+    done = _registered_arr_nos(days + 2) | sorted_
+    out = {}
+    for t in sorted(ts, key=lambda t: t.get("id") or 0):
+        d = t.get("details") or {}
+        a = _ano(d.get("arrangement_no"))
+        if t.get("task_type") == "Porter Bill Missing" and a and a not in done:
+            out[a] = dict(d, _task=t, _when=_j_at(t.get("date"), t.get("time")))
+    return list(out.values())
+
+
+def show_missing_porter_bills(kp="pmb"):
+    """🔴 Purchase team + managers: bills missing from a porter delivery"""
+    miss = porter_missing_bills()
+    if not miss:
+        return
+    now_n = now_ist().replace(tzinfo=None)
+    with st.container(border=True):
+        st.error(f"🔴 {len(miss)} bill(s) did not come with the porter — call the porter / distributor now")
+        st.dataframe(pd.DataFrame([{
+            "ARR #": m.get("arrangement_no", ""), "Distributor": m.get("distributor", ""), "For": m.get("area", ""),
+            "Porter": m.get("porter_no", ""), "Porter phone": m.get("porter_phone", ""), "Why": m.get("reason", ""),
+            "Reported": (fmt_age(int((now_n - m["_when"]).total_seconds() // 60)) + " ago") if m.get("_when") else "",
+            "By": m["_task"].get("person", ""), "Booked by": m.get("booked_by", "")} for m in miss]).astype(str),
+            hide_index=True, width='stretch')
+        st.caption("It clears by itself when the warehouse does 📒 Register Entry for that ARR. "
+                   "If it is sorted another way (cancelled, re-ordered), mark it below.")
+        c1, c2, c3 = st.columns([2, 3, 1])
+        with c1:
+            pick = st.selectbox("ARR", [m.get("arrangement_no") for m in miss], key=f"{kp}_pick", label_visibility="collapsed")
+        with c2:
+            note = st.text_input("How was it sorted?", key=f"{kp}_note", label_visibility="collapsed",
+                                 placeholder="How was it sorted? e.g. order cancelled / re-booked porter")
+        with c3:
+            if st.button("✔️ Sorted", key=f"{kp}_ok", width='stretch'):
+                if not note.strip():
+                    st.error("Write how it was sorted.")
+                else:
+                    log_simple_task("Porter Bill Missing Sorted", {"arrangement_no": pick, "note": note.strip()})
+                    st.rerun()
+
+
+def late_unentered_arrivals(mins=30):
+    """arrived bills still not register-entered after N minutes (last 2 days)"""
+    now = now_ist()
+    out = []
+    for a in load_open_arrivals(1):
+        left = int(a.get("bills") or 0) - a.get("_entered", 0)
+        t = to_ist(a.get("arrived_at"))
+        if left > 0 and t and (now - t).total_seconds() >= mins * 60:
+            out.append(dict(a, _left=left, _age=int((now - t).total_seconds() // 60)))
+    return sorted(out, key=lambda a: -a["_age"])
+
+
 def show_pilot_bills_alert(kp="pba"):
     """manager: bills still with pilots (red near the pilots' day end / overnight) + self-pick orders nobody picked"""
     carry = pilots_carrying()
@@ -2560,7 +2634,9 @@ def show_pilot_bills_alert(kp="pba"):
     n = sum(len(v) for v in carry.values())
     nopick = not_picked_arrangements()
     noarr = not_arrived_distributor_deliveries()
-    if not n and not nopick and not noarr:
+    late_in = late_unentered_arrivals(30)
+    pmiss = porter_missing_bills()
+    if not n and not nopick and not noarr and not late_in and not pmiss:
         return
     now_n = now_ist().replace(tzinfo=None)
     with st.container(border=True):
@@ -2584,6 +2660,16 @@ def show_pilot_bills_alert(kp="pba"):
             st.dataframe(pd.DataFrame([{"ARR #": a.get("arrangement_no", ""), "Distributor": a.get("distributor", ""),
                                         "For": a.get("area", ""), "Ordered": fmt_age(a["_age"]) + " ago",
                                         "Ordered by": a.get("order_by", "")} for a in nopick]),
+                         hide_index=True, width='stretch')
+        if pmiss:
+            show_missing_porter_bills(f"{kp}_pm")
+        if late_in:
+            st.error(f"📥 {sum(a['_left'] for a in late_in)} bill(s) arrived 30+ min ago but not entered — "
+                     "ask the warehouse to do 📒 Register Entry")
+            st.dataframe(pd.DataFrame([{"Distributor": a.get("distributor", ""), "Warehouse": a.get("area", ""),
+                                        "Arrived": fmt_age(a["_age"]) + " ago", "Not entered": a["_left"],
+                                        "Type": a.get("order_type") or "", "Brought by": a.get("brought_by_name") or a.get("brought_by") or "",
+                                        "Logged by": a.get("logged_by", "")} for a in late_in]).astype(str),
                          hide_index=True, width='stretch')
         if noarr:
             st.warning(f"🚚 {len(noarr)} 'Distributor Delivers' order(s) not arrived for 4h+ — call the distributor")
@@ -2746,25 +2832,45 @@ def show_arrival_button():
                     st.rerun()
         p_bills = p_poly = 0
         p_short = ""
+        p_missing, auto_short = [], ""
         if porter_bk:
             pa = porter_bk.get("_arrs") or []
-            cnt = {}
-            for a in pa:
-                cnt[a.get("distributor") or "?"] = cnt.get(a.get("distributor") or "?", 0) + 1
             st.info(f"{porter_label(porter_bk)} — for {area}: "
                     + (" · ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')}" for a in pa) or "no ARR listed"))
-            if cnt and st.session_state.get(f"arr_in_pauto_{ver}") != porter_bk.get("id"):
-                st.session_state[f"arr_in_pauto_{ver}"] = porter_bk.get("id")     # fill once per chosen booking
+            got = []
+            if pa:
+                st.markdown(f"**✅ Tick each bill the porter gave you** ({len(pa)} expected)")
+                for a in pa:
+                    a_no = str(a.get("arrangement_no"))
+                    if st.checkbox(f"#{a_no} · {a.get('distributor', '')}", value=True, key=f"arr_in_got_{ver}_{a_no}"):
+                        got.append(a)
+                    else:
+                        why = st.radio(f"❌ #{a_no} {a.get('distributor', '')} not received — why? *", PORTER_MISSING_WHY,
+                                       index=None, horizontal=True, key=f"arr_in_why_{ver}_{a_no}")
+                        p_missing.append((a, why))
+                if p_missing:
+                    st.warning(f"⚠️ {len(p_missing)} bill(s) missing — the Purchase team will be alerted to call the porter / distributor.")
+                    auto_short = "Missing: " + "; ".join(f"#{a.get('arrangement_no')} {a.get('distributor', '')} ({w or '?'})"
+                                                         for a, w in p_missing)
+            cnt = {}
+            for a in got:
+                cnt[a.get("distributor") or "?"] = cnt.get(a.get("distributor") or "?", 0) + 1
+            fill_key = (porter_bk.get("id"), tuple(sorted(str(a.get("arrangement_no")) for a in got)))
+            if cnt and st.session_state.get(f"arr_in_pauto_{ver}") != fill_key:
+                st.session_state[f"arr_in_pauto_{ver}"] = fill_key     # fill once per booking / ticked set
                 st.session_state["arr_in_prefill"] = list(cnt.items())
                 st.rerun()
             if cnt:
                 st.caption("✅ Distributor and type (Arrangement) filled from the booking — change a line only if "
                            "the bills he brought are different.")
             exp_b = int(_to_float(porter_bk.get("no_bills"), 0) or len(pa) or 1)
+            if p_missing:
+                exp_b = max(0, exp_b - len(p_missing))
             exp_p = int(_to_float(porter_bk.get("no_polythene"), 0))
             c1, c2 = st.columns(2)
             with c1:
-                p_bills = st.number_input(f"Bills received from porter * (booked: {exp_b})", 0, 200, exp_b, key=f"arr_in_pb_{ver}")
+                p_bills = st.number_input(f"Bills received from porter * ({'expected' if p_missing else 'booked'}: {exp_b})",
+                                          0, 200, exp_b, key=f"arr_in_pb_{ver}_{len(p_missing)}")
             with c2:
                 p_poly = st.number_input(f"Polythene received (booked: {exp_p})", 0, 200, exp_p, key=f"arr_in_pp_{ver}")
             if p_bills != exp_b or p_poly != exp_p:
@@ -2810,7 +2916,9 @@ def show_arrival_button():
                     st.error("The same distributor + type is listed twice — put those bills in one line.")
                 elif by == "Other" and not by_name.strip():
                     st.error("Write who brought the bills.")
-                elif porter_bk and (p_bills != int(_to_float(porter_bk.get("no_bills"), 0) or len(porter_bk.get("_arrs") or []) or 1)
+                elif any(w is None for _, w in p_missing):
+                    st.error("❌ Choose why each missing bill did not come (porter / distributor).")
+                elif porter_bk and (p_bills != max(0, int(_to_float(porter_bk.get("no_bills"), 0) or len(porter_bk.get("_arrs") or []) or 1) - len(p_missing))
                                     or p_poly != int(_to_float(porter_bk.get("no_polythene"), 0))) and not p_short.strip():
                     st.error("The count does not match the porter booking — write what is short / extra.")
                 else:
@@ -2830,10 +2938,17 @@ def show_arrival_button():
                                     supabase.table("porter_bookings").update({
                                         "status": "Delivered", "bills_received": str(p_bills),
                                         "polythene_received": str(p_poly), "receive_time": time_str(),
-                                        "received_by": st.session_state.name, "shortage": p_short.strip(),
+                                        "received_by": st.session_state.name,
+                                        "shortage": "; ".join(x for x in [auto_short, p_short.strip()] if x),
                                         "receipt_images": str({"arrival": pic})}).eq("id", porter_bk["id"]).execute()
                                 except Exception as e:
                                     st.warning(f"Arrival saved, but the porter booking was not updated: {e}")
+                            for a, w in p_missing:
+                                log_simple_task("Porter Bill Missing", {
+                                    "arrangement_no": str(a.get("arrangement_no")), "distributor": a.get("distributor", ""),
+                                    "area": area, "porter_no": porter_bk.get("porter_no", ""),
+                                    "porter_phone": porter_bk.get("porter_phone", ""), "booked_by": porter_bk.get("booked_by", ""),
+                                    "reason": w, "booking_id": porter_bk.get("id")})
                             st.session_state["arr_in_open"] = False
                             st.session_state["arr_in_v"] = ver + 1
                             if wa not in areas:
@@ -2842,7 +2957,8 @@ def show_arrival_button():
                                 except Exception:
                                     pass
                             st.session_state["arr_in_msg"] = (
-                                f"✅ {total} bill(s) arrived at {time_str()} via {who} — "
+                                (f"❌ {len(p_missing)} missing bill(s) reported to the Purchase team. " if p_missing else "")
+                                + f"✅ {total} bill(s) arrived at {time_str()} via {who} — "
                                 + ", ".join(f"{d} {n}" + (" (ARR)" if t == "Arrangement" else "") for d, n, t in rows)
                                 + ". Clock started — do 📒 Register Entry for each bill.")
                             st.rerun()
@@ -2857,7 +2973,7 @@ def show_arrival_button():
                        "Gallery photos are not accepted here.")
 
 
-def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills not entered yet"):
+def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills not entered yet", kp="wa"):
     arr = [a for a in load_open_arrivals(1) if a.get("_entered", 0) < int(a.get("bills") or 0)
            and (area in ("All Areas", None, "") or a.get("area") == area)]
     if not arr:
@@ -2876,11 +2992,11 @@ def show_waiting_arrivals(area="All Areas", title="#### 📥 Arrived — bills n
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
     st.caption("🟢 under 20 min · 🟡 20–60 min · 🔴 over 1 hour since the distributor arrived")
     pick = st.selectbox("📸 See arrival photo", ["—"] + [f"{a.get('distributor')} · {a.get('area')} · "
-                        f"{(to_ist(a.get('arrived_at')) or now).strftime('%I:%M %p')}" for a in arr], key=f"wa_ph_{area}")
+                        f"{(to_ist(a.get('arrived_at')) or now).strftime('%I:%M %p')}" for a in arr], key=f"{kp}_ph_{area}")
     if pick != "—":
         a = arr[[f"{x.get('distributor')} · {x.get('area')} · {(to_ist(x.get('arrived_at')) or now).strftime('%I:%M %p')}"
                  for x in arr].index(pick)]
-        show_image(a.get("photo"), caption=f"Logged by {a.get('logged_by')}", key=f"wa_img_{a['id']}", width=420)
+        show_image(a.get("photo"), caption=f"Logged by {a.get('logged_by')}", key=f"{kp}_img_{a['id']}", width=420)
 
 
 ARR_BEFORE_WAREHOUSE = ["Pending", "Porter Booked", "Picked Up", "Picked", "Picked Up - In Transit",
@@ -4344,6 +4460,15 @@ def form_porter_payment():
     # choose OUTSIDE the form so the details below update at once
     selected_label   = st.selectbox("Select Porter *", list(booking_options.keys()), key="pp_select")
     selected_booking = booking_options[selected_label]
+    _nos = sorted(_arr_nos_of({"arrangement_nos": selected_booking.get("arrangement_nos")}))
+    if _nos:
+        _reg = _registered_arr_nos(7)
+        _miss = {m.get("arrangement_no"): m for m in porter_missing_bills(7)}
+        _bad = [n for n in _nos if n not in _reg]
+        if _bad:
+            st.warning(f"⚠️ {len(_bad)} of {len(_nos)} bill(s) of this porter not confirmed at the warehouse: "
+                       + ", ".join(n + (" (❌ reported missing)" if n in _miss else " (not entered yet)") for n in _bad)
+                       + " — check before paying.")
 
     with st.form("porter_payment_form", clear_on_submit=True):
 
@@ -4435,6 +4560,11 @@ def show_user_page():
 
     show_my_shift()
     show_arrival_button()
+    if team == "Stock":
+        show_waiting_arrivals(st.session_state.get("work_area") or "All Areas",
+                              "#### 📥 Arrived — not entered yet (do 📒 Register Entry for each)", kp="home_wa")
+    if team == "Purchase" or st.session_state.get("role") == "manager":
+        show_missing_porter_bills("home_pm")
     done_secs = st.session_state.pop("mission_done", None)
     if done_secs is not None:
         st.toast(f"🎖️ Mission complete — {fmt_secs(done_secs)}", icon="✅")
@@ -7646,20 +7776,22 @@ def _ano(x):
     return str(x or "").strip().lstrip("#")
 
 
-def _load_journey_ctx(lines):
+def _load_journey_ctx(lines, als=None, extra_arrs=()):
     """everything the journeys of these customer-order lines need, loaded in a few batch queries"""
     ids = [l["id"] for l in lines]
-    als = []
-    for part in _chunks(ids, 100):
-        als += supabase.table("arrangement_lines").select("*").in_("line_id", part).execute().data or []
-    arr_nos = sorted({_ano(a.get("arrangement_no")) for a in als} - {""})
+    if als is None:
+        als = []
+        for part in _chunks(ids, 100):
+            als += supabase.table("arrangement_lines").select("*").in_("line_id", part).execute().data or []
+    arr_nos = sorted(({_ano(a.get("arrangement_no")) for a in als} | {_ano(x) for x in extra_arrs}) - {""})
     arrs = {}
     for part in _chunks(arr_nos, 100):
         for a in supabase.table("arrangements").select("*").in_("arrangement_no", part).execute().data or []:
             arrs[_ano(a.get("arrangement_no"))] = a
     now_n = now_ist().replace(tzinfo=None)
     starts = [_j_ts(l.get("imported_at")) for l in lines if l.get("imported_at")] + \
-             [_j_ts(a.get("ordered_at")) for a in als if a.get("ordered_at")]
+             [_j_ts(a.get("ordered_at")) for a in als if a.get("ordered_at")] + \
+             [_j_ts(a.get("created_at")) for a in arrs.values() if a.get("created_at")]
     starts = [s for s in starts if s]
     base, top = (min(starts), max(starts)) if starts else (now_n, now_n)
     d_lo = (base - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -7667,7 +7799,7 @@ def _load_journey_ctx(lines):
     aset = set(arr_nos)
     tasks_by_arr, calls_by_order = {}, {}
     try:
-        tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", JOURNEY_TASKS + JOURNEY_CALL_TASKS)
+        tasks = fetch_all("daily_tasks", lambda q: q.in_("task_type", JOURNEY_TASKS + ["Porter Bill Missing"] + JOURNEY_CALL_TASKS)
                           .gte("date", d_lo).lte("date", d_hi))
     except Exception:
         tasks = []
@@ -7718,6 +7850,121 @@ def order_journey(order_no):
     return build_journey(lines, _load_journey_ctx(lines))
 
 
+def _arr_branch(a_no, arrs, als, ctx, add):
+    """journey steps of one distributor bill (ARR) -> (a_no, distributor)"""
+    arr = arrs.get(a_no, {})
+    mine = [a for a in als if _ano(a.get("arrangement_no")) == a_no]
+    dist = arr.get("distributor") or (mine[0].get("distributor") if mine else "")
+    o_at = min([_j_ts(a.get("ordered_at")) for a in mine if a.get("ordered_at")] or [None]) \
+        or _j_at(arr.get("order_placed_date"), arr.get("order_placed_time")) or _j_ts(arr.get("created_at"))
+    add(o_at, f"📦 Ordered from {dist}", ", ".join(sorted({a.get("ordered_by") or "" for a in mine} - {""}))
+        or arr.get("order_by", ""), a_no,
+        info=f"{len(mine)} medicine(s) of this order" + (f" · {arr.get('urgency')}" if arr.get("urgency") not in (None, "", "Normal") else ""),
+        photo=arr.get("order_image"), k="ordered")
+    my_t = ctx["tasks_by_arr"].get(a_no, [])
+    porter_picked = False
+    for b in ctx["porter_by_arr"].get(a_no, [])[:1]:
+        w = _j_at_any(b.get("date"), b.get("time"))
+        if w:
+            add(w, f"🚛 Porter booked ({b.get('porter_no') or '—'})", b.get("booked_by", ""), a_no,
+                info=f"{b.get('pickup_point') or ''} → {b.get('delivery_point') or ''}", k="porter_book")
+        h_at = _j_at_any(b.get("date"), b.get("handover_time")) if b.get("status") not in (None, "", "Booked") else None
+        if h_at:
+            porter_picked = True
+            add(h_at, "📞 Porter picked up", b.get("handover_by", ""), a_no,
+                info=" · ".join(x for x in [f"{b.get('no_bills')} bill(s)" if b.get("no_bills") else "",
+                                            f"{b.get('no_polythene')} polythene" if b.get("no_polythene") else ""] if x),
+                photo=b.get("handover_image") or None, k="picked")
+    for t in [t for t in my_t if t.get("task_type") == "Porter Bill Missing"]:
+        d = t.get("details") or {}
+        add(_j_at(t.get("date"), t.get("time")), "❌ Not received from porter", t.get("person", ""), a_no,
+            info=f"{d.get('reason', '')} · porter {d.get('porter_no', '')}", k="missing")
+    pk = [t for t in my_t if t.get("task_type") == "Pickup" and t.get("status") != "In Progress"]
+    if pk:
+        t = pk[0]
+        d = t.get("details") or {}
+        reached = _j_at(t.get("date"), d.get("time_reached")) or _task_dt(t, "start_time")
+        add(reached, "🛵 Picked up at distributor", t.get("person", ""), a_no,
+            info=" · ".join(x for x in [f"{d.get('no_sku_received')} SKU" if d.get("no_sku_received") else "",
+                                        f"delivery: {d.get('delivery_by')}" if d.get("delivery_by") else "",
+                                        f"porter {d.get('porter_no')}" if d.get("porter_no") else ""] if x),
+            photo=d.get("medicine_image"), k="picked")
+    elif (arr.get("picked_up_at") or arr.get("pickup_by")) and not porter_picked:
+        add(_j_ts(arr.get("picked_up_at")), "🛵 Picked up at distributor", arr.get("pickup_by", ""), a_no,
+            info=arr.get("pickup_type") or "", k="picked")
+    for h in sorted(ctx["hos_by_arr"].get(a_no, []), key=lambda x: str(x.get("at") or "")):
+        if h.get("kind") == "overnight":
+            add(_j_ts(h.get("at")), f"🌙 Kept overnight by {h.get('to_person','')}", h.get("to_person", ""), a_no,
+                info=h.get("note") or "", photo=h.get("photo"), k="handover")
+            continue
+        add(_j_ts(h.get("at")), f"🤝 Handed {h.get('from_person','')} → {h.get('to_person','')}",
+            h.get("from_person", ""), a_no, info=f"for {h.get('area') or '—'}", photo=h.get("photo"), k="handover")
+    for t in [t for t in my_t if t.get("task_type") in ("Porter Receipt", "Distributor Delivery Receipt")][:1]:
+        add(_task_dt(t, "time"), "📦 Reached warehouse (receipt)", t.get("person", ""), a_no,
+            info=(t.get("details") or {}).get("area", ""), k="arrived")
+    regs = sorted([t for t in my_t if t.get("task_type") == "Register Entry"], key=lambda x: _task_dt(x, "time") or datetime.max)
+    for r in regs[:1]:
+        d = r.get("details") or {}
+        if d.get("arrival_id") or d.get("arrived_at"):
+            b_ = ctx["ba"].get(d.get("arrival_id"), {})
+            add(_j_ts(d.get("arrived_at") or b_.get("arrived_at")), f"📥 Arrived at {d.get('area') or b_.get('area') or 'warehouse'}",
+                b_.get("logged_by", ""), a_no,
+                info=f"brought by {b_.get('brought_by_name') or b_.get('brought_by') or '—'}" if b_ else "",
+                photo=b_.get("photo"), k="arrived")
+        add(_task_dt(r, "time"), "📝 Register entry", r.get("person", ""), a_no,
+            info=f"Bill {d.get('bill_no') or '—'} · {int(_to_float(d.get('no_items'), 0))} items",
+            photo=d.get("invoice_image"), k="register")
+    cc = sorted([t for t in my_t if t.get("task_type") == "Bill Cross Check" and t.get("status") != "In Progress"],
+                key=lambda x: _task_dt(x) or datetime.max)
+    rec = [a for a in mine if a.get("status") in ("Received", "Short")]
+    short = [a for a in mine if a.get("status") == "Short"]
+    if cc:
+        t = cc[0]
+        add(_task_dt(t), "✔️ Cross checked — medicines received", t.get("person", ""), a_no,
+            info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""),
+            photo=(t.get("details") or {}).get("bill_check_image"), k="checked")
+    elif rec:
+        add(max([_j_ts(a.get("received_at")) for a in rec if a.get("received_at")] or [None]),
+            "✔️ Medicines received", ", ".join(sorted({a.get("received_by") or "" for a in rec} - {""})), a_no,
+            info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""), k="checked")
+    up = sorted([t for t in my_t if t.get("task_type") == "Bill Upload (Software)" and t.get("status") != "In Progress"],
+                key=lambda x: _task_dt(x) or datetime.max)
+    for t in up[:1]:
+        add(_task_dt(t), "📤 Bill uploaded in software", t.get("person", ""), a_no, k="uploaded")
+    pl = sorted([t for t in my_t if t.get("task_type") == "Stock Placement" and t.get("status") != "In Progress"],
+                key=lambda x: _task_dt(x) or datetime.max)
+    for t in pl[:1]:
+        d = t.get("details") or {}
+        wh = d.get("placed_by_type") == "Warehouse team"
+        add(_task_dt(t), "📍 Placed on racks" + (" (warehouse team)" if wh else ""),
+            (d.get("warehouse_person") or "Warehouse team") if wh else t.get("person", ""), a_no,
+            info=f"logged by {t.get('person', '')}" if wh else "", photo=d.get("printout_image"), k="placed")
+    if not (cc or rec):
+        missing = [t for t in my_t if t.get("task_type") == "Porter Bill Missing"]
+        nxt = ("❌ not received from porter — Purchase team to sort it" if missing and not regs else
+               "waiting for pickup" if not (pk or arr.get("pickup_by") or porter_picked) else
+               "on the way to warehouse" if not regs else "waiting for cross check")
+        add(None, f"⏳ Now: {nxt}", "", a_no, info=arr.get("status", ""), k="now")
+    return a_no, dist
+
+
+def _order_events(ev):
+    """sort by time (undated 'now' rows go last), then gap from the previous step on the same path"""
+    timed = sorted([e for e in ev if e["when"]], key=lambda e: e["when"])
+    last_any, last_shared, last_br = None, None, {}
+    for e in timed:
+        if e["branch"] is None:
+            prev = last_any                            # order-level step waits for every bill before it
+            last_shared = e["when"]
+        else:
+            cand = [x for x in (last_br.get(e["branch"]), last_shared) if x]
+            prev = max(cand) if cand else None
+            last_br[e["branch"]] = e["when"]
+        e["gap"] = max(0.0, (e["when"] - prev).total_seconds() / 60) if prev else None
+        last_any = e["when"]
+    return timed + [e for e in ev if not e["when"]]
+
+
 def build_journey(lines, ctx):
     idset = {l["id"] for l in lines}
     order_no = str(lines[0].get("order_no"))
@@ -7754,95 +8001,7 @@ def build_journey(lines, ctx):
                  + (f" · {cnt['Not Available']} not available" if cnt.get("Not Available") else ""), k="store")
 
     # 3) one branch per arrangement (distributor bill)
-    branches = []
-    for a_no in arr_nos:
-        arr = arrs.get(a_no, {})
-        mine = [a for a in als if _ano(a.get("arrangement_no")) == a_no]
-        dist = arr.get("distributor") or (mine[0].get("distributor") if mine else "")
-        branches.append((a_no, dist))
-        o_at = min([_j_ts(a.get("ordered_at")) for a in mine if a.get("ordered_at")] or [None])
-        add(o_at, f"📦 Ordered from {dist}", ", ".join(sorted({a.get("ordered_by") or "" for a in mine} - {""}))
-            or arr.get("order_by", ""), a_no,
-            info=f"{len(mine)} medicine(s) of this order" + (f" · {arr.get('urgency')}" if arr.get("urgency") not in (None, "", "Normal") else ""),
-            photo=arr.get("order_image"), k="ordered")
-        my_t = ctx["tasks_by_arr"].get(a_no, [])
-        porter_picked = False
-        for b in ctx["porter_by_arr"].get(a_no, [])[:1]:
-            w = _j_at_any(b.get("date"), b.get("time"))
-            if w:
-                add(w, f"🚛 Porter booked ({b.get('porter_no') or '—'})", b.get("booked_by", ""), a_no,
-                    info=f"{b.get('pickup_point') or ''} → {b.get('delivery_point') or ''}", k="porter_book")
-            h_at = _j_at_any(b.get("date"), b.get("handover_time")) if b.get("status") not in (None, "", "Booked") else None
-            if h_at:
-                porter_picked = True
-                add(h_at, "📞 Porter picked up", b.get("handover_by", ""), a_no,
-                    info=" · ".join(x for x in [f"{b.get('no_bills')} bill(s)" if b.get("no_bills") else "",
-                                                f"{b.get('no_polythene')} polythene" if b.get("no_polythene") else ""] if x),
-                    photo=b.get("handover_image") or None, k="picked")
-        pk = [t for t in my_t if t.get("task_type") == "Pickup" and t.get("status") != "In Progress"]
-        if pk:
-            t = pk[0]
-            d = t.get("details") or {}
-            reached = _j_at(t.get("date"), d.get("time_reached")) or _task_dt(t, "start_time")
-            add(reached, "🛵 Picked up at distributor", t.get("person", ""), a_no,
-                info=" · ".join(x for x in [f"{d.get('no_sku_received')} SKU" if d.get("no_sku_received") else "",
-                                            f"delivery: {d.get('delivery_by')}" if d.get("delivery_by") else "",
-                                            f"porter {d.get('porter_no')}" if d.get("porter_no") else ""] if x),
-                photo=d.get("medicine_image"), k="picked")
-        elif (arr.get("picked_up_at") or arr.get("pickup_by")) and not porter_picked:
-            add(_j_ts(arr.get("picked_up_at")), "🛵 Picked up at distributor", arr.get("pickup_by", ""), a_no,
-                info=arr.get("pickup_type") or "", k="picked")
-        for h in sorted(ctx["hos_by_arr"].get(a_no, []), key=lambda x: str(x.get("at") or "")):
-            if h.get("kind") == "overnight":
-                add(_j_ts(h.get("at")), f"🌙 Kept overnight by {h.get('to_person','')}", h.get("to_person", ""), a_no,
-                    info=h.get("note") or "", photo=h.get("photo"), k="handover")
-                continue
-            add(_j_ts(h.get("at")), f"🤝 Handed {h.get('from_person','')} → {h.get('to_person','')}",
-                h.get("from_person", ""), a_no, info=f"for {h.get('area') or '—'}", photo=h.get("photo"), k="handover")
-        for t in [t for t in my_t if t.get("task_type") in ("Porter Receipt", "Distributor Delivery Receipt")][:1]:
-            add(_task_dt(t, "time"), "📦 Reached warehouse (receipt)", t.get("person", ""), a_no,
-                info=(t.get("details") or {}).get("area", ""), k="arrived")
-        regs = sorted([t for t in my_t if t.get("task_type") == "Register Entry"], key=lambda x: _task_dt(x, "time") or datetime.max)
-        for r in regs[:1]:
-            d = r.get("details") or {}
-            if d.get("arrival_id") or d.get("arrived_at"):
-                b_ = ctx["ba"].get(d.get("arrival_id"), {})
-                add(_j_ts(d.get("arrived_at") or b_.get("arrived_at")), f"📥 Arrived at {d.get('area') or b_.get('area') or 'warehouse'}",
-                    b_.get("logged_by", ""), a_no,
-                    info=f"brought by {b_.get('brought_by_name') or b_.get('brought_by') or '—'}" if b_ else "",
-                    photo=b_.get("photo"), k="arrived")
-            add(_task_dt(r, "time"), "📝 Register entry", r.get("person", ""), a_no,
-                info=f"Bill {d.get('bill_no') or '—'} · {int(_to_float(d.get('no_items'), 0))} items",
-                photo=d.get("invoice_image"), k="register")
-        cc = sorted([t for t in my_t if t.get("task_type") == "Bill Cross Check" and t.get("status") != "In Progress"],
-                    key=lambda x: _task_dt(x) or datetime.max)
-        rec = [a for a in mine if a.get("status") in ("Received", "Short")]
-        short = [a for a in mine if a.get("status") == "Short"]
-        if cc:
-            t = cc[0]
-            add(_task_dt(t), "✔️ Cross checked — medicines received", t.get("person", ""), a_no,
-                info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""),
-                photo=(t.get("details") or {}).get("bill_check_image"), k="checked")
-        elif rec:
-            add(max([_j_ts(a.get("received_at")) for a in rec if a.get("received_at")] or [None]),
-                "✔️ Medicines received", ", ".join(sorted({a.get("received_by") or "" for a in rec} - {""})), a_no,
-                info=f"{len(rec) - len(short)} received" + (f" · ⚠️ {len(short)} short" if short else ""), k="checked")
-        up = sorted([t for t in my_t if t.get("task_type") == "Bill Upload (Software)" and t.get("status") != "In Progress"],
-                    key=lambda x: _task_dt(x) or datetime.max)
-        for t in up[:1]:
-            add(_task_dt(t), "📤 Bill uploaded in software", t.get("person", ""), a_no, k="uploaded")
-        pl = sorted([t for t in my_t if t.get("task_type") == "Stock Placement" and t.get("status") != "In Progress"],
-                    key=lambda x: _task_dt(x) or datetime.max)
-        for t in pl[:1]:
-            d = t.get("details") or {}
-            wh = d.get("placed_by_type") == "Warehouse team"
-            add(_task_dt(t), "📍 Placed on racks" + (" (warehouse team)" if wh else ""),
-                (d.get("warehouse_person") or "Warehouse team") if wh else t.get("person", ""), a_no,
-                info=f"logged by {t.get('person', '')}" if wh else "", photo=d.get("printout_image"), k="placed")
-        if not (cc or rec):
-            nxt = ("waiting for pickup" if not (pk or arr.get("pickup_by") or porter_picked) else
-                   "on the way to warehouse" if not regs else "waiting for cross check")
-            add(None, f"⏳ Now: {nxt}", "", a_no, info=arr.get("status", ""), k="now")
+    branches = [_arr_branch(a_no, arrs, als, ctx, add) for a_no in arr_nos]
 
     # 4) all medicines ready, then the call
     picked = [l for l in lines if l.get("status") == "In Store" and l.get("store_checked_at")]
@@ -7878,21 +8037,8 @@ def build_journey(lines, ctx):
     else:
         add(None, "⏳ Now: waiting for the call to customer" + (f" · 📵 tried {len(nr)}×" if nr else ""), "", k="now")
 
-    # sort by time (undated 'now' rows go last), then gap from the previous step on the same path
-    timed = sorted([e for e in ev if e["when"]], key=lambda e: e["when"])
-    last_any, last_shared, last_br = None, None, {}
-    for e in timed:
-        if e["branch"] is None:
-            prev = last_any                            # order-level step waits for every bill before it
-            last_shared = e["when"]
-        else:
-            cand = [x for x in (last_br.get(e["branch"]), last_shared) if x]
-            prev = max(cand) if cand else None
-            last_br[e["branch"]] = e["when"]
-        e["gap"] = max(0.0, (e["when"] - prev).total_seconds() / 60) if prev else None
-        last_any = e["when"]
     first = lines[0]
-    return {"lines": lines, "events": timed + [e for e in ev if not e["when"]], "photos": photos,
+    return {"lines": lines, "events": _order_events(ev), "photos": photos,
             "branches": branches, "nr": len(nr), "arranged": bool(arr_nos),
             "head": {"customer": first.get("customer_name", ""), "phone": first.get("customer_phone", ""),
                      "area": first.get("area", ""), "sched": first.get("scheduled_date", ""),
@@ -8100,10 +8246,116 @@ def _show_all_journeys(kp, show_phone):
         _show_journey_detail(data[o][0], o, f"{kp}_all", show_phone)
 
 
+def find_arrangements(text, days=30):
+    """arrangements whose number contains the text ('025', 'ARR-20261030-025') — newest first"""
+    t = (text or "").strip().upper().lstrip("#")
+    if not t:
+        return []
+    lo = (today_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        rows = supabase.table("arrangements").select("*").ilike("arrangement_no", f"%{t}%")\
+            .gte("order_placed_date", lo).limit(200).execute().data or []
+    except Exception:
+        return []
+    return sorted(rows, key=lambda a: (str(a.get("order_placed_date") or ""), a.get("id") or 0), reverse=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def arr_journey(a_no):
+    """every step of ONE distributor bill (ARR) + the customer orders waiting on it"""
+    a_no = _ano(a_no)
+    als = supabase.table("arrangement_lines").select("*").eq("arrangement_no", a_no).execute().data or []
+    lines = []
+    for part in _chunks(sorted({a.get("line_id") for a in als} - {None}), 100):
+        lines += supabase.table("customer_order_lines").select("*").in_("id", part).eq("removed", False).execute().data or []
+    ctx = _load_journey_ctx(lines, als=als, extra_arrs=[a_no])
+    ev, photos = [], []
+    def add(when, step, who="", branch=None, info="", photo=None, k=""):
+        ev.append({"when": when, "step": step, "who": who or "", "branch": branch, "info": info, "k": k})
+        for p in (photo if isinstance(photo, list) else [photo] if photo else []):
+            photos.append((step, p))
+    _arr_branch(a_no, ctx["arrs"], als, ctx, add)
+    return {"arr": ctx["arrs"].get(a_no, {}), "events": _order_events(ev), "photos": photos, "lines": lines,
+            "porter": ctx["porter_by_arr"].get(a_no, [])}
+
+
+def _show_arr_journey(kp, show_phone):
+    q = st.text_input("🔎 Arrangement number", key=f"{kp}_arrq", placeholder="e.g. 025 · ARR-20261030-025").strip()
+    if not q:
+        return
+    found = find_arrangements(q)
+    if not found:
+        st.info("No arrangement with this number in the last 30 days.")
+        return
+    labels = {f"#{a.get('arrangement_no')} — {a.get('distributor', '')} — {a.get('area', '')} — {a.get('status', '')}":
+              str(a.get("arrangement_no")) for a in found[:50]}
+    pick = st.selectbox(f"{len(labels)} arrangement(s) found", list(labels), key=f"{kp}_arrpick")
+    a_no = labels[pick]
+    try:
+        j = arr_journey(a_no)
+    except Exception as e:
+        st.error(f"Could not load: {e}")
+        return
+    a = j["arr"]
+    st.markdown(f"**#{a_no} · {a.get('distributor', '')}** · 📍 {a.get('area', '')} · **{a.get('status', '')}** · "
+                f"{a.get('pickup_type') or ''}" + (f" · {a.get('urgency')}" if a.get("urgency") not in (None, "", "Normal") else "")
+                + f" · ordered by {a.get('order_by', '')} {_sched_label(a.get('order_placed_date'))} {a.get('order_placed_time') or ''}")
+    for b in j["porter"]:
+        st.caption(f"🚛 Porter **{b.get('porter_no', '')}**" + (f" · 📞 {b.get('porter_phone')}" if b.get("porter_phone") else "")
+                   + f" · booked by {b.get('booked_by', '')} at {b.get('time', '')} · status **{b.get('status', '')}**"
+                   + (f" · handed over {b.get('handover_time')}" if b.get("handover_time") else "")
+                   + (f" · {b.get('no_bills')} bill(s)" if b.get("no_bills") else "")
+                   + (f" · with: {b.get('arrangement_nos')}" if "," in str(b.get("arrangement_nos") or "") else "")
+                   + (f" · ⚠️ {b.get('shortage')}" if b.get("shortage") else ""))
+    miss = [m for m in porter_missing_bills(7) if m.get("arrangement_no") == a_no]
+    if miss:
+        st.error(f"❌ Reported NOT received from porter {miss[0].get('porter_no', '')} — {miss[0].get('reason', '')} "
+                 f"(by {miss[0]['_task'].get('person', '')})")
+    now_n = now_ist().replace(tzinfo=None)
+    evs = j["events"]
+    t_first = next((e["when"] for e in evs if e["when"]), None)
+    rows = []
+    for e in evs:
+        if e["when"]:
+            rows.append({"Step": e["step"], "Who": e["who"], "Time": _fmt_when(e["when"], t_first),
+                         "Gap": fmt_age(int(e["gap"])) if e.get("gap") is not None else "", "Details": e["info"]})
+        else:
+            last = max([x["when"] for x in evs if x["when"]] or [None]) if any(x["when"] for x in evs) else None
+            rows.append({"Step": e["step"], "Who": "", "Time": "—",
+                         "Gap": f"⏳ {fmt_age(int((now_n - last).total_seconds() // 60))} so far" if last else "",
+                         "Details": e["info"]})
+    st.dataframe(pd.DataFrame(rows).astype(str), hide_index=True, width='stretch')
+    if j["lines"]:
+        st.markdown(f"**🧾 Customer orders waiting on this bill ({len({l.get('order_no') for l in j['lines']})})**")
+        st.dataframe(pd.DataFrame([{"Order #": l.get("order_no"), "Customer": l.get("customer_name", ""),
+                                    **({"Phone": l.get("customer_phone", "")} if show_phone else {}),
+                                    "Medicine": l.get("item_name", ""), "Stock": LINE_ICON.get(l.get("status"), l.get("status")),
+                                    "Delivery": l.get("delivery_status") or "📞 not called"} for l in j["lines"]]).astype(str),
+                     hide_index=True, width='stretch')
+        o = st.selectbox("🔍 Open the full journey of order", ["—"] + sorted({str(l.get("order_no")) for l in j["lines"]}),
+                         key=f"{kp}_arr_o")
+        if o != "—":
+            oj = order_journey(o)
+            if oj:
+                _show_journey_detail(oj, o, f"{kp}_arr", show_phone)
+    else:
+        st.caption("No customer order is linked to this bill (stock top-up).")
+    if j["photos"] and st.toggle(f"📸 Show photos ({len(j['photos'])})", key=f"{kp}_arr_ph_{a_no}"):
+        cols = st.columns(min(3, len(j["photos"])))
+        for i, (lbl, nm) in enumerate(j["photos"]):
+            with cols[i % len(cols)]:
+                st.caption(lbl)
+                show_image(nm, key=f"{kp}_arr_img_{a_no}_{i}")
+
+
 def show_order_journey(kp="oj", show_phone=True):
     st.subheader("📍 Order Journey")
-    mode = st.radio("View", ["📅 All orders (date & area)", "🔍 One order"], horizontal=True, key=f"{kp}_mode",
-                    label_visibility="collapsed")
+    mode = st.radio("View", ["📅 All orders (date & area)", "🔍 One order", "🔎 ARR number"], horizontal=True,
+                    key=f"{kp}_mode", label_visibility="collapsed")
+    if mode.startswith("🔎"):
+        st.caption("Type an arrangement (distributor bill) number — see where it is now, the porter, and which customers wait for it.")
+        _show_arr_journey(kp, show_phone)
+        return
     if mode.startswith("📅"):
         st.caption("Every customer order in the period with the time of each step — came in → ordered to distributor → "
                    "picked up → arrived → cross checked → all ready → call done — and where the time is lost.")
