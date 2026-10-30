@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v26-Oct porter bill check"
+APP_VERSION = "v27-Oct call table"
 
 def show_sidebar():
     with st.sidebar:
@@ -8565,165 +8565,238 @@ def customer_order_summary(lines):
         md += f"- 📞 Awaiting call: **{len(ord_wait)} orders**"
         st.markdown(md)
 
-def form_customer_delivery():
-    """Call team: after calling the customer, mark each order delivered / not delivered with reason"""
-    from datetime import timedelta
-    st.subheader("📞 Customer Delivery Status")
-    st.caption("Call the customer, then mark the order ✅ Delivered or ❌ Not Delivered with the reason. "
-               "Use the table to mark individual medicines if only part of the order was taken.")
-    c1, c2 = st.columns(2)
-    with c1: area = st.selectbox("Area", ["All Areas"] + load_areas(), key="cd_area")
-    with c2: show_done = st.toggle("Show already-marked orders", key="cd_done")
+CD_RESULTS = ["—", "✅ Delivered", "❌ Not delivered", "📵 Not reachable", "🟡 Part delivered"]
+CD_TABS = ["ready", "again", "notready", "done"]
+CD_TAB_NAME = {"ready": "🟢 Ready to call", "again": "📵 Call again", "notready": "⏳ Not ready", "done": "✅ Done today"}
+
+
+def _cd_orders(area):
+    """open + today's done customer orders of the last 7 days: {order_no: [lines]}"""
     since = IST.localize(datetime.combine(today_ist() - timedelta(days=7), datetime.min.time())).isoformat()
     def build(q):
         q = q.eq("removed", False).gte("imported_at", since)
         return q.eq("area", area) if area != "All Areas" else q
+    lines = fetch_all("customer_order_lines", build)     # paged: more than 1000 lines are no longer cut off
+    orders = {}
+    for l in lines:
+        orders.setdefault(str(l.get("order_no")), []).append(l)
+    return lines, orders
+
+
+def _cd_due(x, now):
+    d = next((due_info(l, now) for l in x if due_info(l, now)), None)
+    return d
+
+
+def form_customer_delivery():
+    """Call team: one row per customer order — call, choose the result, save many at once"""
+    st.subheader("📞 Customer Delivery Status")
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key="cd_area")
     try:
-        lines = fetch_all("customer_order_lines", build)     # paged: more than 1000 lines are no longer cut off
+        lines, orders = _cd_orders(area)
     except Exception as e:
         st.error(f"Could not load customer orders ({e})")
         return
     if lines and "delivery_status" not in lines[0]:
         st.error("Run delivery_status_setup.sql in Supabase first.")
         return
-    orders = {}
-    for l in lines:
-        orders.setdefault(l.get("order_no"), []).append(l)
-    if not show_done:
-        orders = {o: x for o, x in orders.items() if any(not l.get("delivery_status") for l in x)}
-    if not orders:
-        st.success("✅ No orders waiting for a call.")
-        return
-
-    def ready(x):
-        return all(line_ready(l) for l in x)
-    olist = sorted(orders.items(), key=lambda kv: (not ready(kv[1]), str(min(l.get("imported_at", "") for l in kv[1]))))
+    now = now_ist()
+    today_s = today_ist().strftime("%Y-%m-%d")
     tries = not_reachable_tries()
-    st.markdown(f"**{len(olist)} orders** · 🟢 ready = in-store medicines picked from the shelf + the rest received")
-
-    # quick whole-order action
-    labels = {f"{'🟢' if ready(x) else '⏳'} #{o} — {x[0].get('customer_name','')} — {x[0].get('customer_phone','')} — {len(x)} medicine(s)"
-              + (f" · 📵 tried {len(tries[str(o)])}×" if tries.get(str(o)) else ""): o
-              for o, x in olist}
-    pick = st.selectbox("Order", list(labels.keys()), key="cd_pick")
-    o = labels[pick]
-    x = orders[o]
-    ph = "".join(ch for ch in str(x[0].get("customer_phone", "")) if ch.isdigit())
-    if ph:
-        st.markdown(f"📞 [Call {x[0].get('customer_name','')} ({ph})](tel:{ph})")
-    st.dataframe(pd.DataFrame([{"Medicine": l.get("item_name", ""), "Pack": l.get("pack_size", ""),
-                                "Qty": _qty_txt(l.get("qty")), "Stock": LINE_ICON.get(l.get("status"), l.get("status")),
-                                "Delivery": l.get("delivery_status") or "",
-                                "Reason": l.get("delivery_reason") or ""} for l in x]),
-                 hide_index=True, width='stretch')
-    not_ready = [l for l in x if not line_ready(l)]
-    sure = True
-    if not_ready:
-        st.warning(f"⏳ This order is not ready — {len(not_ready)} medicine(s) not received / not picked yet: "
-                   + ", ".join(str(l.get("item_name", "")) for l in not_ready[:5]) + ("…" if len(not_ready) > 5 else ""))
-        sure = st.checkbox("The customer really got everything — mark delivered anyway", key=f"cd_sure_{o}")
-    t_o = tries.get(str(o)) or []
-    if t_o:
-        last = sorted(t_o, key=lambda t: t.get("id") or 0)[-1]
-        st.caption(f"📵 Not reachable before: {len(t_o)} time(s) — last {_rep_day0(str(last.get('date'))[:10]).strftime('%d %b')} "
-                   f"{last.get('time', '')} by {last.get('person', '')}")
+    ready = lambda x: all(line_ready(l) for l in x)
+    groups = {k: [] for k in CD_TABS}
+    for o, x in orders.items():
+        pend = [l for l in x if not l.get("delivery_status")]
+        if not pend:
+            if any(str(to_ist(l.get("delivery_at")) or "")[:10] == today_s for l in x):
+                groups["done"].append(o)
+            continue
+        groups["notready" if not ready(x) else "again" if tries.get(o) else "ready"].append(o)
+    with c2:
+        tab = st.radio("Show", CD_TABS, horizontal=True, key="cd_tab", label_visibility="collapsed",
+                       format_func=lambda k: f"{CD_TAB_NAME[k]} ({len(groups[k])})")
     msg = st.session_state.pop("cd_msg", None)
     if msg:
         st.success(msg)
-    b1, b2, b3 = st.columns([1, 2, 1])
-    with b1:
-        if st.button("✅ Whole order delivered", key=f"cd_all_ok_{o}", type="primary", width='stretch', disabled=not sure):
-            save_delivery([(l["id"], "Delivered", None) for l in x], o, customer=x[0].get("customer_name"))
-    with b2:
-        reason = st.selectbox("Reason", NOT_DELIVERED_REASONS + [NOT_REACHABLE], key=f"cd_reason_{o}",
-                              label_visibility="collapsed")
-    nr = reason == NOT_REACHABLE
+
+    if tab == "done":
+        rows = []
+        for o in groups["done"]:
+            x = orders[o]
+            n_ok = sum(1 for l in x if l.get("delivery_status") == "Delivered")
+            res = "✅ Delivered" if n_ok == len(x) else "❌ Not delivered" if n_ok == 0 else f"🟡 Part delivered ({n_ok}/{len(x)})"
+            at = max([to_ist(l.get("delivery_at")) for l in x if l.get("delivery_at")] or [None])
+            rows.append({"Time": at.strftime("%I:%M %p") if at else "", "Order": o, "Customer": x[0].get("customer_name", ""),
+                         "Phone": x[0].get("customer_phone", ""), "Result": res,
+                         "Reason": "; ".join(sorted({l.get("delivery_reason") or "" for l in x} - {""})),
+                         "By": ", ".join(sorted({l.get("delivery_by") or "" for l in x} - {""})), "_at": at})
+        if not rows:
+            st.info("Nothing marked today yet.")
+            return
+        rows.sort(key=lambda r: r["_at"] or now, reverse=True)
+        st.dataframe(pd.DataFrame([{k: v for k, v in r.items() if k != "_at"} for r in rows]).astype(str),
+                     hide_index=True, width='stretch')
+        return
+
+    olist = groups[tab]
+    if not olist:
+        st.success({"ready": "✅ No order waiting for a call right now.", "again": "✅ No 'not reachable' order to call again.",
+                    "notready": "✅ Every open order is ready."}[tab])
+        return
+
+    def sort_key(o):
+        d = _cd_due(orders[o], now)
+        return (d[1] if d else 10 ** 9, str(min(l.get("imported_at", "") for l in orders[o])))
+    olist.sort(key=sort_key)
+    rows = []
+    for o in olist:
+        x = orders[o]
+        pend = [l for l in x if not l.get("delivery_status")]
+        d = _cd_due(x, now)
+        r_at = [to_ist(line_ready_at(l)) for l in x if line_ready_at(l)] if ready(x) else []
+        since = max(r_at) if r_at else min([to_ist(l.get("imported_at")) for l in x if l.get("imported_at")] or [None])
+        t_o = tries.get(o) or []
+        row = {"⏰ Deliver by": f"{d[0]} {orders[o][0].get('delivery_time') or next((l.get('delivery_time') for l in x if l.get('delivery_time')), '')}" if d else "",
+               "Order": o, "Customer": x[0].get("customer_name", ""), "Phone": str(x[0].get("customer_phone", "") or ""),
+               "Medicines": ", ".join(f"{l.get('item_name', '')} ×{_qty_txt(l.get('qty'))}" for l in pend),
+               "Ready": f"{'🟢' if ready(x) else '⏳'} {sum(1 for l in x if line_ready(l))}/{len(x)}",
+               "Waiting": fmt_age(int((now - since).total_seconds() // 60)) if since else "",
+               "Tries": f"📵 {len(t_o)}×" if t_o else ""}
+        if tab == "notready":
+            row["Sure?"] = False
+        row.update({"Result": "—", "Reason": ""})
+        rows.append(row)
+    st.caption("Call the customer, choose the **Result** (and the **Reason** if not delivered), then press 💾 Save. "
+               "❌ / 📵 need a screenshot — the upload box appears below the table."
+               + (" ⏳ These orders are not ready — tick **Sure?** only if the customer really got everything." if tab == "notready" else ""))
+    ver = st.session_state.get("cd_ver", 0)
+    cfg = {"Result": st.column_config.SelectboxColumn("Result", options=CD_RESULTS, required=True, width="medium"),
+           "Reason": st.column_config.SelectboxColumn("Reason (if ❌)", options=[""] + NOT_DELIVERED_REASONS, width="medium"),
+           "Phone": st.column_config.TextColumn("Phone"),
+           "Medicines": st.column_config.TextColumn("Medicines", width="medium"),
+           "Waiting": st.column_config.TextColumn("Waiting", width="small"),
+           "Tries": st.column_config.TextColumn("Tries", width="small"),
+           "Ready": st.column_config.TextColumn("Ready", width="small")}
+    if tab == "notready":
+        cfg["Sure?"] = st.column_config.CheckboxColumn("Sure?", help="The customer really got everything — allow ✅ although not ready")
+    order_cols = ["⏰ Deliver by", "Order", "Customer", "Phone"] + (["Sure?"] if tab == "notready" else []) + \
+                 ["Result", "Reason", "Medicines", "Ready", "Waiting", "Tries"]
+    ed = st.data_editor(pd.DataFrame(rows)[order_cols], key=f"cd_ed_{tab}_{ver}", hide_index=True, width='stretch',
+                        disabled=[c for c in rows[0] if c not in ("Result", "Reason", "Sure?")], column_config=cfg)
+    picked = [(r["Order"], r) for _, r in ed.iterrows() if r["Result"] != "—"]
     pv = st.session_state.get("cd_pv", 0)
-    proof = st.file_uploader(f"📸 Proof for ❌ / 📵 — {PROOF_HELP['two' if nr else 'one']} *",
-                             type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"cd_proof_{o}_{pv}",
-                             help="Needed only when the order is NOT delivered or the customer is not reachable.")
-    with b3:
-        if st.button("📵 Not reachable — try later" if nr else "❌ Whole order not delivered", key=f"cd_all_no_{o}",
-                     width='stretch'):
-            need = 2 if nr else 1
-            if len(proof or []) < need:
-                st.error(f"📸 Add the proof first: {PROOF_HELP['two' if nr else 'one']}"
-                         + (" (2 screenshots)." if nr else "."))
-                return
-            names = _upload_proofs(proof)
-            if not names:
+    proofs, parts = {}, {}
+    for o, r in picked:
+        x = orders[o]
+        res = r["Result"]
+        if res == "🟡 Part delivered":
+            pend = [l for l in x if not l.get("delivery_status")]
+            st.markdown(f"**🟡 {x[0].get('customer_name', '')} · #{o} — mark each medicine**")
+            parts[o] = (pend, st.data_editor(
+                pd.DataFrame([{"id": l["id"], "Medicine": l.get("item_name", ""), "Qty": _qty_txt(l.get("qty")),
+                               "Stock": LINE_ICON.get(l.get("status"), l.get("status")), "Result": "—", "Reason": ""}
+                              for l in pend]),
+                key=f"cd_part_{o}_{ver}", hide_index=True, width='stretch', disabled=["Medicine", "Qty", "Stock"],
+                column_config={"id": None,
+                               "Result": st.column_config.SelectboxColumn("Result", options=DELIVERY_CHOICES, required=True),
+                               "Reason": st.column_config.SelectboxColumn("Reason (if ❌)", options=[""] + NOT_DELIVERED_REASONS)}))
+        if res in ("❌ Not delivered", "📵 Not reachable", "🟡 Part delivered"):
+            two = res == "📵 Not reachable"
+            proofs[o] = st.file_uploader(
+                f"📸 #{o} {x[0].get('customer_name', '')} — {'2 screenshots' if two else '1 screenshot'}: "
+                f"{PROOF_HELP['two' if two else 'one']}" + (" (only if a medicine is ❌)" if res.startswith("🟡") else ""),
+                type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"cd_proof_{o}_{pv}")
+    if not st.button(f"💾 Save {len(picked)} order(s)" if picked else "💾 Save", type="primary", key="cd_save",
+                     disabled=False):
+        return
+    if not picked:
+        st.info("Choose a Result for at least one order first.")
+        return
+    errs, plan = [], []
+    for o, r in picked:
+        x = orders[o]
+        pend = [l for l in x if not l.get("delivery_status")]
+        res, reason, n_pf = r["Result"], (r.get("Reason") or "").strip(), len(proofs.get(o) or [])
+        if res == "✅ Delivered":
+            if not ready(x) and not r.get("Sure?"):
+                errs.append(f"#{o}: not ready — tick **Sure?** if the customer really got everything.")
+            plan.append((o, "ok", [(l["id"], "Delivered", None) for l in pend]))
+        elif res == "❌ Not delivered":
+            if not reason:
+                errs.append(f"#{o}: choose the Reason.")
+            if n_pf < 1:
+                errs.append(f"#{o}: add 1 screenshot ({PROOF_HELP['one']}).")
+            plan.append((o, "no", [(l["id"], "Not Delivered", reason) for l in pend]))
+        elif res == "📵 Not reachable":
+            if n_pf < 2:
+                errs.append(f"#{o}: add 2 screenshots ({PROOF_HELP['two']}).")
+            plan.append((o, "nr", []))
+        else:
+            pend_, ped = parts[o]
+            ch = []
+            for _, pr in ped.iterrows():
+                if pr["Result"] == "—":
+                    errs.append(f"#{o}: mark every medicine ✅ or ❌ ({pr['Medicine']} is empty).")
+                    continue
+                okk = pr["Result"].startswith("✅")
+                if not okk and not pr["Reason"]:
+                    errs.append(f"#{o}: choose the reason for {pr['Medicine']}.")
+                ch.append((int(pr["id"]), "Delivered" if okk else "Not Delivered", None if okk else pr["Reason"]))
+            if any(c[1] == "Not Delivered" for c in ch) and n_pf < 1:
+                errs.append(f"#{o}: add 1 screenshot for the ❌ medicine(s).")
+            if any(c[0] in {l["id"] for l in pend_ if not line_ready(l)} and c[1] == "Delivered" for c in ch) \
+                    and not r.get("Sure?") and not ready(x):
+                errs.append(f"#{o}: some ✅ medicines are not ready — tick **Sure?**.")
+            plan.append((o, "part", ch))
+    if errs:
+        st.error("Not saved — fix these first:\n\n" + "\n".join(f"- {e}" for e in errs))
+        return
+    done = {"ok": 0, "no": 0, "nr": 0, "part": 0}
+    try:
+        for o, kind, ch in plan:
+            x = orders[o]
+            names = _upload_proofs(proofs[o]) if proofs.get(o) else []
+            if names is None:
                 return                                  # upload_image already showed the error
-            if nr:
-                log_simple_task("Customer Not Reachable", {"order": str(o), "customer": x[0].get("customer_name", ""),
+            if kind == "nr":
+                log_simple_task("Customer Not Reachable", {"order": o, "customer": x[0].get("customer_name", ""),
                                                            "phone": x[0].get("customer_phone", ""), "lines": str(len(x)),
                                                            "proof": names})
-                st.session_state["cd_pv"] = pv + 1
-                st.session_state["cd_msg"] = f"📵 #{o}: saved as not reachable ({len(t_o) + 1} try) — the order stays open, call again later."
-                _ready_to_call_count.clear()
-                st.rerun()
-            st.session_state["cd_pv"] = pv + 1
-            save_delivery([(l["id"], "Not Delivered", reason) for l in x], o, proof=names, customer=x[0].get("customer_name"))
-
-    # per-medicine marking (all waiting orders)
-    with st.expander("✏️ Mark individual medicines (all waiting orders)"):
-        rows = [{"id": l["id"], "Order #": oo, "Customer": l.get("customer_name", ""), "Medicine": l.get("item_name", ""),
-                 "Stock": LINE_ICON.get(l.get("status"), l.get("status")),
-                 "Delivery": {"Delivered": "✅ Delivered", "Not Delivered": "❌ Not Delivered"}.get(l.get("delivery_status"), "—"),
-                 "Reason": l.get("delivery_reason") or ""}
-                for oo, xx in olist for l in xx]
-        ver = st.session_state.get("cd_ver", 0)
-        ed = st.data_editor(pd.DataFrame(rows), key=f"cd_editor_{ver}", hide_index=True, width='stretch',
-                            disabled=["Order #", "Customer", "Medicine", "Stock"],
-                            column_config={"id": None,
-                                           "Delivery": st.column_config.SelectboxColumn("Delivery", options=DELIVERY_CHOICES, required=True),
-                                           "Reason": st.column_config.SelectboxColumn("Reason (if not delivered)", options=[""] + NOT_DELIVERED_REASONS)})
-        not_ready_ids = {l["id"] for _, xx in olist for l in xx if not line_ready(l)}
-        sure_lines = st.checkbox("Allow ✅ Delivered for medicines that are not received / picked yet",
-                                 key="cd_sure_lines")
-        lproof = st.file_uploader(f"📸 Proof for the ❌ not-delivered medicines — {PROOF_HELP['one']}",
-                                  type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"cd_lproof_{ver}")
-        if st.button("💾 Save medicine-wise", key="cd_save_lines", type="primary"):
-            old = {r["id"]: (r["Delivery"], r["Reason"]) for r in rows}
-            changes, missing = [], 0
-            for _, r in ed.iterrows():
-                if (r["Delivery"], r["Reason"]) == old.get(r["id"]) or r["Delivery"] == "—":
-                    continue
-                if r["Delivery"] == "❌ Not Delivered" and not r["Reason"]:
-                    missing += 1
-                    continue
-                changes.append((int(r["id"]), "Delivered" if r["Delivery"].startswith("✅") else "Not Delivered",
-                                None if r["Delivery"].startswith("✅") else r["Reason"]))
-            early = [c for c in changes if c[1] == "Delivered" and c[0] in not_ready_ids]
-            if missing:
-                st.error(f"{missing} medicine(s) marked Not Delivered without a reason — pick a reason.")
-            elif early and not sure_lines:
-                st.error(f"⏳ {len(early)} medicine(s) marked Delivered are not received / picked yet. "
-                         "Check again, or tick the box above to allow it.")
-            elif any(c[1] == "Not Delivered" for c in changes) and not lproof:
-                st.error(f"📸 Add the proof for the not-delivered medicines: {PROOF_HELP['one']}.")
-            elif changes:
-                names = _upload_proofs(lproof) if lproof else []
-                if names is None:
-                    return
-                st.session_state["cd_ver"] = ver + 1
-                ords = sorted({str(r["Order #"]) for _, r in ed.iterrows() if int(r["id"]) in {c[0] for c in changes}})
-                save_delivery(changes, ", ".join(ords) or "medicine-wise", proof=names)
             else:
-                st.info("Nothing changed.")
+                _apply_delivery(ch, o, proof=names, customer=x[0].get("customer_name"))
+            done[kind] += 1
+    except Exception as e:
+        st.error(f"Could not save: {e}")
+        return
+    st.session_state["cd_ver"] = ver + 1
+    st.session_state["cd_pv"] = pv + 1
+    _ready_to_call_count.clear()
+    st.session_state["cd_msg"] = "Saved: " + " · ".join(
+        t for t in [f"✅ {done['ok']} delivered" if done["ok"] else "", f"❌ {done['no']} not delivered" if done["no"] else "",
+                    f"🟡 {done['part']} part delivered" if done["part"] else "",
+                    f"📵 {done['nr']} not reachable (stay open — call again later)" if done["nr"] else ""] if t)
+    st.rerun()
+
+
+def _apply_delivery(changes, label, proof=None, customer=None):
+    now_s = now_iso()
+    for lid, stt, reason in changes:
+        supabase.table("customer_order_lines").update({
+            "delivery_status": stt, "delivery_reason": reason,
+            "delivery_by": st.session_state.name, "delivery_at": now_s}).eq("id", lid).execute()
+    ok = sum(1 for c in changes if c[1] == "Delivered")
+    log_simple_task("Customer Delivery Update", {"lines": str(len(changes)), "delivered": str(ok),
+                                                  "not_delivered": str(len(changes) - ok), "order": str(label),
+                                                  "customer": customer or "", "proof": proof or [],
+                                                  "reasons": sorted({c[2] for c in changes if c[2]})})
+
 
 def save_delivery(changes, label, proof=None, customer=None):
     """changes: [(line_id, 'Delivered'/'Not Delivered', reason)] — proof: screenshot names (not delivered)"""
-    now_s = now_iso()
     try:
-        for lid, stt, reason in changes:
-            supabase.table("customer_order_lines").update({
-                "delivery_status": stt, "delivery_reason": reason,
-                "delivery_by": st.session_state.name, "delivery_at": now_s}).eq("id", lid).execute()
-        ok = sum(1 for c in changes if c[1] == "Delivered")
-        log_simple_task("Customer Delivery Update", {"lines": str(len(changes)), "delivered": str(ok),
-                                                      "not_delivered": str(len(changes) - ok), "order": str(label),
-                                                      "customer": customer or "", "proof": proof or [],
-                                                      "reasons": sorted({c[2] for c in changes if c[2]})})
+        _apply_delivery(changes, label, proof, customer)
         _ready_to_call_count.clear()
         st.rerun()
     except Exception as e:
