@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v25-Oct journey all orders"
+APP_VERSION = "v25.2-Oct porter filters"
 
 def show_sidebar():
     with st.sidebar:
@@ -1091,6 +1091,40 @@ ARR_NEW_COLS = {"target_pickup_at": "pickup_target_setup.sql",
                 "invoice_no": "arrangement_invoice_setup.sql", "invoice_added_by": "arrangement_invoice_setup.sql",
                 "invoice_added_at": "arrangement_invoice_setup.sql"}
 
+def _next_serial(table, col, pre):
+    """next free <pre>NNN = highest number with this prefix + 1 (a gap or a deleted row can't repeat a used number)"""
+    try:
+        rows = supabase.table(table).select(col).like(col, pre + "%").execute().data or []
+    except Exception:
+        rows = []
+    nums = [int(m.group(1)) for r in rows for m in [re.match(re.escape(pre) + r"(\d+)$", str(r.get(col) or ""))] if m]
+    return f"{pre}{(max(nums) + 1 if nums else 1):03d}"
+
+
+def next_arrangement_no():
+    """next free ARR-YYYYMMDD-NNN"""
+    return _next_serial("arrangements", "arrangement_no", f"ARR-{today_ist().strftime('%Y%m%d')}-")
+
+
+def next_porter_no():
+    return _next_serial("porter_bookings", "porter_no", f"PRT-{date_str()}-")
+
+
+def insert_arrangement_unique(row):
+    """take a fresh number at the moment of saving; if a teammate saved the same number in the same
+    second, the later one moves to the next free number. -> (result, arr_no)"""
+    row["arrangement_no"] = next_arrangement_no()
+    res = insert_arrangement(row)
+    my_id = res.data[0]["id"]
+    for _ in range(5):
+        same = supabase.table("arrangements").select("id").eq("arrangement_no", row["arrangement_no"]).execute().data or []
+        if min([r["id"] for r in same] or [my_id]) == my_id:
+            break
+        row["arrangement_no"] = next_arrangement_no()
+        supabase.table("arrangements").update({"arrangement_no": row["arrangement_no"]}).eq("id", my_id).execute()
+    return res, row["arrangement_no"]
+
+
 def insert_arrangement(row):
     """Insert an arrangement; if newer columns aren't in Supabase yet, save without them and say which SQL to run"""
     try:
@@ -1222,14 +1256,7 @@ def form_arrangement():
     AREAS = load_areas() + load_warehouses() + ["Other"]
 
     # Auto generate arrangement number
-    try:
-        today_prefix = today_ist().strftime("%Y%m%d")
-        existing = supabase.table("arrangements").select("arrangement_no")\
-            .like("arrangement_no", f"ARR-{today_prefix}-%").execute()
-        next_no = len(existing.data) + 1 if existing.data else 1
-        auto_arr_no = f"ARR-{today_prefix}-{str(next_no).zfill(3)}"
-    except Exception:
-        auto_arr_no = f"ARR-{today_ist().strftime('%Y%m%d')}-001"
+    auto_arr_no = next_arrangement_no()     # shown now; the final number is taken again at Submit
 
     # Customer order items: decide each one / tick to order (optional for stock top-ups)
     link_area, picked_lines = arrangement_line_picker()
@@ -1308,15 +1335,9 @@ def form_arrangement():
                 st.error("⚠️ Image of order is mandatory when no customer items are ticked! "
                          "Tick the medicines above, or upload / take a photo (just above Submit).")
             else:
-                # Check duplicate arrangement number
+                # the number is taken fresh at Submit — a teammate saving at the same time can't block this order
                 try:
-                    check = supabase.table("arrangements")\
-                        .select("id")\
-                        .eq("arrangement_no", arr_no)\
-                        .execute()
-                    if check.data:
-                        st.error(f"❌ Arrangement No #{arr_no} already exists! Please use a different number.")
-                    else:
+                    if True:
                         img_name = upload_image(arr_img, "arr") if arr_img is not None else ""
                         arr_row = {
                             "arrangement_no": arr_no,
@@ -1339,7 +1360,8 @@ def form_arrangement():
                                         "invoice_no": invoice_no or None})
                         if invoice_no:
                             arr_row.update({"invoice_added_by": st.session_state.name, "invoice_added_at": now_iso()})
-                        result = insert_arrangement(arr_row)
+                        shown_no = arr_no
+                        result, arr_no = insert_arrangement_unique(arr_row)
                         arr_id = result.data[0]["id"]
                         if picked_lines:
                             save_arrangement_links(arr_id, arr_no, distributor, area, picked_lines)
@@ -1381,6 +1403,8 @@ def form_arrangement():
                         st.session_state["arr_link_ver"] = st.session_state.get("arr_link_ver", 0) + 1
                         st.session_state["arr_done_msg"] = (
                             f"✅ Arrangement #{arr_no} placed — {distributor}, {no_medicines} medicine(s)"
+                            + (f" · 🔢 number is **{arr_no}** (not {shown_no} — a teammate saved that one first)"
+                               if arr_no != shown_no else "")
                             + (f" · ⏰ Pick up by **{target_at.strftime('%I:%M %p')}**" if target_at else ""))
                         st.rerun()
                 except Exception as e:
@@ -3730,6 +3754,19 @@ def porter_direct_pickup(boxed=True):
     return len(bks)
 
 
+def pb_arr_label(a):
+    """'ARR-…-022 · Goel Medical · Gaur City · 2 medicines · 02:46 PM · Pooja · 🔴 Very Urgent'"""
+    n = str(a.get("no_medicines") or "").strip()
+    urg = {"Very Urgent": "🔴 Very Urgent", "Urgent": "🟡 Urgent"}.get(a.get("urgency"), "")
+    typ = "🛵 Self Pick" if a.get("pickup_type") == "Self Pick" else ""
+    day = str(a.get("order_placed_date") or "")[:10]
+    when = ("" if day == today_ist().strftime("%Y-%m-%d") else
+            (datetime.strptime(day, "%Y-%m-%d").strftime("%d %b ") if day else "")) + str(a.get("order_placed_time") or "")
+    parts = [str(a.get("arrangement_no") or ""), str(a.get("distributor") or ""), str(a.get("area") or ""),
+             f"{n} medicine{'s' if n != '1' else ''}" if n else "", when.strip(), str(a.get("order_by") or ""), urg, typ]
+    return " · ".join(p for p in parts if p)
+
+
 def form_book_porter():
     st.subheader("🚛 Book Porter")
     porter_direct_pickup()
@@ -3739,7 +3776,7 @@ def form_book_porter():
         from datetime import timedelta
         two_days_ago = (today_ist() - timedelta(days=2)).strftime("%Y-%m-%d")
         resp = supabase.table("arrangements").select("*")\
-            .in_("status", ["Pending", "Picked Up - In Transit"])\
+            .eq("status", "Pending")\
             .gte("order_placed_date", two_days_ago)\
             .execute()
         arrangements = resp.data if resp.data else []
@@ -3752,14 +3789,50 @@ def form_book_porter():
         st.success(msg[0])
         st.info(msg[1])
     pv = st.session_state.get("pb_ver", 0)
-    by_label = {f"#{a.get('arrangement_no')} — {a.get('distributor')} — {a.get('area','')}": a for a in arrangements}
-    if arrangements:
-        selected_arrs = st.multiselect("Link Arrangements * (choose these first — pickup point fills by itself)",
-                                       list(by_label), key=f"pb_arrs_{pv}")
+    # only orders a porter can still collect: pending, not 'Distributor Delivers' (picked up / booked ones are not loaded)
+    arrangements = [a for a in arrangements if a.get("pickup_type") != "Distributor Delivers"]
+    by_label = {pb_arr_label(a): a for a in sorted(arrangements, key=lambda a: -(a.get("id") or 0))}
+    f1, f2, f3 = st.columns([2, 2, 2])
+    area_opts = sorted({str(a.get("area") or "—") for a in arrangements})
+    wa = st.session_state.get("work_area")
+    with f1:
+        f_area = st.selectbox("Area", ["All Areas"] + area_opts, key="pb_f_area",
+                              index=(area_opts.index(wa) + 1) if wa in area_opts else 0)
+    with f2:
+        f_day = st.selectbox("Date", ["Today", "Yesterday", "Last 3 days"], key="pb_f_day")
+    with f3:
+        st.write("")
+        f_self = st.checkbox("Also show Self Pick", key="pb_f_self",
+                             help="Porter orders show first. Tick to book a porter for a Self Pick order too "
+                                  "(e.g. no delivery pilot free).")
+    day0 = today_ist()
+    days = {"Today": [day0], "Yesterday": [day0 - timedelta(days=1)],
+            "Last 3 days": [day0 - timedelta(days=i) for i in range(3)]}[f_day]
+    days = {d.strftime("%Y-%m-%d") for d in days}
+    def _keep(a):
+        return ((f_area == "All Areas" or str(a.get("area") or "—") == f_area)
+                and str(a.get("order_placed_date") or "")[:10] in days
+                and (f_self or a.get("pickup_type") != "Self Pick"))
+    prev_sel = [x for x in st.session_state.get(f"pb_arrs_{pv}", []) if x in by_label]
+    shown = [lb for lb, a in by_label.items() if _keep(a)]
+    shown.sort(key=lambda lb: by_label[lb].get("pickup_type") == "Self Pick")       # 🚛 Porter orders first
+    opts = prev_sel + [lb for lb in shown if lb not in prev_sel]                      # chosen ones stay when a filter changes
+    if opts:
+        hidden = len(by_label) - len(shown)
+        selected_arrs = st.multiselect(f"Link Arrangements * — {len(shown)} shown"
+                                       + (f" ({hidden} hidden by the filters)" if hidden else "")
+                                       + " · choose these first, the pickup point fills by itself",
+                                       opts, key=f"pb_arrs_{pv}", placeholder="Choose or type a distributor / ARR number")
     else:
-        st.warning("No pending arrangements found!")
+        st.warning("No pending arrangements for this area / date"
+                   + ("" if f_self else " (Self Pick hidden — tick 'Also show Self Pick')") + "."
+                   if by_label else "No pending arrangements found!")
         selected_arrs = []
     chosen = [by_label[x] for x in selected_arrs]
+    if len({str(a.get("area") or "") for a in chosen}) > 1:
+        st.warning("⚠️ " + str(len({str(a.get('area') or '') for a in chosen})) + " areas chosen ("
+                   + ", ".join(sorted({str(a.get('area') or '—') for a in chosen}))
+                   + ") — one porter delivers to one warehouse. Book a separate porter per area.")
     auto_pick = " + ".join(dict.fromkeys(str(a.get("distributor") or "").strip() for a in chosen if a.get("distributor")))
     whs = load_warehouses()
     areas_ch = {_norm_col(a.get("area") or "") for a in chosen}
@@ -3769,15 +3842,7 @@ def form_book_porter():
         c1,c2 = st.columns(2)
         with c1:
             # Auto-generate System Porter ID
-            try:
-                today_str = date_str()
-                existing = supabase.table("porter_bookings").select("porter_no")\
-                    .like("porter_no", f"PRT-{today_str}-%")\
-                    .execute()
-                next_num = len(existing.data or []) + 1
-                auto_porter_no = f"PRT-{today_str}-{next_num:03d}"
-            except Exception:
-                auto_porter_no = f"PRT-{date_str()}-001"
+            auto_porter_no = next_porter_no()
             porter_no    = st.text_input("System Porter ID", value=auto_porter_no,
                 help="Auto-generated ID for tracking")
             porter_phone = st.text_input("Porter Phone Number *",
@@ -3803,8 +3868,10 @@ def form_book_porter():
             else:
                 try:
                     # Extract arrangement nos
-                    arr_nos = [a.split("—")[0].replace("#","").strip() for a in selected_arrs]
-                    arr_ids = [a["id"] for a in arrangements if str(a.get("arrangement_no")) in arr_nos]
+                    arr_nos = [str(a.get("arrangement_no")) for a in chosen]
+                    arr_ids = [a["id"] for a in chosen]
+                    if porter_no == auto_porter_no:          # untouched auto ID -> take the free number now
+                        porter_no = next_porter_no()
 
                     # Save porter booking
                     result = supabase.table("porter_bookings").insert({
@@ -3822,6 +3889,13 @@ def form_book_porter():
                         "remarks": remarks
                     }).execute()
                     porter_id = result.data[0]["id"]
+                    if porter_no.startswith(f"PRT-{date_str()}-"):   # same number saved by a teammate in the same second
+                        for _ in range(5):
+                            same = supabase.table("porter_bookings").select("id").eq("porter_no", porter_no).execute().data or []
+                            if min([r["id"] for r in same] or [porter_id]) == porter_id:
+                                break
+                            porter_no = next_porter_no()
+                            supabase.table("porter_bookings").update({"porter_no": porter_no}).eq("id", porter_id).execute()
 
                     # Update arrangement status
                     for arr_id in arr_ids:
