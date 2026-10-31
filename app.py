@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v29-Oct staff report"
+APP_VERSION = "v30-Oct no work"
 
 def show_sidebar():
     with st.sidebar:
@@ -1911,7 +1911,7 @@ def form_other_task():
     start = timer_button("other_task")
     if start is None: return
     with st.form("other_task_form", clear_on_submit=True):
-        task_name = st.text_input("Task Name *", placeholder="What did you do?")
+        task_name = st.text_input("Task Name *", value=st.session_state.get("other_prefill", ""), placeholder="What did you do?")
         details   = st.text_area("Task Details", placeholder="Describe the task...")
         remarks   = st.text_input("Remarks")
         if st.form_submit_button("Submit ✅", type="primary", width='stretch'):
@@ -1928,6 +1928,7 @@ def form_other_task():
                         "start_time": start.strftime("%I:%M:%S %p"),
                         "end_time": end_time, "duration_mins": str(duration)
                     }).execute()
+                    st.session_state.pop("other_prefill", None)
                     st.success("✅ Task submitted!")
                     st.balloons()
                 except Exception as e:
@@ -4573,6 +4574,7 @@ def show_user_page():
     if st.session_state.get("role") == "manager":
         pending_reviews_banner()
         show_report_due_banner()
+        show_no_work_panel("mgr_nwp")
         show_daily_checklist()
         mode = st.radio("View", ["🧑‍💼 My Work", "👥 Team View"], horizontal=True,
                         key="mgr_mode", label_visibility="collapsed")
@@ -10072,6 +10074,10 @@ def attendance_gate():
             st.rerun()
         return False
 
+    if s["on_break"] and nw_parse(s["on_break"][1]):
+        show_no_work_card(s["on_break"][0], s["on_break"][1], now)
+        return False
+
     if s["on_break"]:
         b_start, b_type = s["on_break"]
         mins = int((now - b_start).total_seconds() // 60)
@@ -10085,7 +10091,7 @@ def attendance_gate():
     worked = int((now - s["clock_in"]).total_seconds() // 60)
     if worked < 20 and not st.session_state.get("_in_share_hide"):
         show_in_share(s["clock_in"])
-    c0, c1, c2, c3, c4 = st.columns([3, 1, 1, 1, 1])
+    c0, c1, c2, c3, c5, c4 = st.columns([3, 1, 1, 1, 1, 1])
     with c0:
         st.caption(f"🟢 In since **{s['clock_in'].strftime('%I:%M %p')}** · {fmt_age(worked)} · "
                    f"Breaks: {s['breaks']} ({fmt_age(int(s['break_secs'] // 60))})")
@@ -10098,6 +10104,13 @@ def attendance_gate():
                 else:
                     att_log("break_start", btype)
                     st.rerun()
+    with c5:
+        if st.button("⏸️ No work", key="att_nowork", width='stretch',
+                     help="Nothing to do right now (e.g. stock not arrived) — your manager will see it and can give you work"):
+            st.session_state["nw_pick"] = True
+            st.rerun()
+    if st.session_state.get("nw_pick"):
+        show_no_work_start(active_key)
     delivery = st.session_state.team == "Delivery"
     with c4:
         if not st.session_state.get("att_confirm_out") and st.button("🔴 Clock Out", key="att_out", width='stretch'):
@@ -10396,6 +10409,7 @@ def show_my_assigned_tasks():
             with c2:
                 if r.get("status") == "Pending":
                     if st.button("▶️ Start", key=f"at_start_{r['id']}", width='stretch'):
+                        end_no_work_if_any()
                         supabase.table("assigned_tasks").update({"status": "In Progress", "started_at": now_iso()}).eq("id", r["id"]).execute()
                         st.rerun()
                 else:
@@ -14526,8 +14540,9 @@ def is_reviewer():
 
 
 # ── counting what was done ────────────────────────────────────────────────────
-def _tasks_of(person, lo_n, hi_n):
-    """finished tasks of a person between two naive-IST datetimes"""
+def _tasks_of(person, lo_n, hi_n, by_start=False):
+    """finished tasks of a person between two naive-IST datetimes
+    (by_start: by the time the task STARTED — a task begun near the end of a block finishes after it)"""
     days = sorted({lo_n.strftime("%Y-%m-%d"), hi_n.strftime("%Y-%m-%d")})
     try:
         rows = fetch_all("daily_tasks", lambda q: q.eq("person", person).gte("date", days[0]).lte("date", days[-1]))
@@ -14538,6 +14553,15 @@ def _tasks_of(person, lo_n, hi_n):
         if t.get("status") == "In Progress":
             continue
         when = _naive(_task_dt(t, "end_time")) or _naive(to_ist(t.get("created_at")))
+        if by_start:
+            s_ = _naive(_task_dt(t, "start_time"))
+            if s_ and when and s_ > when:              # crossed midnight
+                s_ -= timedelta(days=1)
+            when = s_ or when
+            if when and lo_n <= when < hi_n:
+                t["_when"] = when
+                out.append(t)
+            continue
         if when and lo_n <= when <= hi_n:
             t["_when"] = when
             out.append(t)
@@ -14581,7 +14605,7 @@ def block_progress(block, upto=None):
     if not lo or not items:
         return [], None
     person = block.get("person")
-    tasks = _tasks_of(person, lo, hi)
+    tasks = _tasks_of(person, lo, hi, by_start=True)
     hows = {k: how for k, _, how in PLAN_ITEMS.get(block.get("team"), [])}
     rows, parts = [], []
     for it in items:
@@ -16363,7 +16387,8 @@ def person_day_stats(tasks, events, day_s, now_n=None):
     day_end = cout or (now_n if is_today and cin else (max(p[1] for p in spans) if spans else None))
     present = (day_end - cin).total_seconds() if cin and day_end and day_end > cin else 0
     lunch = [b for b in breaks if "lunch" in str(b[2]).lower()]
-    other = [b for b in breaks if b not in lunch]
+    nowork = [b for b in breaks if nw_parse(b[2])]
+    other = [b for b in breaks if b not in lunch and b not in nowork]
     bsecs = lambda bs: sum(max(0, (b[1] - b[0]).total_seconds()) for b in bs)
     rest_secs, rest_n = 0, 0
     if cin and day_end and day_end > cin:          # rest time only between clock-in and clock-out
@@ -16381,7 +16406,9 @@ def person_day_stats(tasks, events, day_s, now_n=None):
                 break
     return {"cin": cin, "cout": cout, "present": present, "work": _merged_secs(spans), "tasks": len(done),
             "lunch": bsecs(lunch), "lunch_n": len(lunch), "brk": bsecs(other), "brk_n": len(other),
-            "rest": rest_secs, "rest_n": rest_n}
+            "rest": rest_secs, "rest_n": rest_n,
+            "nowork": bsecs(nowork), "nowork_ok": bsecs([b for b in nowork if nw_parse(b[2])[1] == 0]),
+            "nowork_list": [(b[0], b[1], nw_parse(b[2])[0], nw_parse(b[2])[1]) for b in nowork]}
 
 
 def _rep_t(secs):
@@ -16555,6 +16582,323 @@ def _staff_compare_df(data):
     return pd.DataFrame(rows)
 
 
+# ── ⏸️ NO WORK RIGHT NOW: waiting for stock etc. — checked against the team's open work, managers give work ────
+NW_REASONS = ["📦 Stock not arrived yet", "🧾 Waiting for bills / distributor", "💻 App / software / internet down",
+              "🙋 Waiting for instructions", "Other"]
+NW_BACKUP = {   # team -> [(button, form key, task name for ✏️ Other Task)]
+    "Stock": [("📦 Inventory check", "inventory", None), ("📅 Expiry check", "other", "Expiry check"),
+              ("🗄️ Rack arranging", "other", "Rack arranging"), ("🧹 Cleaning", "other", "Cleaning")],
+    "Purchase": [("🧾 Follow up pending invoices", "invoice", None), ("💰 Check rates / distributors", "other", "Rate check")],
+    "Call": [("📵 Call back not-reachable customers", "custdel", None), ("💬 Feedback calls", "other", "Feedback calls")],
+    "Delivery": [("🏬 Help at the warehouse", "other", "Help at warehouse")],
+}
+NW_LIMIT_MINS = 60
+NW_RED_MINS = 30
+
+
+def nw_parse(bt):
+    """'No work: <reason> || w=3 || 3 bills …' -> (reason, waiting count, waiting text) or None"""
+    bt = str(bt or "")
+    if not bt.startswith("No work"):
+        return None
+    parts = [p.strip() for p in bt.split("||")]
+    reason = parts[0].split(":", 1)[1].strip() if ":" in parts[0] else ""
+    w = int(_to_float(parts[1][2:], 0)) if len(parts) > 1 and parts[1].startswith("w=") else 0
+    return reason, w, parts[2] if len(parts) > 2 else ""
+
+
+def work_waiting(team, area=None):
+    """open work in this person's queue right now -> (count, ['3 bills arrived, not entered', …])"""
+    out = []
+    try:
+        if team == "Stock":
+            left = sum(int(a.get("bills") or 0) - a.get("_entered", 0) for a in load_open_arrivals(1)
+                       if (not area or area == "All Areas" or a.get("area") == area))
+            if left > 0:
+                out.append((left, f"{left} bill(s) arrived, not entered"))
+            sp = stock_pending(area or "All Areas")
+            for k, lbl in (("crosscheck", "to cross-check"), ("upload", "to upload"), ("placement", "to place"),
+                           ("storepick", "in-store medicine(s) to pick")):
+                if sp.get(k):
+                    out.append((sp[k], f"{sp[k]} {'bill(s) ' if k != 'storepick' else ''}{lbl}"))
+        elif team == "Purchase":
+            since = IST.localize(datetime.combine(today_ist() - timedelta(days=3), datetime.min.time())).isoformat()
+            n = len(fetch_all("customer_order_lines", lambda q: q.eq("removed", False).eq("status", "Pending")
+                              .gte("imported_at", since)))
+            if n:
+                out.append((n, f"{n} customer medicine(s) not ordered"))
+            inv = count_missing_invoices()
+            if inv:
+                out.append((inv, f"{inv} invoice no(s) to add"))
+        elif team == "Call":
+            n = ready_to_call_count()
+            if n:
+                out.append((n, f"{n} order(s) ready to call"))
+        elif team == "Delivery":
+            lo = (today_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+            n = len(fetch_all("arrangements", lambda q: q.eq("status", "Pending").eq("pickup_type", "Self Pick")
+                              .gte("order_placed_date", lo)))
+            if n:
+                out.append((n, f"{n} pickup(s) waiting"))
+    except Exception:
+        pass
+    return sum(n for n, _ in out), [t for _, t in out]
+
+
+def end_no_work_if_any():
+    """starting real work ends '⏸️ No work' by itself"""
+    try:
+        ev = supabase.table("attendance_log").select("*").eq("person", st.session_state.name)\
+            .eq("date", date_str()).order("at").execute().data or []
+        s = att_state(ev)
+        if s["on_break"] and nw_parse(s["on_break"][1]):
+            att_log("break_end", s["on_break"][1])
+    except Exception:
+        pass
+
+
+def show_no_work_start(active_key):
+    """reason picker under the attendance bar"""
+    with st.container(border=True):
+        st.markdown("**⏸️ No work right now — why?**")
+        r = st.radio("Reason", NW_REASONS, index=None, key="nw_reason", label_visibility="collapsed")
+        other = st.text_input("Write the reason", key="nw_other") if r == "Other" else ""
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("⏸️ Start 'No work'", type="primary", key="nw_go", width='stretch'):
+                if active_key:
+                    st.error("Finish or cancel your running task first.")
+                elif not r or (r == "Other" and not other.strip()):
+                    st.error("Choose the reason (or write it).")
+                else:
+                    n, txt = work_waiting(st.session_state.team, st.session_state.get("work_area"))
+                    reason = other.strip() if r == "Other" else r
+                    att_log("break_start", f"No work: {reason} || w={n} || {'; '.join(txt)}")
+                    st.session_state["nw_pick"] = False
+                    st.rerun()
+        with b2:
+            if st.button("✖️ Cancel", key="nw_cancel", width='stretch'):
+                st.session_state["nw_pick"] = False
+                st.rerun()
+
+
+def show_no_work_card(b_start, b_type, now):
+    """while on '⏸️ No work': work waiting, tasks from managers, backup work, back to work"""
+    reason, w0, _ = nw_parse(b_type)
+    mins = int((now - b_start).total_seconds() // 60)
+    st.warning(f"⏸️ **No work** since {b_start.strftime('%I:%M %p')} — {fmt_age(mins)} · {reason}. "
+               "Your manager can see this and may give you work.")
+    team = st.session_state.team
+    n, txt = work_waiting(team, st.session_state.get("work_area"))
+    if n:
+        st.error("⚠️ There IS work waiting for your team: " + " · ".join(txt) + " — press ▶️ Back to work and do it.")
+    show_my_assigned_tasks()
+    opts = NW_BACKUP.get(team, [])
+    if opts:
+        st.markdown("**🧰 Backup work while you wait** — this counts as normal task time:")
+        cols = st.columns(len(opts))
+        for col, (lbl, form, name) in zip(cols, opts):
+            with col:
+                if st.button(lbl, key=f"nw_bk_{form}_{name or ''}", width='stretch'):
+                    att_log("break_end", b_type)
+                    st.session_state[FORM_KEYS.get(team, "")] = form
+                    if name:
+                        st.session_state["other_prefill"] = name
+                    if form == "custdel":
+                        st.session_state["cd_tab"] = "again"
+                    st.rerun()
+    if st.button("▶️ Back to work", type="primary", width='stretch', key="nw_end"):
+        att_log("break_end", b_type)
+        st.rerun()
+
+
+def no_work_now():
+    """everyone on '⏸️ No work' right now -> [dict]"""
+    try:
+        ev = fetch_all("attendance_log", lambda q: q.eq("date", date_str()))
+    except Exception:
+        return []
+    by = {}
+    for e in ev:
+        by.setdefault(e.get("person"), []).append(e)
+    users = {u["name"]: u for u in (load_users() or {}).values()}
+    now = now_ist()
+    out = []
+    for p, es in by.items():
+        es = sorted(es, key=lambda e: str(e.get("at")))
+        s = att_state(es)
+        if s["on_break"] and nw_parse(s["on_break"][1]) and not s["clock_out"]:
+            reason, w0, t0 = nw_parse(s["on_break"][1])
+            last = [e for e in es if e.get("event") == "break_start"][-1]
+            team = (users.get(p) or {}).get("team") or last.get("team") or ""
+            area = last.get("area") or ""
+            n, txt = work_waiting(team, area)
+            out.append({"person": p, "team": team, "area": area, "since": s["on_break"][0], "reason": reason,
+                        "mins": int((now - s["on_break"][0]).total_seconds() // 60), "waiting": n, "waiting_txt": txt})
+    return sorted(out, key=lambda r: -r["mins"])
+
+
+def show_no_work_panel(kp="nwp"):
+    """managers / admin: who has no work right now + 📌 give work"""
+    rows = no_work_now()
+    if not rows:
+        return
+    with st.container(border=True):
+        red = sum(1 for r in rows if r["mins"] >= NW_RED_MINS)
+        (st.error if red else st.warning)(f"⏸️ **{len(rows)} {'person has' if len(rows) == 1 else 'people have'} no work right now**"
+                                          + (f" — 🔴 {red} for {NW_RED_MINS}+ min" if red else ""))
+        st.dataframe(pd.DataFrame([{
+            "": "🔴" if r["mins"] >= NW_RED_MINS else "", "Staff": r["person"],
+            "Role · Area": f"{TEAM_ICON.get(r['team'], '')} {r['team']}" + (f" · {r['area']}" if r["area"] else ""),
+            "Since": f"{r['since'].strftime('%I:%M %p')} ({fmt_age(r['mins'])})", "Reason": r["reason"],
+            "Work waiting?": ("⚠️ " + " · ".join(r["waiting_txt"])) if r["waiting"] else "✅ none"} for r in rows]).astype(str),
+            hide_index=True, width='stretch')
+        msg = st.session_state.pop(f"{kp}_msg", None)
+        if msg:
+            st.success(msg)
+        c1, c2, c3, c4 = st.columns([2, 3, 3, 1])
+        by = {r["person"]: r for r in rows}
+        with c1:
+            who = st.selectbox("📌 Give work to", list(by), key=f"{kp}_who")
+        team = by[who]["team"]
+        picks = [lbl for lbl, _, _ in NW_BACKUP.get(team, [])] + ["✏️ Write my own"]
+        with c2:
+            what = st.selectbox("Work", picks, key=f"{kp}_what_{who}")
+        with c3:
+            txt = st.text_input("Details", key=f"{kp}_txt_{who}",
+                                placeholder="Write the task" if what.startswith("✏️") else "e.g. rack A, top 2 shelves")
+        with c4:
+            st.write("")
+            if st.button("📌 Assign", type="primary", key=f"{kp}_go", width='stretch'):
+                title = txt.strip() if what.startswith("✏️") else what
+                if not title:
+                    st.error("Write the task.")
+                    return
+                try:
+                    supabase.table("assigned_tasks").insert({
+                        "title": title[:120], "details": ("" if what.startswith("✏️") else txt.strip()) or "Given during ⏸️ No work",
+                        "assigned_to": who, "team": team, "due_date": date_str(), "priority": "Urgent",
+                        "status": "Pending", "is_template": False, "active": True,
+                        "assigned_by": st.session_state.name, "assigned_at": now_iso()}).execute()
+                    st.session_state[f"{kp}_msg"] = f"📌 Work given to {who}: {title}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save — has assigned_tasks_setup.sql been run? ({e})")
+
+
+def _nw_blocks(day_lo, day_hi):
+    """every '⏸️ No work' stretch in a period -> [(person, area, start, end, reason, waiting)]"""
+    ev = fetch_all("attendance_log", lambda q: q.gte("date", _ds(day_lo)).lte("date", _ds(day_hi)))
+    by = {}
+    for e in ev:
+        by.setdefault((e.get("person"), str(e.get("date"))[:10]), []).append(e)
+    now_n = _now_n()
+    out = []
+    for (p, d), es in by.items():
+        cur = None
+        for e in sorted(es, key=lambda e: str(e.get("at"))):
+            t = _naive(to_ist(e.get("at")))
+            if e.get("event") == "break_start":
+                cur = (t, e) if nw_parse(e.get("break_type")) else None
+            elif e.get("event") in ("break_end", "clock_out") and cur:
+                r, w, _ = nw_parse(cur[1].get("break_type"))
+                out.append((p, cur[1].get("area") or "", cur[0], t, r, w))
+                cur = None
+        if cur:
+            r, w, _ = nw_parse(cur[1].get("break_type"))
+            out.append((p, cur[1].get("area") or "", cur[0], now_n if d == _ds(now_n) else cur[0], r, w))
+    return out
+
+
+def _heat(v, top, fmt, marks=("🟨", "🟧", "🟥")):
+    if not v:
+        return ""
+    k = 2 if v >= top * 0.66 else 1 if v >= top * 0.33 else 0
+    return f"{marks[k]} {fmt(v)}"
+
+
+def show_nowork_pattern(kp="nwpat"):
+    st.markdown("#### ⏸️ No-work pattern — when the team waits, and when stock really arrives")
+    lo, hi, _b = report_period(kp)
+    rs = st.selectbox("Reason", ["All reasons"] + NW_REASONS[:-1], key=f"{kp}_reason")
+    try:
+        blocks = _nw_blocks(lo, hi)
+        arr = fetch_all("bill_arrivals", lambda q: q.gte("date", _ds(lo)).lte("date", _ds(hi)))
+    except Exception as e:
+        st.error(f"Could not load: {e}")
+        return
+    if rs != "All reasons":
+        blocks = [b for b in blocks if b[4] == rs]
+    hours = list(range(7, 24))
+    nw = {}
+    for p, area, s, e, r, w in blocks:
+        t = s
+        while t < e:
+            nxt = min(e, t.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+            nw[(area or "No area", t.hour)] = nw.get((area or "No area", t.hour), 0) + (nxt - t).total_seconds()
+            t = nxt
+    st.markdown("**1. When the team waits** — total ⏸️ No-work time per hour"
+                + (f" ({rs})" if rs != "All reasons" else ""))
+    if nw:
+        top = max(nw.values())
+        areas = sorted({a for a, _ in nw})
+        st.dataframe(pd.DataFrame([{"Area": a, **{f"{h % 12 or 12}{'am' if h < 12 else 'pm'}":
+                                                   _heat(nw.get((a, h), 0), top, lambda v: _sr_hm(v)) for h in hours}}
+                                   for a in areas]).astype(str), hide_index=True, width='stretch')
+        tot = sum((b[3] - b[2]).total_seconds() for b in blocks)
+        bad = sum((b[3] - b[2]).total_seconds() for b in blocks if b[5])
+        st.caption(f"Total ⏸️ No work: {_sr_hm(tot)} in {len(blocks)} stretch(es)"
+                   + (f" · ⚠️ {_sr_hm(bad)} of it while work was waiting" if bad else ""))
+    else:
+        st.info("No '⏸️ No work' recorded in this period yet — the pattern fills in as the team uses the button.")
+    st.markdown("**2. When stock arrives** — bills per hour (📥 Bills arrived photos)")
+    ah = {}
+    for a in arr:
+        t = _naive(to_ist(a.get("arrived_at")))
+        if t:
+            k = (a.get("area") or "—", t.hour)
+            ah[k] = ah.get(k, 0) + int(a.get("bills") or 1)
+    if ah:
+        top = max(ah.values())
+        st.dataframe(pd.DataFrame([{"Area": a, **{f"{h % 12 or 12}{'am' if h < 12 else 'pm'}":
+                                                   _heat(ah.get((a, h), 0), top, str, ("▫️", "🟩", "🟩🟩")) for h in hours}}
+                                   for a in sorted({a for a, _ in ah})]).astype(str), hide_index=True, width='stretch')
+    else:
+        st.info("No bill arrivals in this period.")
+    st.markdown("**3. When each distributor's stock arrives**")
+    try:
+        arrs = fetch_all("arrangements", lambda q: q.gte("order_placed_date", _ds(lo)).lte("order_placed_date", _ds(hi)))
+    except Exception:
+        arrs = []
+    placed = {}
+    for a in arrs:
+        t = parse_task_time(a.get("order_placed_time"))
+        if t and a.get("distributor"):
+            placed.setdefault(_bill_norm(a["distributor"]), []).append(t.hour * 60 + t.minute)
+    by = {}
+    for a in arr:
+        t = _naive(to_ist(a.get("arrived_at")))
+        if t and a.get("distributor"):
+            by.setdefault(a["distributor"], []).extend([t.hour * 60 + t.minute] * int(a.get("bills") or 1))
+    hm = lambda m: datetime(2000, 1, 1, int(m) // 60, int(m) % 60).strftime("%I:%M %p")
+    rows = []
+    for d, ms in by.items():
+        ms = sorted(ms)
+        med = ms[len(ms) // 2]
+        pl = placed.get(_bill_norm(d))
+        rows.append({"": "🟢" if med < 10 * 60 else "🟡" if med < 12 * 60 else "🔴", "Distributor": d, "Bills": len(ms),
+                     "Usual arrival": hm(med), "Earliest": hm(ms[0]),
+                     "Orders placed (avg)": hm(sum(pl) / len(pl)) if pl else "", "_m": med})
+    if rows:
+        rows.sort(key=lambda r: -r["_m"])
+        st.dataframe(pd.DataFrame([{k: v for k, v in r.items() if k != "_m"} for r in rows]).astype(str),
+                     hide_index=True, width='stretch')
+        st.caption("Usual arrival = the middle arrival time of that distributor's bills. 🟢 before 10 AM · 🟡 before 12 PM · "
+                   "🔴 12 PM or later — ask the 🔴 ones to deliver in the hours your team is waiting.")
+    else:
+        st.info("No distributor arrivals in this period.")
+
+
 # ── 📣 DAILY STAFF REPORT — shared in the WhatsApp group (2 PM · 7 PM · 11:15 PM · next morning) ─────────
 SR_DEFAULT = {"target": 85, "yellow": 70, "break_full": 60, "break_short": 30, "full_hours": 8,
               "posts": ["14:00", "19:00", "23:15", "09:00"],
@@ -16621,7 +16965,7 @@ def longest_idle(tasks, events, day_s, now_n):
 
 
 def _sr_used(s):
-    working = max(0, s["present"] - s["lunch"] - s["brk"])
+    working = max(0, s["present"] - s["lunch"] - s["brk"] - s.get("nowork_ok", 0))
     return working, (100 * s["work"] / working if working > 0 else None)
 
 
@@ -16646,6 +16990,11 @@ def staff_day_report(day_s, upto_s=None):
         if w.get("area"):
             area_pd.setdefault((w.get("person"), str(w.get("date"))[:10]), []).append(w["area"])
     roster = load_roster(day_s)
+    try:
+        assigned = supabase.table("assigned_tasks").select("assigned_to,assigned_by,assigned_at")\
+            .eq("due_date", day_s).eq("is_template", False).execute().data or []
+    except Exception:
+        assigned = []
     rows, absent = [], []
     for u in users:
         name, team = u["name"], u.get("team", "")
@@ -16662,6 +17011,9 @@ def staff_day_report(day_s, upto_s=None):
                 absent.append((name, team, "❌ No clock-in"))
             continue
         s = person_day_stats(tl, el, day_s, now_n)
+        if not s["cin"] and not s["tasks"]:
+            absent.append((name, team, "⚠️ Logged in, not clocked in"))
+            continue
         working, used = _sr_used(s)
         breaks = s["lunch"] + s["brk"]
         allow = (cfg["break_full"] if s["present"] >= cfg["full_hours"] * 3600 else cfg["break_short"]) * 60
@@ -16693,16 +17045,34 @@ def staff_day_report(day_s, upto_s=None):
         base = sum(prev) / len(prev) if prev else None
         trend = "" if used is None or base is None else "↑" if used >= base + 3 else "↓" if used <= base - 3 else "→"
         areas = area_pd.get((name, day_s), [])
-        rows.append({"name": name, "team": role, "teams": teams, "area": max(set(areas), key=areas.count) if areas else "",
+        given = [a for a in assigned if a.get("assigned_to") == name and any(
+            s_ <= (_naive(to_ist(a.get("assigned_at"))) or datetime.min) <= e_ + timedelta(minutes=5)
+            for s_, e_, _, _ in s["nowork_list"])]
+        nw_reasons = sorted({r_ for _, _, r_, _ in s["nowork_list"]})
+        rows.append({"nowork": s["nowork"], "nowork_bad": s["nowork"] - s["nowork_ok"], "nowork_why": ", ".join(nw_reasons),
+                     "given_by": ", ".join(sorted({a.get("assigned_by") or "" for a in given} - {""})),"name": name, "team": role, "teams": teams, "area": max(set(areas), key=areas.count) if areas else "",
                      "cin": s["cin"], "cout": s["cout"], "working": working, "task": s["work"], "breaks": breaks,
                      "over": max(0, breaks - allow), "allow": allow, "off": max(0, working - s["work"]), "used": used,
                      "tasks": s["tasks"], "idle": idle, "slow": slow, "trend": trend, "base": base})
+    return rows, absent
+
+
+def sr_ranked(rows):
+    """copies of the rows with 🥇 / 🔻 inside each role — only among the people shown"""
+    rows = [dict(r, rank="") for r in rows]
     for tm in set(r["team"] for r in rows):
         grp = sorted([r for r in rows if r["team"] == tm and r["used"] is not None and r["working"] >= 3600],
                      key=lambda r: -r["used"])
         for i, r in enumerate(grp):
             r["rank"] = "🥇" if i == 0 and len(grp) > 1 else "🔻" if i == len(grp) - 1 and len(grp) > 1 else ""
-    return rows, absent
+    return rows
+
+
+def sr_hidden():
+    try:
+        return set(json.loads(get_app_setting("staff_report_hide", "[]") or "[]"))
+    except Exception:
+        return set()
 
 
 def _sr_flag(used, cfg):
@@ -16735,6 +17105,11 @@ def staff_report_text(day_s, rows, absent, final, title):
                 bits.append(f"☕ breaks {_sr_hm(r['breaks'])} (+{_sr_hm(r['over'])})")
             if r["slow"]:
                 bits.append(f"🐢 {r['slow'][0]} avg {round(r['slow'][1])}m (target {r['slow'][2]}m)")
+            if r.get("nowork", 0) >= 5 * 60:
+                bits.append(f"⏸️ No work {_sr_hm(r['nowork'])}" + (" 🟡" if r["nowork"] >= NW_LIMIT_MINS * 60 else "")
+                            + (f" ({r['nowork_why']})" if r["nowork_why"] else "")
+                            + (" ⚠️ work was waiting" if r["nowork_bad"] >= 60 else "")
+                            + (f" → 📌 work given by {r['given_by']}" if r["given_by"] else ""))
             if r["tasks"] <= 2 and r["working"] >= 3 * 3600:
                 bits.append(f"⚠️ only {r['tasks']} task(s) timed")
             mark = (r.get("rank") or "") if final else ""
@@ -16754,7 +17129,7 @@ def staff_report_text(day_s, rows, absent, final, title):
         if good:
             best = max(good, key=lambda r: r["used"])
             lines.append(f"🏆 Star of the day: {best['name']} ({round(best['used'])}%)")
-    for lbl in ("❌ No clock-in", "🤒 Leave", "🏖️ Off"):
+    for lbl in ("❌ No clock-in", "⚠️ Logged in, not clocked in", "🤒 Leave", "🏖️ Off"):
         ns = [n for n, _, w in absent if w == lbl]
         if ns:
             lines.append(f"{lbl}: " + ", ".join(ns))
@@ -16825,8 +17200,6 @@ def show_staff_report(kp="sr"):
             day = today if kind.startswith("Today") else today - timedelta(days=1)
             st.write("")
             st.caption(f"📅 {day.strftime('%a %d %b %Y')}")
-    with c3:
-        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
     day_s = day.strftime("%Y-%m-%d")
     try:
         with st.spinner("Building the report…"):
@@ -16834,8 +17207,30 @@ def show_staff_report(kp="sr"):
     except Exception as e:
         st.error(f"Could not build the report: {e}")
         return
+    hide = sr_hidden()
+    rows = [r for r in rows if r["name"] not in hide]
+    absent = [a for a in absent if a[0] not in hide]
+    with c3:
+        NOA = "No area"
+        areas_here = sorted({r["area"] for r in rows if r["area"]})
+        area = st.selectbox("Area", ["All Areas"] + areas_here + ([NOA] if any(not r["area"] for r in rows) else []),
+                            key=f"{kp}_area")
+    f1, f2 = st.columns([1, 3])
+    with f1:
+        roles = [t for t in REP_TEAM_ORDER if any(t in r["teams"] for r in rows) or any(a[1] == t for a in absent)]
+        role = st.selectbox("Role", ["All"] + roles, key=f"{kp}_role")
     if area != "All Areas":
-        rows = [r for r in rows if r["area"] == area]
+        rows = [r for r in rows if (r["area"] or NOA) == area]
+        absent = [a for a in absent if area == NOA]          # absent people have no area of the day
+    if role != "All":
+        rows = [r for r in rows if role in r["teams"]]
+        absent = [a for a in absent if a[1] == role]
+    names = sorted({r["name"] for r in rows} | {a[0] for a in absent}, key=str.lower)
+    with f2:
+        keep = st.multiselect("Staff (untick to leave someone out)", names, default=names,
+                              key=f"{kp}_staff_{day_s}_{area}_{role}")
+    rows = sr_ranked([r for r in rows if r["name"] in keep])
+    absent = [a for a in absent if a[0] in keep]
     final = day_s != today.strftime("%Y-%m-%d") or (now.hour, now.minute) >= (23, 0)
     title = "Staff Report" if final else f"Staff check {now.strftime('%I:%M %p').lstrip('0')} (today so far)"
     if due:
@@ -16856,7 +17251,11 @@ def show_staff_report(kp="sr"):
                     "Trend": r["trend"], "Tasks": r["tasks"],
                     "Longest idle": (f"{_sr_hm(r['idle'][0])} ({r['idle'][1].strftime('%I:%M')}–{r['idle'][2].strftime('%I:%M %p')})"
                                      if r["idle"][0] >= 15 * 60 else ""),
-                    "Slow task": f"{r['slow'][0]} {round(r['slow'][1])}m / {r['slow'][2]}m" if r["slow"] else ""})
+                    "Slow task": f"{r['slow'][0]} {round(r['slow'][1])}m / {r['slow'][2]}m" if r["slow"] else "",
+                    "⏸️ No work": ((("🟡 " if r["nowork"] >= NW_LIMIT_MINS * 60 else "") + _sr_hm(r["nowork"])
+                                    + (f" ({r['nowork_why']})" if r["nowork_why"] else "")
+                                    + (" ⚠️ work waiting" if r["nowork_bad"] >= 60 else "")
+                                    + (f" → 📌 {r['given_by']}" if r["given_by"] else "")) if r.get("nowork", 0) >= 60 else "")})
     tw, tt = sum(r["working"] for r in rows), sum(r["task"] for r in rows)
     m = st.columns(4)
     m[0].metric("Staff working", len(rows))
@@ -16869,7 +17268,8 @@ def show_staff_report(kp="sr"):
         st.caption(" · ".join(f"{w} {n}" for n, _, w in absent))
     st.caption(f"Used % = task time ÷ working hrs (clock-in → out, minus breaks). 🟢 {cfg['target']}%+ · 🟡 {cfg['yellow']}–{cfg['target']}% · "
                f"🔴 below {cfg['yellow']}%. Breaks allowed: {cfg['break_full']}m (shift {cfg['full_hours']}h+) / {cfg['break_short']}m. "
-               "Trend = against own last 7 days. 🥇 / 🔻 = best / last in the role.")
+               "Trend = against own last 7 days. 🥇 / 🔻 = best / last in the role. ⏸️ No work with nothing waiting in "
+               f"the queue is not counted against them; 🟡 = {NW_LIMIT_MINS}+ min of No work.")
     txt = staff_report_text(day_s, rows, absent, final, title)
     st.markdown("**📤 Message for the WhatsApp group**")
     st.code(txt, language=None, wrap_lines=True)
@@ -16903,6 +17303,10 @@ def show_staff_report(kp="sr"):
                               ", ".join(cfg["posts"]), key=f"{kp}_s_p")
         sp = st.data_editor(pd.DataFrame([{"Task": k, "Target minutes": v} for k, v in cfg["speed"].items()]),
                             key=f"{kp}_s_sp", hide_index=True, disabled=["Task"])
+        all_staff = sorted({u["name"] for u in (load_users() or {}).values() if u.get("role") not in ("admin", "manager")},
+                           key=str.lower)
+        hide_sel = st.multiselect("🙈 Never show in the report (test accounts)", all_staff,
+                                  default=[n for n in sorted(hide) if n in all_staff], key=f"{kp}_s_hide")
         if st.button("💾 Save settings", key=f"{kp}_s_save"):
             ps = [p.strip() for p in posts.split(",") if p.strip()]
             if len(ps) != 4 or not all(re.match(r"^\d{1,2}:\d{2}$", p) for p in ps):
@@ -16914,6 +17318,7 @@ def show_staff_report(kp="sr"):
                     "target": int(tgt), "yellow": int(yel), "break_full": int(bf), "break_short": int(bs),
                     "full_hours": int(fh), "posts": ps,
                     "speed": {r["Task"]: int(_to_float(r["Target minutes"], 0)) for _, r in sp.iterrows()}}))
+                set_app_setting("staff_report_hide", json.dumps(sorted(hide_sel)))
                 staff_day_report.clear()
                 st.session_state["sr_msg"] = "✅ Report settings saved."
                 st.rerun()
@@ -18009,8 +18414,11 @@ def show_overlap_cost(kp, lo, hi):
 
 def show_reports(kp="rep"):
     st.subheader("📋 Staff & Area Summary")
-    tab = st.radio("Report", ["👤 Staff", "📍 Area", "🚚 Arrangement", "🛵 Delivery"], horizontal=True, key=f"{kp}_tab",
-                   label_visibility="collapsed")
+    tab = st.radio("Report", ["👤 Staff", "📍 Area", "🚚 Arrangement", "🛵 Delivery", "⏸️ No-work pattern"], horizontal=True,
+                   key=f"{kp}_tab", label_visibility="collapsed")
+    if tab == "⏸️ No-work pattern":
+        show_nowork_pattern(f"{kp}_nw")
+        return
     if tab == "👤 Staff":
         show_staff_summary(f"{kp}_s")
     elif tab == "📍 Area":
@@ -18033,6 +18441,7 @@ def show_admin_page():
         pass
     pending_reviews_banner()
     show_report_due_banner()
+    show_no_work_panel("adm_nwp")
     st.divider()
 
     _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '🧭 Live Tracker', '📣 Staff Report', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
