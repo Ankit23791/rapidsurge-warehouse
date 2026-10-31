@@ -648,7 +648,7 @@ def show_login():
         st.caption("Contact Ankit if you forgot your password.")
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
-APP_VERSION = "v28-Oct live tracker"
+APP_VERSION = "v29-Oct staff report"
 
 def show_sidebar():
     with st.sidebar:
@@ -4572,6 +4572,7 @@ def show_user_page():
     # ── MANAGER: switch between own work and team view ───────────────────────
     if st.session_state.get("role") == "manager":
         pending_reviews_banner()
+        show_report_due_banner()
         show_daily_checklist()
         mode = st.radio("View", ["🧑‍💼 My Work", "👥 Team View"], horizontal=True,
                         key="mgr_mode", label_visibility="collapsed")
@@ -9871,7 +9872,7 @@ def show_in_share(cin):
     with c1:
         st.link_button("📤 Send IN on WhatsApp group", _wa_link(txt), type="primary", width='stretch')
         _wa_laptop(txt)
-        st.code(txt, language=None)
+        st.code(txt, language=None, wrap_lines=True)
     with c2:
         if st.button("✖️ Done", key="in_share_hide", width='stretch'):
             st.session_state["_in_share_hide"] = True
@@ -10786,7 +10787,7 @@ def show_full_day_picker(kp="fd"):
 
 def show_manager_team_view():
     st.markdown("## 👥 Team View")
-    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '🧭 Live Tracker', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
+    _nav = section_nav("mgr", ['📅 Daily Summary', '🔎 Reviews', '👥 All Staff Work', '🕐 Attendance', '📋 Full Day', '📌 Assign Tasks', '📅 Shift Planner', '🧾 Bills Register', '🧭 Live Tracker', '📣 Staff Report', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🚚 Distributors', '🛵 Delivery KM', '🏆 League', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
     if _nav == '📅 Daily Summary': show_daily_summary("mgr_ds")
     if _nav == '🔎 Reviews': show_reviews("mgr_rv")
     if _nav == '👥 All Staff Work': show_all_staff_work("mgr_asw")
@@ -10800,6 +10801,7 @@ def show_manager_team_view():
         show_delivery_proof_check("mgr_pc")
     if _nav == '📍 Order Journey': show_order_journey("mgr_oj")
     if _nav == '🧭 Live Tracker': show_live_tracker("mgr_lt")
+    if _nav == '📣 Staff Report': show_staff_report("mgr_sr")
     if _nav == '🛒 Normal Orders': show_order_sheet_report("mgr_osr")
     if _nav == '🚚 Distributors': show_distributors_admin("mgr_dist")
     if _nav == '🛵 Delivery KM': show_delivery_km("mgr_dkm")
@@ -16553,6 +16555,370 @@ def _staff_compare_df(data):
     return pd.DataFrame(rows)
 
 
+# ── 📣 DAILY STAFF REPORT — shared in the WhatsApp group (2 PM · 7 PM · 11:15 PM · next morning) ─────────
+SR_DEFAULT = {"target": 85, "yellow": 70, "break_full": 60, "break_short": 30, "full_hours": 8,
+              "posts": ["14:00", "19:00", "23:15", "09:00"],
+              "speed": {"Register Entry": 5, "Bill Cross Check": 15, "Bill Upload (Software)": 10, "Stock Placement": 15,
+                        "Arrangement Order": 10, "Purchase Order": 20, "Call Log": 5, "Pickup": 45}}
+SR_POST_NAME = ["🌤️ 2 PM check", "🌇 7 PM check", "🌙 Final report", "☀️ Morning — yesterday"]
+
+
+def sr_cfg():
+    try:
+        c = json.loads(get_app_setting("staff_report_cfg", "{}") or "{}")
+    except Exception:
+        c = {}
+    out = dict(SR_DEFAULT, **{k: v for k, v in c.items() if k in SR_DEFAULT})
+    out["speed"] = dict(SR_DEFAULT["speed"], **(c.get("speed") or {}))
+    return out
+
+
+def _sr_cover(tasks, events, day_s, now_n):
+    """(clock-in, day end, [(start, end)] of tasks + breaks) for idle stretches"""
+    s = att_state(sorted(events, key=lambda e: str(e.get("at"))))
+    cin, cout = _naive(s["clock_in"]), _naive(s["clock_out"])
+    is_today = day_s == _ds(now_n)
+    cover, cur = [], None
+    for e in sorted(events, key=lambda e: str(e.get("at"))):
+        t, ev = _naive(to_ist(e.get("at"))), e.get("event")
+        if ev == "break_start":
+            cur = t
+        elif ev in ("break_end", "clock_out") and cur:
+            cover.append((cur, t))
+            cur = None
+    if cur:
+        cover.append((cur, now_n if is_today else cur))
+    for t in tasks:
+        if t.get("status") == "In Progress" and is_today:
+            st_ = _rep_dt(t.get("date"), t.get("start_time"))
+            if st_:
+                cover.append((st_, now_n))
+        elif t.get("status") != "In Progress":
+            a, b = _rep_span(t)
+            if a:
+                cover.append((a, b or a))
+    end = cout or (now_n if is_today and cin else None)
+    return cin, end, sorted(cover)
+
+
+def longest_idle(tasks, events, day_s, now_n):
+    """longest stretch between clock-in and clock-out with no task and no break -> (secs, start, end)"""
+    cin, end, cover = _sr_cover(tasks, events, day_s, now_n)
+    if not cin or not end or end <= cin:
+        return 0, None, None
+    best, cursor = (0, None, None), cin
+    for a, b in cover + [(end, end)]:
+        a = max(a, cin)
+        if a > cursor:
+            g = (min(a, end) - cursor).total_seconds()
+            if g > best[0]:
+                best = (g, cursor, min(a, end))
+        if b > cursor:
+            cursor = b
+        if cursor >= end:
+            break
+    return best
+
+
+def _sr_used(s):
+    working = max(0, s["present"] - s["lunch"] - s["brk"])
+    return working, (100 * s["work"] / working if working > 0 else None)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def staff_day_report(day_s, upto_s=None):
+    """every staff member for one day (upto_s = 'HH:MM' for 'today so far') -> list of rows + absent list"""
+    cfg = sr_cfg()
+    day = datetime.strptime(day_s, "%Y-%m-%d")
+    now_n = _now_n() if day_s == _ds(_now_n()) else day.replace(hour=23, minute=59)
+    lo = _ds(day - timedelta(days=7))
+    tasks, att, wal = _rep_load_people(lo, day_s)
+    users = [u for u in (load_users() or {}).values()
+             if u.get("role") not in ("admin", "manager") and u.get("active", True) is not False]
+    xmap = extra_teams_map()
+    uname = {u["name"]: k for k, u in (load_users() or {}).items()}
+    by_pd, ev_pd, area_pd = {}, {}, {}
+    for t in tasks:
+        by_pd.setdefault((t.get("person"), str(t.get("date"))[:10]), []).append(t)
+    for e in att:
+        ev_pd.setdefault((e.get("person"), str(e.get("date"))[:10]), []).append(e)
+    for w in wal:
+        if w.get("area"):
+            area_pd.setdefault((w.get("person"), str(w.get("date"))[:10]), []).append(w["area"])
+    roster = load_roster(day_s)
+    rows, absent = [], []
+    for u in users:
+        name, team = u["name"], u.get("team", "")
+        teams = [team] + [x for x in xmap.get(uname.get(name, ""), []) if x != team]
+        tl, el = by_pd.get((name, day_s), []), ev_pd.get((name, day_s), [])
+        if not tl and not el:
+            r = roster.get(name) or {}
+            if r.get("status") in ("Off", "Leave"):
+                absent.append((name, team, "🏖️ Off" if r["status"] == "Off" else "🤒 Leave"))
+            elif day_s == _ds(_now_n()) and r.get("start_time") and parse_task_time(r["start_time"]) and \
+                    parse_task_time(r["start_time"]).time() > _now_n().time():
+                absent.append((name, team, f"🕒 starts {r['start_time']}"))
+            else:
+                absent.append((name, team, "❌ No clock-in"))
+            continue
+        s = person_day_stats(tl, el, day_s, now_n)
+        working, used = _sr_used(s)
+        breaks = s["lunch"] + s["brk"]
+        allow = (cfg["break_full"] if s["present"] >= cfg["full_hours"] * 3600 else cfg["break_short"]) * 60
+        idle = longest_idle(tl, el, day_s, now_n)
+        done = [t for t in tl if t.get("status") != "In Progress"]
+        secs_by_team = {}
+        for t in done:
+            tm = t.get("team") if t.get("team") in teams else team
+            secs_by_team[tm] = secs_by_team.get(tm, 0) + task_secs(t)
+        role = max(secs_by_team, key=secs_by_team.get) if secs_by_team else team
+        # speed: the slowest main task against its target
+        slow = None
+        for tt, tgt in cfg["speed"].items():
+            xs = [task_secs(t) for t in done if t.get("task_type") == tt and task_secs(t) > 0]
+            if xs and tgt:
+                avg = sum(xs) / len(xs) / 60
+                if avg > tgt * 1.25 and (not slow or avg / tgt > slow[1] / slow[2]):
+                    slow = (tt, avg, tgt, len(xs))
+        # trend: used % vs own last 7 days
+        prev = []
+        for i in range(1, 8):
+            d_ = _ds(day - timedelta(days=i))
+            ptl, pel = by_pd.get((name, d_), []), ev_pd.get((name, d_), [])
+            if ptl or pel:
+                ps = person_day_stats(ptl, pel, d_, now_n)
+                pw, pu = _sr_used(ps)
+                if pu is not None and pw >= 3600:
+                    prev.append(pu)
+        base = sum(prev) / len(prev) if prev else None
+        trend = "" if used is None or base is None else "↑" if used >= base + 3 else "↓" if used <= base - 3 else "→"
+        areas = area_pd.get((name, day_s), [])
+        rows.append({"name": name, "team": role, "teams": teams, "area": max(set(areas), key=areas.count) if areas else "",
+                     "cin": s["cin"], "cout": s["cout"], "working": working, "task": s["work"], "breaks": breaks,
+                     "over": max(0, breaks - allow), "allow": allow, "off": max(0, working - s["work"]), "used": used,
+                     "tasks": s["tasks"], "idle": idle, "slow": slow, "trend": trend, "base": base})
+    for tm in set(r["team"] for r in rows):
+        grp = sorted([r for r in rows if r["team"] == tm and r["used"] is not None and r["working"] >= 3600],
+                     key=lambda r: -r["used"])
+        for i, r in enumerate(grp):
+            r["rank"] = "🥇" if i == 0 and len(grp) > 1 else "🔻" if i == len(grp) - 1 and len(grp) > 1 else ""
+    return rows, absent
+
+
+def _sr_flag(used, cfg):
+    if used is None:
+        return "⚪"
+    return "🟢" if used >= cfg["target"] else "🟡" if used >= cfg["yellow"] else "🔴"
+
+
+def _sr_hm(secs):
+    secs = int(secs or 0)
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def staff_report_text(day_s, rows, absent, final, title):
+    cfg = sr_cfg()
+    d = datetime.strptime(day_s, "%Y-%m-%d")
+    lines = [f"📊 {title} — {d.strftime('%a %d %b')}", "━━━━━━━━━━━━━━━"]
+    for tm in REP_TEAM_ORDER + sorted({r["team"] for r in rows} - set(REP_TEAM_ORDER)):
+        grp = sorted([r for r in rows if r["team"] == tm], key=lambda r: -(r["used"] or -1))
+        if not grp:
+            continue
+        lines.append(f"{TEAM_ICON.get(tm, '👤')} {tm.upper()}")
+        for r in grp:
+            bits = [f"{round(r['used'])}% {_sr_flag(r['used'], cfg)}" if r["used"] is not None else "—",
+                    f"{_sr_hm(r['working'])} worked", f"{r['tasks']} tasks" + (f" {r['trend']}" if r["trend"] else "")]
+            if r["idle"][0] >= 30 * 60:
+                bits.append(f"💤 {_sr_hm(r['idle'][0])} idle ({r['idle'][1].strftime('%I:%M')}–{r['idle'][2].strftime('%I:%M %p')})")
+            if r["over"] >= 5 * 60:
+                bits.append(f"☕ breaks {_sr_hm(r['breaks'])} (+{_sr_hm(r['over'])})")
+            if r["slow"]:
+                bits.append(f"🐢 {r['slow'][0]} avg {round(r['slow'][1])}m (target {r['slow'][2]}m)")
+            if r["tasks"] <= 2 and r["working"] >= 3 * 3600:
+                bits.append(f"⚠️ only {r['tasks']} task(s) timed")
+            mark = (r.get("rank") or "") if final else ""
+            lines.append(f"{mark + ' ' if mark else ''}{r['name']}" + (f" · {r['area']}" if r["area"] else "")
+                         + " — " + " · ".join(bits))
+        lines.append("")
+    tw = sum(r["working"] for r in rows)
+    tt = sum(r["task"] for r in rows)
+    if rows:
+        lines.append("━━━━━━━━━━━━━━━")
+    if tw:
+        bases = [r["base"] for r in rows if r["base"] is not None]
+        lines.append(f"Team: {_sr_hm(tw)} worked · {round(100 * tt / tw)}% on tasks (target {cfg['target']}%)"
+                     + (f" · last 7 days {round(sum(bases) / len(bases))}%" if bases else ""))
+    if final:
+        good = [r for r in rows if r["used"] is not None and r["working"] >= 4 * 3600]
+        if good:
+            best = max(good, key=lambda r: r["used"])
+            lines.append(f"🏆 Star of the day: {best['name']} ({round(best['used'])}%)")
+    for lbl in ("❌ No clock-in", "🤒 Leave", "🏖️ Off"):
+        ns = [n for n, _, w in absent if w == lbl]
+        if ns:
+            lines.append(f"{lbl}: " + ", ".join(ns))
+    later = [f"{n} ({w.split('starts ')[1]})" for n, _, w in absent if w.startswith("🕒")]
+    if later:
+        lines.append("🕒 Shift later: " + ", ".join(later))
+    return "\n".join(lines).replace("\n\n━", "\n━")
+
+
+def sr_due_slot(now=None):
+    """the latest post time that has passed today and is not marked posted -> (index, 'HH:MM') or None"""
+    now = now or now_ist()
+    cfg = sr_cfg()
+    try:
+        done = json.loads(get_app_setting(f"staff_report_posted_{now.strftime('%Y-%m-%d')}", "[]") or "[]")
+    except Exception:
+        done = []
+    passed = []
+    for i, hm in enumerate(cfg["posts"]):
+        try:
+            h, m = [int(x) for x in hm.split(":")]
+        except Exception:
+            continue
+        if (now.hour, now.minute) >= (h, m):
+            passed.append(((h, m), i, hm))
+    if not passed:
+        return None
+    _, i, hm = max(passed)                       # the most recent post time; posting it covers the earlier ones
+    return None if i in done else (i, hm)
+
+
+def sr_slots_upto(i):
+    """slot i and every slot with an earlier time of day"""
+    def hm(x):
+        try:
+            return tuple(int(v) for v in x.split(":"))
+        except Exception:
+            return (99, 0)
+    posts = sr_cfg()["posts"]
+    return [j for j, x in enumerate(posts) if hm(x) <= hm(posts[i])]
+
+
+def show_report_due_banner():
+    """managers / admin: reminder to post the staff report in the group"""
+    due = sr_due_slot()
+    if due:
+        st.warning(f"📤 **Staff report due — {SR_POST_NAME[due[0]]} ({due[1]})**. Open 📣 Staff Report and share it in the group.")
+
+
+def show_staff_report(kp="sr"):
+    st.subheader("📣 Staff Report — share in the group")
+    msg = st.session_state.pop("sr_msg", None)
+    if msg:
+        st.success(msg)
+    cfg = sr_cfg()
+    now = now_ist()
+    today = today_ist()
+    c1, c2, c3 = st.columns([2, 2, 2])
+    kinds = ["Today so far", "Yesterday (full day)", "📅 Choose date"]
+    due = sr_due_slot()
+    with c1:
+        kind = st.selectbox("Report", kinds, key=f"{kp}_kind",
+                            index=0 if now.hour >= 14 else 1)          # before the 2 PM check: yesterday's full day
+    with c2:
+        if kind.startswith("📅"):
+            day = st.date_input("Date", value=today - timedelta(days=1), max_value=today, key=f"{kp}_day")
+        else:
+            day = today if kind.startswith("Today") else today - timedelta(days=1)
+            st.write("")
+            st.caption(f"📅 {day.strftime('%a %d %b %Y')}")
+    with c3:
+        area = st.selectbox("Area", ["All Areas"] + load_areas(), key=f"{kp}_area")
+    day_s = day.strftime("%Y-%m-%d")
+    try:
+        with st.spinner("Building the report…"):
+            rows, absent = staff_day_report(day_s)
+    except Exception as e:
+        st.error(f"Could not build the report: {e}")
+        return
+    if area != "All Areas":
+        rows = [r for r in rows if r["area"] == area]
+    final = day_s != today.strftime("%Y-%m-%d") or (now.hour, now.minute) >= (23, 0)
+    title = "Staff Report" if final else f"Staff check {now.strftime('%I:%M %p').lstrip('0')} (today so far)"
+    if due:
+        st.warning(f"📤 Due now: **{SR_POST_NAME[due[0]]} ({due[1]})**")
+    if not rows and not absent:
+        st.info("No staff activity for this day.")
+        return
+    tbl = []
+    for r in sorted(rows, key=lambda r: (REP_TEAM_ORDER.index(r["team"]) if r["team"] in REP_TEAM_ORDER else 9, -(r["used"] or -1))):
+        tbl.append({"Date": day.strftime("%d %b"), "Area": r["area"], "Role": " + ".join(TEAM_ICON.get(t, "") + " " + t for t in r["teams"]),
+                    "Staff": r["name"], "Rank": r.get("rank", ""),
+                    "In – Out": (r["cin"].strftime("%I:%M %p") if r["cin"] else "—") + " – "
+                                + (r["cout"].strftime("%I:%M %p") if r["cout"] else ("still in" if day_s == _ds(_now_n()) else "—")),
+                    "Working hrs": _sr_hm(r["working"]), "Task time": _sr_hm(r["task"]), "Breaks": _sr_hm(r["breaks"]),
+                    "Over-break": f"+{_sr_hm(r['over'])}" if r["over"] >= 60 else "",
+                    "Not on task": _sr_hm(r["off"]),
+                    "Used %": f"{_sr_flag(r['used'], cfg)} {round(r['used'])}%" if r["used"] is not None else "—",
+                    "Trend": r["trend"], "Tasks": r["tasks"],
+                    "Longest idle": (f"{_sr_hm(r['idle'][0])} ({r['idle'][1].strftime('%I:%M')}–{r['idle'][2].strftime('%I:%M %p')})"
+                                     if r["idle"][0] >= 15 * 60 else ""),
+                    "Slow task": f"{r['slow'][0]} {round(r['slow'][1])}m / {r['slow'][2]}m" if r["slow"] else ""})
+    tw, tt = sum(r["working"] for r in rows), sum(r["task"] for r in rows)
+    m = st.columns(4)
+    m[0].metric("Staff working", len(rows))
+    m[1].metric("Worked", _sr_hm(tw))
+    m[2].metric("On tasks", f"{round(100 * tt / tw)}%" if tw else "—", help=f"Target {cfg['target']}%")
+    m[3].metric("🔴 below " + str(cfg["yellow"]) + "%", sum(1 for r in rows if r["used"] is not None and r["used"] < cfg["yellow"]))
+    if tbl:
+        st.dataframe(pd.DataFrame(tbl).astype(str), hide_index=True, width='stretch')
+    if absent:
+        st.caption(" · ".join(f"{w} {n}" for n, _, w in absent))
+    st.caption(f"Used % = task time ÷ working hrs (clock-in → out, minus breaks). 🟢 {cfg['target']}%+ · 🟡 {cfg['yellow']}–{cfg['target']}% · "
+               f"🔴 below {cfg['yellow']}%. Breaks allowed: {cfg['break_full']}m (shift {cfg['full_hours']}h+) / {cfg['break_short']}m. "
+               "Trend = against own last 7 days. 🥇 / 🔻 = best / last in the role.")
+    txt = staff_report_text(day_s, rows, absent, final, title)
+    st.markdown("**📤 Message for the WhatsApp group**")
+    st.code(txt, language=None, wrap_lines=True)
+    import urllib.parse
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.link_button("📤 Share on WhatsApp", "https://wa.me/?text=" + urllib.parse.quote(txt), width='stretch')
+    with b2:
+        if due and st.button(f"✅ Mark '{SR_POST_NAME[due[0]]}' as posted", key=f"{kp}_posted", width='stretch'):
+            k = f"staff_report_posted_{now.strftime('%Y-%m-%d')}"
+            try:
+                done = json.loads(get_app_setting(k, "[]") or "[]")
+            except Exception:
+                done = []
+            set_app_setting(k, json.dumps(sorted(set(done) | set(sr_slots_upto(due[0])))))
+            st.rerun()
+    with b3:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            pd.DataFrame(tbl).to_excel(w, index=False, sheet_name="Staff report")
+        st.download_button("📥 Excel", buf.getvalue(), file_name=f"staff-report-{day_s}.xlsx", key=f"{kp}_xl",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width='stretch')
+    with st.expander("⚙️ Report settings (targets, breaks, post times)"):
+        c = st.columns(5)
+        tgt = c[0].number_input("🟢 Target %", 50, 100, int(cfg["target"]), key=f"{kp}_s_t")
+        yel = c[1].number_input("🔴 below %", 30, 100, int(cfg["yellow"]), key=f"{kp}_s_y")
+        bf = c[2].number_input("Breaks full shift (min)", 0, 180, int(cfg["break_full"]), key=f"{kp}_s_bf")
+        bs = c[3].number_input("Breaks short shift (min)", 0, 120, int(cfg["break_short"]), key=f"{kp}_s_bs")
+        fh = c[4].number_input("Full shift = hours", 1, 14, int(cfg["full_hours"]), key=f"{kp}_s_fh")
+        posts = st.text_input("Post times (2 PM, 7 PM, final, next morning) — HH:MM, comma separated",
+                              ", ".join(cfg["posts"]), key=f"{kp}_s_p")
+        sp = st.data_editor(pd.DataFrame([{"Task": k, "Target minutes": v} for k, v in cfg["speed"].items()]),
+                            key=f"{kp}_s_sp", hide_index=True, disabled=["Task"])
+        if st.button("💾 Save settings", key=f"{kp}_s_save"):
+            ps = [p.strip() for p in posts.split(",") if p.strip()]
+            if len(ps) != 4 or not all(re.match(r"^\d{1,2}:\d{2}$", p) for p in ps):
+                st.error("Write 4 times like 14:00, 19:00, 23:15, 09:00")
+            elif yel >= tgt:
+                st.error("'🔴 below %' must be lower than the target %.")
+            else:
+                set_app_setting("staff_report_cfg", json.dumps({
+                    "target": int(tgt), "yellow": int(yel), "break_full": int(bf), "break_short": int(bs),
+                    "full_hours": int(fh), "posts": ps,
+                    "speed": {r["Task"]: int(_to_float(r["Target minutes"], 0)) for _, r in sp.iterrows()}}))
+                staff_day_report.clear()
+                st.session_state["sr_msg"] = "✅ Report settings saved."
+                st.rerun()
+
+
 def show_staff_summary(kp="rs"):
     st.markdown("#### 👤 Staff summary — what each person did")
     lo, hi, _ = report_period(kp)
@@ -17666,9 +18032,10 @@ def show_admin_page():
     except Exception:
         pass
     pending_reviews_banner()
+    show_report_due_banner()
     st.divider()
 
-    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '🧭 Live Tracker', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
+    _nav = section_nav("adm", ['🎯 My Day', '📅 Daily Summary', '🔎 Reviews', '📊 Dashboard', '👥 All Staff Work', '🔄 Pipeline', '📈 Performance', '📝 Submit Entry', '👥 Settings', '📥 Reports', '🧭 Live Tracker', '📣 Staff Report', '📦 Customer Orders', '📍 Order Journey', '🛒 Normal Orders', '🧾 Bills Register', '🕐 Attendance', '📌 Assign Tasks', '📅 Shift Planner', '🛵 Delivery KM', '🏆 League', '📦 Photos', '🚚 Order Follow-up', '📋 Staff & Area Summary'])
 
     if _nav == '📅 Daily Summary':
         show_daily_summary("adm_ds")
@@ -17718,6 +18085,8 @@ def show_admin_page():
         show_order_journey("adm_oj")
     if _nav == '🧭 Live Tracker':
         show_live_tracker("adm_lt")
+    if _nav == '📣 Staff Report':
+        show_staff_report("adm_sr")
 
     if _nav == '🧾 Bills Register':
         show_bills_register("adm_bills")
